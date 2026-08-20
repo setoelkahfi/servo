@@ -953,6 +953,11 @@ fn test_servoshell_cmd() {
     );
 
     assert_eq!(
+        test_parse("").2.url.as_deref(),
+        Some("https://smbcloud.xyz/"),
+    );
+
+    assert_eq!(
         test_parse("--screen-size=1000x1000")
             .2
             .screen_size_override

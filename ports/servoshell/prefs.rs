@@ -115,7 +115,7 @@ impl Default for ServoShellPreferences {
             clean_shutdown: false,
             device_pixel_ratio_override: None,
             headless: false,
-            homepage: "https://servo.org".into(),
+            homepage: "https://smbcloud.xyz/".into(),
             initial_window_size: Size2D::new(1024, 740),
             no_native_titlebar: true,
             screen_size_override: None,
@@ -146,8 +146,7 @@ impl Default for ServoShellPreferences {
 ))]
 pub fn default_config_dir() -> Option<PathBuf> {
     let mut config_dir = ::dirs::config_dir().unwrap();
-    config_dir.push("servo");
-    config_dir.push("default");
+    config_dir.push("smb-browser");
     Some(config_dir)
 }
 
@@ -164,14 +163,14 @@ pub fn default_config_dir() -> Option<PathBuf> {
     // FIXME: use `config_dir()` ($HOME/Library/Preferences)
     // instead of `data_dir()` ($HOME/Library/Application Support) ?
     let mut config_dir = ::dirs::data_dir().unwrap();
-    config_dir.push("Servo");
+    config_dir.push("smb Browser");
     Some(config_dir)
 }
 
 #[cfg(target_os = "windows")]
 pub fn default_config_dir() -> Option<PathBuf> {
     let mut config_dir = ::dirs::config_dir().unwrap();
-    config_dir.push("Servo");
+    config_dir.push("smb Browser");
     Some(config_dir)
 }
 
@@ -577,7 +576,7 @@ struct CmdArgs {
     zealous_gc: bool,
 
     /// The url we should load.
-    #[bpaf(positional("URL"), fallback(String::from("https://www.servo.org")))]
+    #[bpaf(positional("URL"), fallback(String::from("https://smbcloud.xyz/")))]
     url: String,
 }
 
@@ -905,6 +904,11 @@ fn test_profiling_args() {
 
 #[test]
 fn test_servoshell_cmd() {
+    assert_eq!(
+        test_parse("").2.url.as_deref(),
+        Some("https://smbcloud.xyz/"),
+    );
+
     assert_eq!(
         test_parse("--screen-size=1000x1000")
             .2

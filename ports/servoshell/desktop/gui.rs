@@ -401,6 +401,31 @@ impl Gui {
                         ui.available_size(),
                         egui::Layout::left_to_right(egui::Align::Center),
                         |ui| {
+                            if ui.input(|input| {
+                                input
+                                    .clone()
+                                    .consume_key(Modifiers::COMMAND | Modifiers::SHIFT, Key::H)
+                            }) {
+                                *location_dirty = false;
+                                window.queue_user_interface_command(UserInterfaceCommand::GoHome);
+                            }
+                            if ui.input(|input| {
+                                input.clone().consume_key(Modifiers::COMMAND, Key::D)
+                            }) {
+                                window.queue_user_interface_command(
+                                    UserInterfaceCommand::ToggleBookmark,
+                                );
+                            }
+                            if ui.input(|input| {
+                                input
+                                    .clone()
+                                    .consume_key(Modifiers::COMMAND | Modifiers::SHIFT, Key::T)
+                            }) {
+                                window.queue_user_interface_command(
+                                    UserInterfaceCommand::ReopenClosedWebView,
+                                );
+                            }
+
                             let back_button =
                                 ui.add_enabled(self.can_go_back, Gui::toolbar_button("⏴"));
                             back_button.widget_info(|| {
@@ -423,6 +448,17 @@ impl Gui {
                             if forward_button.clicked() {
                                 *location_dirty = false;
                                 window.queue_user_interface_command(UserInterfaceCommand::Forward);
+                            }
+
+                            let home_button = ui.add(Gui::toolbar_button("⌂"));
+                            home_button.widget_info(|| {
+                                let mut info = WidgetInfo::new(WidgetType::Button);
+                                info.label = Some("Home".into());
+                                info
+                            });
+                            if home_button.clicked() {
+                                *location_dirty = false;
+                                window.queue_user_interface_command(UserInterfaceCommand::GoHome);
                             }
 
                             match self.load_status {
@@ -454,6 +490,55 @@ impl Gui {
                             }
                             ui.add_space(2.0);
 
+                            let active_url =
+                                window.active_webview().and_then(|webview| webview.url());
+                            let bookmarkable = active_url
+                                .as_ref()
+                                .is_some_and(|url| matches!(url.scheme(), "http" | "https"));
+                            let is_bookmarked = active_url
+                                .as_ref()
+                                .is_some_and(|url| state.is_bookmarked(url));
+                            let bookmark_button = ui.add_enabled(
+                                bookmarkable,
+                                Gui::toolbar_button(if is_bookmarked { "★" } else { "☆" }),
+                            );
+                            bookmark_button.widget_info(|| {
+                                let mut info = WidgetInfo::new(WidgetType::Button);
+                                info.label = Some(if is_bookmarked {
+                                    "Remove bookmark".into()
+                                } else {
+                                    "Add bookmark".into()
+                                });
+                                info
+                            });
+                            if bookmark_button.clicked() {
+                                window.queue_user_interface_command(
+                                    UserInterfaceCommand::ToggleBookmark,
+                                );
+                            }
+
+                            ui.menu_button("☰", |ui| {
+                                ui.strong("Bookmarks");
+                                let bookmarks = state.bookmarks();
+                                if bookmarks.is_empty() {
+                                    ui.label("No bookmarks yet");
+                                }
+                                for bookmark in bookmarks {
+                                    let label = bookmark
+                                        .host_str()
+                                        .map(|host| truncate_with_ellipsis(host, 28))
+                                        .unwrap_or_else(|| {
+                                            truncate_with_ellipsis(bookmark.as_str(), 28)
+                                        });
+                                    if ui.button(label).on_hover_text(bookmark.as_str()).clicked() {
+                                        window.queue_user_interface_command(
+                                            UserInterfaceCommand::Go(bookmark.to_string()),
+                                        );
+                                        ui.close();
+                                    }
+                                }
+                            });
+
                             ui.allocate_ui_with_layout(
                                 ui.available_size(),
                                 egui::Layout::right_to_left(egui::Align::Center),
@@ -461,11 +546,11 @@ impl Gui {
                                     let mut experimental_preferences_enabled =
                                         state.experimental_preferences_enabled();
                                     let prefs_toggle = ui
-                                        .toggle_value(&mut experimental_preferences_enabled, "☢")
-                                        .on_hover_text("Enable experimental prefs");
+                                        .toggle_value(&mut experimental_preferences_enabled, "⚙")
+                                        .on_hover_text("Experimental web features");
                                     prefs_toggle.widget_info(|| {
                                         let mut info = WidgetInfo::new(WidgetType::Button);
-                                        info.label = Some("Enable experimental preferences".into());
+                                        info.label = Some("Experimental web features".into());
                                         info.selected = Some(experimental_preferences_enabled);
                                         info
                                     });

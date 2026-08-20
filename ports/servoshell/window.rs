@@ -65,6 +65,8 @@ pub(crate) struct ServoShellWindow {
     pending_favicon_loads: RefCell<Vec<WebViewId>>,
     /// Pending [`UserInterfaceCommand`] that have yet to be processed by the main loop.
     pending_commands: RefCell<Vec<UserInterfaceCommand>>,
+    /// The most recently closed page, used by the familiar Reopen Closed Tab command.
+    recently_closed_webview: RefCell<Option<Url>>,
 }
 
 impl ServoShellWindow {
@@ -77,6 +79,7 @@ impl ServoShellWindow {
             needs_repaint: Default::default(),
             pending_favicon_loads: Default::default(),
             pending_commands: Default::default(),
+            recently_closed_webview: Default::default(),
         }
     }
 
@@ -236,6 +239,9 @@ impl ServoShellWindow {
     /// the close notification via the [`WebViewDelegate`] later.
     pub(crate) fn close_webview(&self, webview_id: WebViewId) {
         let mut webview_collection = self.webview_collection.borrow_mut();
+        if let Some(webview) = webview_collection.get(webview_id) {
+            *self.recently_closed_webview.borrow_mut() = webview.url();
+        }
         if webview_collection.remove(webview_id).is_none() {
             return;
         }
@@ -244,6 +250,13 @@ impl ServoShellWindow {
 
         self.set_needs_update();
         self.set_needs_repaint();
+    }
+
+    pub(crate) fn reopen_closed_webview(self: &Rc<Self>, state: Rc<RunningAppState>) {
+        let Some(url) = self.recently_closed_webview.borrow_mut().take() else {
+            return;
+        };
+        self.create_and_activate_toplevel_webview(state, url);
     }
 
     pub(crate) fn notify_favicon_changed(&self, webview: WebView) {
@@ -329,6 +342,15 @@ impl ServoShellWindow {
                         active_webview.load(url.into_url());
                     }
                 },
+                UserInterfaceCommand::GoHome => {
+                    let Ok(url) = Url::parse(&state.servoshell_preferences.homepage) else {
+                        warn!("failed to parse homepage URL");
+                        continue;
+                    };
+                    if let Some(active_webview) = self.active_webview() {
+                        active_webview.load(url);
+                    }
+                },
                 UserInterfaceCommand::Back => {
                     if let Some(active_webview) = self.active_webview() {
                         active_webview.go_back(1);
@@ -355,8 +377,19 @@ impl ServoShellWindow {
                 },
                 UserInterfaceCommand::NewWebView => {
                     self.set_needs_update();
-                    let url = Url::parse("servo:newtab").expect("Should always be able to parse");
+                    let url = Url::parse("smb:newtab").expect("Should always be able to parse");
                     self.create_and_activate_toplevel_webview(state.clone(), url);
+                },
+                UserInterfaceCommand::ReopenClosedWebView => {
+                    self.reopen_closed_webview(state.clone());
+                },
+                UserInterfaceCommand::ToggleBookmark => {
+                    if let Some(url) = self.active_webview().and_then(|webview| webview.url()) &&
+                        matches!(url.scheme(), "http" | "https")
+                    {
+                        state.toggle_bookmark(url);
+                        self.set_needs_update();
+                    }
                 },
                 UserInterfaceCommand::CloseWebView(id) => {
                     self.set_needs_update();
@@ -364,7 +397,7 @@ impl ServoShellWindow {
                 },
                 UserInterfaceCommand::NewWindow => {
                     if let Some(create_platform_window) = create_platform_window {
-                        let url = Url::parse("servo:newtab").unwrap();
+                        let url = Url::parse("smb:newtab").unwrap();
                         let platform_window = create_platform_window(url.clone());
                         state.open_window(platform_window, url);
                     }

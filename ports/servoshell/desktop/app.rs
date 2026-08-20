@@ -86,6 +86,8 @@ impl App {
             protocols::urlinfo::UrlInfoProtocolHander::default(),
         );
         let _ =
+            protocol_registry.register("smb", protocols::servo::ServoProtocolHandler::default());
+        let _ =
             protocol_registry.register("servo", protocols::servo::ServoProtocolHandler::default());
         let _ = protocol_registry.register(
             "resource",
@@ -126,6 +128,7 @@ impl App {
         let running_state = Rc::new(RunningAppState::new(
             servo,
             self.servoshell_preferences.clone(),
+            self.opts.config_dir.clone(),
             self.waker.clone(),
             user_content_manager,
             self.preferences.clone(),

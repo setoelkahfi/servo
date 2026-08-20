@@ -57,7 +57,7 @@ use crate::window::{
     ServoShellWindowId,
 };
 
-pub(crate) const INITIAL_WINDOW_TITLE: &str = "Servo";
+pub(crate) const INITIAL_WINDOW_TITLE: &str = "smb Browser";
 
 pub struct HeadedWindow {
     /// The egui interface that is responsible for showing the user interface elements of
@@ -425,8 +425,8 @@ impl HeadedWindow {
             .shortcut(CMD_OR_CONTROL, 'T', || {
                 window.create_and_activate_toplevel_webview(
                     state.clone(),
-                    Url::parse("servo:newtab")
-                        .expect("Should be able to unconditionally parse 'servo:newtab' as URL"),
+                    Url::parse("smb:newtab")
+                        .expect("Should be able to unconditionally parse 'smb:newtab' as URL"),
                 );
             })
             .shortcut(CMD_OR_CONTROL, 'Q', || state.schedule_exit())

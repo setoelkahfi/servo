@@ -324,6 +324,7 @@ impl App {
         let state = Rc::new(RunningAppState::new(
             servo,
             init.servoshell_preferences,
+            init.opts.config_dir.clone(),
             init.event_loop_waker,
             user_content_manager,
             init.preferences,

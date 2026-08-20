@@ -9,7 +9,7 @@
 	<key>CFBundleIconFile</key>
 	<string>servo.icns</string>
 	<key>CFBundleIdentifier</key>
-	<string>org.servo.ServoShell</string>
+	<string>xyz.smbcloud.Browser</string>
 	<key>CFBundleInfoDictionaryVersion</key>
 	<string>6.0</string>
 	<key>CFBundleName</key>

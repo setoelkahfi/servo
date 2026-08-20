@@ -54,6 +54,35 @@ pub(crate) static EXPERIMENTAL_PREFS: &[&str] = &[
     "layout_variable_fonts_enabled",
 ];
 
+/// Web APIs required by mainstream daily-use sites. Servo still ships these
+/// behind preferences, but smb Browser treats them as part of its compatibility
+/// baseline rather than asking users to discover an experimental toggle.
+const SMB_DAILY_WEB_PREFS: &[&str] = &[
+    "dom_adoptedstylesheet_enabled",
+    "dom_fontface_enabled",
+    "dom_indexeddb_enabled",
+    "dom_intersection_observer_enabled",
+    "layout_container_queries_enabled",
+];
+
+// GitHub's marketing RiverAccordion animates a grid between 0fr and 1fr. In
+// this Servo revision that grid can create a cyclic block-layout tree and hang
+// navigation indefinitely. Keep the component usable as a normal block until
+// the upstream grid bug is fixed. The CSS-module hash is deliberately omitted
+// so the rule survives GitHub asset rebuilds.
+const SMB_COMPATIBILITY_CSS: &str = r#"
+[class*="Primer_Brand__RiverAccordion-module__RiverAccordion__panel"] {
+    display: block !important;
+}
+"#;
+
+fn smb_compatibility_stylesheets() -> Vec<Rc<UserStyleSheet>> {
+    vec![Rc::new(UserStyleSheet::new(
+        SMB_COMPATIBILITY_CSS.into(),
+        Url::parse("resource:///smb-compatibility.css").unwrap(),
+    ))]
+}
+
 #[cfg_attr(any(target_os = "android", target_env = "ohos"), expect(dead_code))]
 #[derive(Clone)]
 pub(crate) struct ServoShellPreferences {
@@ -115,7 +144,7 @@ impl Default for ServoShellPreferences {
             clean_shutdown: false,
             device_pixel_ratio_override: None,
             headless: false,
-            homepage: "https://servo.org".into(),
+            homepage: "https://smbcloud.xyz/".into(),
             initial_window_size: Size2D::new(1024, 740),
             no_native_titlebar: true,
             screen_size_override: None,
@@ -146,8 +175,7 @@ impl Default for ServoShellPreferences {
 ))]
 pub fn default_config_dir() -> Option<PathBuf> {
     let mut config_dir = ::dirs::config_dir().unwrap();
-    config_dir.push("servo");
-    config_dir.push("default");
+    config_dir.push("smb-browser");
     Some(config_dir)
 }
 
@@ -164,14 +192,14 @@ pub fn default_config_dir() -> Option<PathBuf> {
     // FIXME: use `config_dir()` ($HOME/Library/Preferences)
     // instead of `data_dir()` ($HOME/Library/Application Support) ?
     let mut config_dir = ::dirs::data_dir().unwrap();
-    config_dir.push("Servo");
+    config_dir.push("smb Browser");
     Some(config_dir)
 }
 
 #[cfg(target_os = "windows")]
 pub fn default_config_dir() -> Option<PathBuf> {
     let mut config_dir = ::dirs::config_dir().unwrap();
-    config_dir.push("Servo");
+    config_dir.push("smb Browser");
     Some(config_dir)
 }
 
@@ -577,7 +605,7 @@ struct CmdArgs {
     zealous_gc: bool,
 
     /// The url we should load.
-    #[bpaf(positional("URL"), fallback(String::from("https://www.servo.org")))]
+    #[bpaf(positional("URL"), fallback(String::from("https://smbcloud.xyz/")))]
     url: String,
 }
 
@@ -585,6 +613,10 @@ fn update_preferences_from_command_line_arguments(
     preferences: &mut Preferences,
     cmd_args: &CmdArgs,
 ) {
+    for pref in SMB_DAILY_WEB_PREFS {
+        preferences.set_value(pref, PrefValue::Bool(true));
+    }
+
     if let Some(listen_address) = &cmd_args.devtools {
         preferences.devtools_server_enabled = true;
         preferences.devtools_server_listen_address = listen_address.clone();
@@ -720,7 +752,10 @@ fn parse_arguments_helper(args_without_binary: Args) -> ArgumentParsingResult {
         output_image_path: cmd_args.output.map(|p| p.to_string_lossy().into_owned()),
         exit_after_stable_image: cmd_args.exit,
         userscripts_directory: cmd_args.userscripts,
-        user_stylesheets: cmd_args.user_stylesheet,
+        user_stylesheets: smb_compatibility_stylesheets()
+            .into_iter()
+            .chain(cmd_args.user_stylesheet)
+            .collect(),
         experimental_preferences_enabled: cmd_args.enable_experimental_web_platform_features,
         #[cfg(target_env = "ohos")]
         log_filter: cmd_args.log_filter.or_else(|| {
@@ -905,6 +940,18 @@ fn test_profiling_args() {
 
 #[test]
 fn test_servoshell_cmd() {
+    let (_, daily_preferences, _) = test_parse("");
+    assert!(daily_preferences.dom_adoptedstylesheet_enabled);
+    assert!(daily_preferences.dom_fontface_enabled);
+    assert!(daily_preferences.dom_indexeddb_enabled);
+    assert!(daily_preferences.dom_intersection_observer_enabled);
+    assert!(daily_preferences.layout_container_queries_enabled);
+
+    assert_eq!(
+        test_parse("").2.url.as_deref(),
+        Some("https://smbcloud.xyz/"),
+    );
+
     assert_eq!(
         test_parse("--screen-size=1000x1000")
             .2

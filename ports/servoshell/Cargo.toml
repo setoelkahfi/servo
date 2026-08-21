@@ -152,15 +152,22 @@ windows-sys = { workspace = true, features = ["Win32_Graphics_Gdi", "Win32_Syste
 
 [target.'cfg(target_os = "macos")'.dependencies]
 onde = { workspace = true }
+# Defining the target that answers the Settings menu item.
+objc2 = { workspace = true }
 objc2-app-kit = { workspace = true, features = [
     "std",
+    # Extending the application menu winit builds.
+    "NSApplication",
     "NSColorSpace",
+    "NSMenu",
+    "NSMenuItem",
     "NSResponder",
     "NSView",
     "NSWindow",
 ] }
 objc2-foundation = { workspace = true, features = [
     "std",
+    "NSString",
     # Resolving the Onde shared-model App Group container.
     "NSFileManager",
     "NSURL",

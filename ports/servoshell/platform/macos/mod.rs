@@ -5,6 +5,8 @@
 use std::time::Duration;
 use std::{ptr, thread};
 
+pub mod menu;
+
 pub fn deinit(clean_shutdown: bool) {
     // An unfortunate hack to make sure the linker's dead code stripping doesn't strip our
     // `Info.plist`.

@@ -80,6 +80,10 @@ pub struct Gui {
     /// Whether the chat panel is open.
     #[cfg(target_os = "macos")]
     chat_open: bool,
+
+    /// The Settings window, opened from the application menu.
+    #[cfg(target_os = "macos")]
+    settings: crate::desktop::settings::Settings,
 }
 
 fn truncate_with_ellipsis(input: &str, max_length: usize) -> String {
@@ -193,50 +197,6 @@ impl Drop for Gui {
     }
 }
 
-/// The Onde shared model cache App Group.
-///
-/// Every Onde-based app on this team points at this group, so weights
-/// downloaded by one are already present for the next. Models run to a couple
-/// of gigabytes each, which makes the difference between one download and one
-/// download per app.
-#[cfg(target_os = "macos")]
-const ONDE_APP_GROUP: &str = "group.com.ondeinference.apps";
-
-/// Base directory handed to onde for model storage.
-///
-/// Returns the *container root*, not a subdirectory: onde appends `models/` and
-/// `models/hub` itself and seeds `HF_HOME` and `HF_HUB_CACHE` from them.
-/// Passing an already-suffixed path would bury the cache at `models/models/hub`
-/// and quietly miss anything another app had downloaded.
-///
-/// Falls back to app-private Application Support when the group container is
-/// unavailable, which is what happens if the entitlement is missing from the
-/// signature or the profile does not carry the group. That failure is silent by
-/// design on Apple's side, so the log line is the only way to notice that
-/// sharing is off and the app is about to download its own copy.
-#[cfg(target_os = "macos")]
-fn model_cache_dir() -> Option<std::path::PathBuf> {
-    use objc2_foundation::{NSFileManager, NSString};
-
-    let group = NSString::from_str(ONDE_APP_GROUP);
-    let container =
-        NSFileManager::defaultManager().containerURLForSecurityApplicationGroupIdentifier(&group);
-
-    if let Some(url) = container &&
-        let Some(path) = url.path()
-    {
-        let path = std::path::PathBuf::from(path.to_string());
-        log::info!("Onde model cache: shared group container at {}", path.display());
-        return Some(path);
-    }
-
-    warn!(
-        "Onde App Group {ONDE_APP_GROUP} is unavailable; falling back to a private model cache. \
-         Models will not be shared with other Onde apps."
-    );
-    crate::prefs::default_config_dir()
-}
-
 impl Gui {
     pub(crate) fn new(
         winit_window: &Window,
@@ -287,9 +247,11 @@ impl Gui {
             favicon_textures: Default::default(),
             pending_accesskit_updates: vec![],
             #[cfg(target_os = "macos")]
-            inference: crate::desktop::inference::Inference::new(model_cache_dir()),
+            inference: crate::desktop::inference::Inference::new(),
             #[cfg(target_os = "macos")]
             chat_open: false,
+            #[cfg(target_os = "macos")]
+            settings: Default::default(),
         }
     }
 
@@ -300,7 +262,11 @@ impl Gui {
     /// read or write, so polling here costs less than routing events back
     /// through the winit loop would.
     #[cfg(target_os = "macos")]
-    fn chat_panel(ui: &mut egui::Ui, inference: &mut crate::desktop::inference::Inference) {
+    fn chat_panel(
+        ui: &mut egui::Ui,
+        inference: &mut crate::desktop::inference::Inference,
+        settings: &mut crate::desktop::settings::Settings,
+    ) {
         use crate::desktop::inference::Status;
 
         ui.horizontal(|ui| {
@@ -308,6 +274,9 @@ impl Gui {
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui.button("Clear").clicked() {
                     inference.clear();
+                }
+                if ui.button("Models…").on_hover_text("Manage on-device models").clicked() {
+                    settings.open(inference);
                 }
             });
         });
@@ -324,13 +293,17 @@ impl Gui {
             match &*status {
                 Status::Idle => {
                     drop(status);
-                    if ui.button("Download and load model").clicked() {
+                    let model = inference.selected_model_name();
+                    if ui.button(format!("Load {model}")).clicked() {
                         inference.ensure_model();
                     }
                     ui.label(
-                        egui::RichText::new("About 2 GB on first use.")
-                            .small()
-                            .weak(),
+                        egui::RichText::new(
+                            "Downloads a few gigabytes the first time. Choose a different \
+                             model in Settings.",
+                        )
+                        .small()
+                        .weak(),
                     );
                     false
                 },
@@ -338,9 +311,11 @@ impl Gui {
                     ui.add(egui::ProgressBar::new(*fraction).text(detail.clone()));
                     false
                 },
-                Status::Loading => {
-                    ui.spinner();
-                    ui.label("Loading model…");
+                Status::Loading { model } => {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label(format!("Loading {model}…"));
+                    });
                     false
                 },
                 Status::Ready { model } => {
@@ -556,6 +531,8 @@ impl Gui {
             inference,
             #[cfg(target_os = "macos")]
             chat_open,
+            #[cfg(target_os = "macos")]
+            settings,
             ..
         } = self;
 
@@ -871,7 +848,20 @@ impl Gui {
                     .default_size(320.0)
                     .min_size(240.0)
                     .resizable(true)
-                    .show_inside(ctx, |ui| Gui::chat_panel(ui, inference));
+                    .show_inside(ctx, |ui| Gui::chat_panel(ui, inference, settings));
+            }
+
+            // The application menu can only raise a flag: AppKit delivers the
+            // click while winit owns the run loop. Only the focused window
+            // claims it, so Settings opens once instead of once per window.
+            #[cfg(target_os = "macos")]
+            {
+                if headed_window.winit_window().has_focus() &&
+                    crate::platform::macos::menu::take_settings_request()
+                {
+                    settings.open(inference);
+                }
+                settings.show(ctx, inference);
             }
 
             let scale =

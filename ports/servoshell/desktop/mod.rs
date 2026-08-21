@@ -13,6 +13,8 @@ pub(crate) mod event_loop;
 pub(crate) mod gamepad;
 pub mod geometry;
 mod gui;
+#[cfg(target_os = "macos")]
+pub(crate) mod inference;
 pub(crate) mod headed_window;
 mod headless_window;
 mod keyutils;

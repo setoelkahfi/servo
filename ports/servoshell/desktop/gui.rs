@@ -71,6 +71,15 @@ pub struct Gui {
     /// AccessKit tree updates pending the next egui tick.
     /// This allows us to ensure that graft nodes are sent before the subtrees they graft.
     pending_accesskit_updates: Vec<accesskit::TreeUpdate>,
+
+    /// On-device chat. Constructed eagerly because it is cheap until a model
+    /// is requested, so the panel can be opened without a startup cost.
+    #[cfg(target_os = "macos")]
+    inference: crate::desktop::inference::Inference,
+
+    /// Whether the chat panel is open.
+    #[cfg(target_os = "macos")]
+    chat_open: bool,
 }
 
 fn truncate_with_ellipsis(input: &str, max_length: usize) -> String {
@@ -184,6 +193,50 @@ impl Drop for Gui {
     }
 }
 
+/// The Onde shared model cache App Group.
+///
+/// Every Onde-based app on this team points at this group, so weights
+/// downloaded by one are already present for the next. Models run to a couple
+/// of gigabytes each, which makes the difference between one download and one
+/// download per app.
+#[cfg(target_os = "macos")]
+const ONDE_APP_GROUP: &str = "group.com.ondeinference.apps";
+
+/// Base directory handed to onde for model storage.
+///
+/// Returns the *container root*, not a subdirectory: onde appends `models/` and
+/// `models/hub` itself and seeds `HF_HOME` and `HF_HUB_CACHE` from them.
+/// Passing an already-suffixed path would bury the cache at `models/models/hub`
+/// and quietly miss anything another app had downloaded.
+///
+/// Falls back to app-private Application Support when the group container is
+/// unavailable, which is what happens if the entitlement is missing from the
+/// signature or the profile does not carry the group. That failure is silent by
+/// design on Apple's side, so the log line is the only way to notice that
+/// sharing is off and the app is about to download its own copy.
+#[cfg(target_os = "macos")]
+fn model_cache_dir() -> Option<std::path::PathBuf> {
+    use objc2_foundation::{NSFileManager, NSString};
+
+    let group = NSString::from_str(ONDE_APP_GROUP);
+    let container =
+        NSFileManager::defaultManager().containerURLForSecurityApplicationGroupIdentifier(&group);
+
+    if let Some(url) = container &&
+        let Some(path) = url.path()
+    {
+        let path = std::path::PathBuf::from(path.to_string());
+        log::info!("Onde model cache: shared group container at {}", path.display());
+        return Some(path);
+    }
+
+    warn!(
+        "Onde App Group {ONDE_APP_GROUP} is unavailable; falling back to a private model cache. \
+         Models will not be shared with other Onde apps."
+    );
+    crate::prefs::default_config_dir()
+}
+
 impl Gui {
     pub(crate) fn new(
         winit_window: &Window,
@@ -233,7 +286,124 @@ impl Gui {
             can_go_forward: false,
             favicon_textures: Default::default(),
             pending_accesskit_updates: vec![],
+            #[cfg(target_os = "macos")]
+            inference: crate::desktop::inference::Inference::new(model_cache_dir()),
+            #[cfg(target_os = "macos")]
+            chat_open: false,
         }
+    }
+
+    /// Draw the on-device chat panel.
+    ///
+    /// Reads engine state every frame rather than subscribing to it. The
+    /// engine publishes through mutexes that are only ever held for a field
+    /// read or write, so polling here costs less than routing events back
+    /// through the winit loop would.
+    #[cfg(target_os = "macos")]
+    fn chat_panel(ui: &mut egui::Ui, inference: &mut crate::desktop::inference::Inference) {
+        use crate::desktop::inference::Status;
+
+        ui.horizontal(|ui| {
+            ui.heading("Chat");
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.button("Clear").clicked() {
+                    inference.clear();
+                }
+            });
+        });
+        ui.label(
+            egui::RichText::new("Runs on this Mac. Nothing is sent to a server.")
+                .small()
+                .weak(),
+        );
+        ui.separator();
+
+        // Status line, and the only place a model load can be started.
+        let ready = {
+            let status = inference.status();
+            match &*status {
+                Status::Idle => {
+                    drop(status);
+                    if ui.button("Download and load model").clicked() {
+                        inference.ensure_model();
+                    }
+                    ui.label(
+                        egui::RichText::new("About 2 GB on first use.")
+                            .small()
+                            .weak(),
+                    );
+                    false
+                },
+                Status::Downloading { fraction, detail } => {
+                    ui.add(egui::ProgressBar::new(*fraction).text(detail.clone()));
+                    false
+                },
+                Status::Loading => {
+                    ui.spinner();
+                    ui.label("Loading model…");
+                    false
+                },
+                Status::Ready { model } => {
+                    ui.label(egui::RichText::new(model.clone()).small().weak());
+                    true
+                },
+                Status::Failed(error) => {
+                    ui.colored_label(ui.visuals().error_fg_color, error.clone());
+                    drop(status);
+                    if ui.button("Try again").clicked() {
+                        inference.ensure_model();
+                    }
+                    false
+                },
+            }
+        };
+
+        ui.separator();
+
+        // Transcript. Reserve room for the input row so a long conversation
+        // does not push it off the bottom of the panel.
+        let input_height = 64.0;
+        let transcript_height = (ui.available_height() - input_height).max(0.0);
+        egui::ScrollArea::vertical()
+            .max_height(transcript_height)
+            .stick_to_bottom(true)
+            .show(ui, |ui| {
+                for turn in inference.transcript().iter() {
+                    let (name, color) = match turn.role {
+                        onde::inference::ChatRole::User => ("You", ui.visuals().strong_text_color()),
+                        _ => ("Assistant", ui.visuals().text_color()),
+                    };
+                    ui.label(egui::RichText::new(name).small().strong());
+                    ui.add(egui::Label::new(egui::RichText::new(&turn.text).color(color)).wrap());
+                    ui.add_space(6.0);
+                }
+                if inference.is_generating() {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label(egui::RichText::new("Thinking…").small().weak());
+                    });
+                }
+            });
+
+        // Input row, pinned to the bottom.
+        ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
+            let busy = inference.is_generating();
+            ui.horizontal(|ui| {
+                let send = ui.add_enabled(ready && !busy, egui::Button::new("Send"));
+                let field = ui.add_enabled(
+                    ready && !busy,
+                    egui::TextEdit::singleline(&mut inference.draft)
+                        .desired_width(ui.available_width())
+                        .hint_text("Ask something"),
+                );
+                let submitted = field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                if send.clicked() || submitted {
+                    let message = std::mem::take(&mut inference.draft);
+                    inference.send(message);
+                    field.request_focus();
+                }
+            });
+        });
     }
 
     pub(crate) fn has_keyboard_focus(&self) -> bool {
@@ -382,6 +552,10 @@ impl Gui {
             location,
             location_dirty,
             favicon_textures,
+            #[cfg(target_os = "macos")]
+            inference,
+            #[cfg(target_os = "macos")]
+            chat_open,
             ..
         } = self;
 
@@ -459,6 +633,25 @@ impl Gui {
                             if home_button.clicked() {
                                 *location_dirty = false;
                                 window.queue_user_interface_command(UserInterfaceCommand::GoHome);
+                            }
+
+                            #[cfg(target_os = "macos")]
+                            {
+                                let chat_button = ui.add(Gui::toolbar_button("✦"));
+                                chat_button.widget_info(|| {
+                                    let mut info = WidgetInfo::new(WidgetType::Button);
+                                    info.label = Some("Chat".into());
+                                    info
+                                });
+                                if chat_button.clicked()
+                                    || ui.input(|input| {
+                                        input
+                                            .clone()
+                                            .consume_key(Modifiers::COMMAND | Modifiers::SHIFT, Key::A)
+                                    })
+                                {
+                                    *chat_open = !*chat_open;
+                                }
                             }
 
                             match self.load_status {
@@ -662,6 +855,23 @@ impl Gui {
                 *toolbar_height = Length::new(outer.response.rect.max.y);
             } else {
                 *toolbar_height = Length::default();
+            }
+
+            // Drawn before `available_rect_before_wrap` is read below, so the
+            // WebView is resized around the panel instead of being covered by
+            // it. Opening the panel narrows the page rather than hiding part
+            // of it.
+            #[cfg(target_os = "macos")]
+            if *chat_open {
+                let frame = egui::Frame::default()
+                    .fill(ctx.style().visuals.window_fill)
+                    .inner_margin(8.0);
+                Panel::right("chat")
+                    .frame(frame)
+                    .default_size(320.0)
+                    .min_size(240.0)
+                    .resizable(true)
+                    .show_inside(ctx, |ui| Gui::chat_panel(ui, inference));
             }
 
             let scale =

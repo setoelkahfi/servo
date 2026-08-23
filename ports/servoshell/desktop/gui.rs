@@ -3,9 +3,19 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 use std::collections::HashMap;
-#[cfg(any(target_os = "windows", target_os = "linux", target_os = "freebsd"))]
+#[cfg(any(
+    target_os = "windows",
+    target_os = "linux",
+    target_os = "freebsd",
+    target_os = "macos"
+))]
 use std::fs;
-#[cfg(any(target_os = "windows", target_os = "linux", target_os = "freebsd"))]
+#[cfg(any(
+    target_os = "windows",
+    target_os = "linux",
+    target_os = "freebsd",
+    target_os = "macos"
+))]
 use std::path::Path;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -17,12 +27,22 @@ use egui::{
     Button, FontDefinitions, Id, Key, Label, LayerId, Modifiers, Order, PaintCallback, Panel, Vec2,
     WidgetInfo, WidgetType, pos2,
 };
-#[cfg(any(target_os = "windows", target_os = "linux", target_os = "freebsd"))]
+#[cfg(any(
+    target_os = "windows",
+    target_os = "linux",
+    target_os = "freebsd",
+    target_os = "macos"
+))]
 use egui::{FontData, FontFamily};
 use egui_glow::{CallbackFn, EguiGlow};
 use egui_winit::EventResponse;
 use euclid::{Length, Point2D, Rect, Scale, Size2D};
-#[cfg(any(target_os = "windows", target_os = "linux", target_os = "freebsd"))]
+#[cfg(any(
+    target_os = "windows",
+    target_os = "linux",
+    target_os = "freebsd",
+    target_os = "macos"
+))]
 use log::info;
 use servo::{
     DeviceIndependentPixel, DevicePixel, Image, LoadStatus, OffscreenRenderingContext, PixelFormat,
@@ -84,8 +104,21 @@ fn truncate_with_ellipsis(input: &str, max_length: usize) -> String {
     }
 }
 
-#[cfg(any(target_os = "windows", target_os = "linux", target_os = "freebsd"))]
-fn load_cjk_fonts(font_candidates: &[(&str, &str)]) -> FontDefinitions {
+/// Load whichever of `font_candidates` exist and add them to the proportional
+/// family.
+///
+/// `prefer` decides whether they go in front of egui's bundled faces or behind
+/// them. In front means they also render Latin text, which is what the CJK
+/// faces on Windows and Linux have always done. Behind means they are consulted
+/// only for glyphs the bundled faces lack, which is what macOS wants: the
+/// chrome should keep looking like the rest of the system.
+#[cfg(any(
+    target_os = "windows",
+    target_os = "linux",
+    target_os = "freebsd",
+    target_os = "macos"
+))]
+fn load_cjk_fonts(font_candidates: &[(&str, &str)], prefer: bool) -> FontDefinitions {
     let mut fonts = FontDefinitions::default();
     let mut loaded_font_names = Vec::new();
 
@@ -112,7 +145,11 @@ fn load_cjk_fonts(font_candidates: &[(&str, &str)]) -> FontDefinitions {
     if !loaded_font_names.is_empty() {
         let proportional = fonts.families.get_mut(&FontFamily::Proportional).unwrap();
         for font_name in loaded_font_names.iter() {
-            proportional.insert(0, font_name.clone());
+            if prefer {
+                proportional.insert(0, font_name.clone());
+            } else {
+                proportional.push(font_name.clone());
+            }
         }
     }
 
@@ -121,10 +158,13 @@ fn load_cjk_fonts(font_candidates: &[(&str, &str)]) -> FontDefinitions {
 
 #[cfg(target_os = "windows")]
 fn configure_fonts() -> FontDefinitions {
-    load_cjk_fonts(&[
-        (r"C:\Windows\Fonts\malgun.ttf", "Malgun Gothic"), // Korean
-        (r"C:\Windows\Fonts\msyh.ttc", "Microsoft YaHei"), // Chinese + Japanese
-    ])
+    load_cjk_fonts(
+        &[
+            (r"C:\Windows\Fonts\malgun.ttf", "Malgun Gothic"), // Korean
+            (r"C:\Windows\Fonts\msyh.ttc", "Microsoft YaHei"), // Chinese + Japanese
+        ],
+        true,
+    )
 }
 
 #[cfg(any(target_os = "linux", target_os = "freebsd"))]
@@ -167,14 +207,43 @@ fn configure_fonts() -> FontDefinitions {
             "/usr/local/share/fonts/wqy/wqy-microhei.ttc",
             "WenQuanYi Micro Hei",
         ), // FreeBSD
-    ])
+    ], true)
 }
 
 #[cfg(target_os = "macos")]
 fn configure_fonts() -> FontDefinitions {
-    // TODO: Default proportional fonts: ["Ubuntu-Light", "NotoEmoji-Regular", "emoji-icon-font"]
-    // does not support CJK. Add them for Mac.
-    FontDefinitions::default()
+    // egui's bundled faces cover Latin and little else, so any chrome that
+    // shows page-supplied text renders tofu outside that range. The select
+    // element popup is drawn here rather than by the engine, so a language
+    // picker on a site like about.google turns into a column of boxes.
+    //
+    // These are fallbacks, not preferences: the toolbar keeps egui's own face
+    // and only unmapped glyphs reach them. Arial Unicode comes first because it
+    // covers most of the BMP on its own; the rest fill in scripts it renders
+    // poorly, and any that a given macOS release has moved or dropped are
+    // skipped.
+    load_cjk_fonts(
+        &[
+            (
+                "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
+                "Arial Unicode MS",
+            ),
+            ("/System/Library/Fonts/Hiragino Sans GB.ttc", "Hiragino Sans GB"), // Chinese
+            (
+                "/System/Library/Fonts/ヒラギノ角ゴシック W3.ttc",
+                "Hiragino Kaku Gothic", // Japanese
+            ),
+            ("/System/Library/Fonts/AppleSDGothicNeo.ttc", "Apple SD Gothic Neo"), // Korean
+            ("/System/Library/Fonts/GeezaPro.ttc", "Geeza Pro"),                   // Arabic
+            ("/System/Library/Fonts/Supplemental/Thonburi.ttc", "Thonburi"),       // Thai
+            (
+                "/System/Library/Fonts/Supplemental/DevanagariMT.ttc",
+                "Devanagari MT",
+            ),
+            ("/System/Library/Fonts/Apple Symbols.ttf", "Apple Symbols"),
+        ],
+        false,
+    )
 }
 
 impl Drop for Gui {

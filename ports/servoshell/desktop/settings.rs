@@ -18,6 +18,17 @@ use crate::prefs::{SMB_DAILY_WEB_PREFS, default_config_dir};
 /// letting a long value push the columns apart.
 const LABEL_COLUMN_WIDTH: f32 = 140.0;
 
+/// Write a path under the user's home directory the way people write it, so the
+/// row reads `~/Library/…` rather than spelling out the account name.
+fn abbreviate_home(path: &str) -> String {
+    match std::env::var("HOME") {
+        Ok(home) if !home.is_empty() && path.starts_with(&home) => {
+            format!("~{}", &path[home.len()..])
+        },
+        _ => path.to_owned(),
+    }
+}
+
 #[derive(Default)]
 pub(crate) struct Settings {
     open: bool,
@@ -42,6 +53,10 @@ impl Settings {
             .collapsible(false)
             .default_size([560.0, 480.0])
             .min_width(420.0)
+            // Centred on first open. Left at egui's default the window lands in
+            // the top-left corner, over the toolbar it was just opened from.
+            .pivot(egui::Align2::CENTER_CENTER)
+            .default_pos(ctx.screen_rect().center())
             .show(ctx, |ui| {
                 egui::ScrollArea::vertical().show(ui, |ui| {
                     Self::about_panel(ui);
@@ -69,7 +84,7 @@ impl Settings {
         let engine_version = env!("CARGO_PKG_VERSION");
         let user_agent = servo::prefs::get().user_agent.clone();
         let profile_directory = default_config_dir()
-            .map(|path| path.display().to_string())
+            .map(|path| abbreviate_home(&path.display().to_string()))
             .unwrap_or_else(|| "Unavailable".to_owned());
 
         egui::Grid::new("settings-about-grid")

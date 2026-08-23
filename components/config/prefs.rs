@@ -128,8 +128,6 @@ pub struct Preferences {
     pub dom_webgpu_enabled: bool,
     /// List of comma-separated backends to be used by wgpu.
     pub dom_webgpu_wgpu_backend: String,
-    // feature: AbortController | #34866 | Web/API/AbortController
-    pub dom_abort_controller_enabled: bool,
     // feature: Adopted Stylesheet | #38132 | Web/API/Document/adoptedStyleSheets
     pub dom_adoptedstylesheet_enabled: bool,
     pub dom_allow_preloading_module_descendants: bool,
@@ -154,7 +152,6 @@ pub struct Preferences {
     ///
     /// See <https://github.com/servo/servo/pull/45301> for measurements.
     pub dom_canvas_msg_buffer_size: u64,
-    pub dom_clipboardevent_enabled: bool,
     pub dom_composition_event_enabled: bool,
     // feature: CookieStore | #37674 | Web/API/CookieStore
     pub dom_cookiestore_enabled: bool,
@@ -182,9 +179,6 @@ pub struct Preferences {
     // feature: IntersectionObserver | #35767 | Web/API/Intersection_Observer_API
     pub dom_intersection_observer_enabled: bool,
     pub dom_microdata_testing_enabled: bool,
-    pub dom_uievent_which_enabled: bool,
-    // feature: MutationObserver | #6633 | Web/API/MutationObserver
-    pub dom_mutation_observer_enabled: bool,
     // feature: Navigator.registerProtocolHandler() | #40615 | Web/API/Navigator/registerProtocolHandler
     pub dom_navigator_protocol_handlers_enabled: bool,
     // feature: Notification API | #34841 | Web/API/Notifications_API
@@ -344,6 +338,18 @@ pub struct Preferences {
     /// The goal of these two values is to allow tuning Servo's parallelism for both wide
     /// and deep trees.
     pub layout_parallelism_job_size_minimum: u64,
+    /// Gates a grab-bag of CSS properties (mask-image, contain, appearance, and
+    /// others) that stylo/Gecko implement but that have no consumer anywhere in
+    /// Servo's layout or paint code. Defaulting this off (upstream's choice)
+    /// means an author declaration like `mask-image` is dropped at parse time —
+    /// not merely "unpainted" — so authors relying on `@supports (mask-image: …)`
+    /// or a masked, dark-background icon pattern (which App Store product pages
+    /// use) get the *unmasked* background box rendered solid, not a graceful
+    /// fallback. smbCloud Browser turns this on so `mask-image` at least parses and
+    /// is visible to layout, which is what lets `build_background_for_painter`
+    /// (see display_list/mod.rs) suppress that background paint instead of
+    /// drawing a wrong opaque box. None of this bucket's other properties have
+    /// any Servo-side consumer, so enabling it is otherwise a no-op.
     pub layout_unimplemented: bool,
     // feature: Variable fonts | #38800 | Web/CSS/Guides/Fonts/Variable_fonts
     pub layout_variable_fonts_enabled: bool,
@@ -434,7 +440,6 @@ impl Preferences {
             editing_caret_blink_time: 600,
             devtools_server_enabled: false,
             devtools_server_listen_address: String::new(),
-            dom_abort_controller_enabled: true,
             dom_adoptedstylesheet_enabled: false,
             dom_allow_preloading_module_descendants: false,
             dom_allow_scripts_to_close_windows: false,
@@ -445,7 +450,6 @@ impl Preferences {
             dom_canvas_text_enabled: true,
             dom_canvas_backend: String::new(),
             dom_canvas_msg_buffer_size: 16,
-            dom_clipboardevent_enabled: true,
             dom_composition_event_enabled: false,
             dom_cookiestore_enabled: false,
             dom_credential_management_enabled: false,
@@ -462,8 +466,6 @@ impl Preferences {
             dom_indexeddb_enabled: false,
             dom_intersection_observer_enabled: false,
             dom_microdata_testing_enabled: false,
-            dom_uievent_which_enabled: true,
-            dom_mutation_observer_enabled: true,
             dom_navigator_protocol_handlers_enabled: false,
             dom_notification_enabled: false,
             dom_parallel_css_parsing_enabled: true,
@@ -577,7 +579,7 @@ impl Preferences {
             layout_threads: 3,
             layout_parallelism_job_count_minimum: 4,
             layout_parallelism_job_size_minimum: 16,
-            layout_unimplemented: false,
+            layout_unimplemented: true,
             layout_variable_fonts_enabled: false,
             layout_writing_mode_enabled: false,
             media_glvideo_enabled: false,

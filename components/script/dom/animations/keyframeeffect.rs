@@ -79,7 +79,7 @@ impl KeyframeEffect {
         }
     }
 
-    fn new_with_proto_and_cx(
+    fn new_with_proto(
         cx: &mut JSContext,
         window: &Window,
         proto: Option<HandleObject>,
@@ -88,7 +88,7 @@ impl KeyframeEffect {
     }
 
     pub(crate) fn new(cx: &mut JSContext, window: &Window) -> DomRoot<Self> {
-        Self::new_with_proto_and_cx(cx, window, None)
+        Self::new_with_proto(cx, window, None)
     }
 }
 
@@ -250,7 +250,6 @@ impl KeyframeEffectMethods<crate::DomTypeHolder> for KeyframeEffect {
 }
 
 /// <https://drafts.csswg.org/web-animations-1/#process-a-keyframes-argument>
-#[expect(unsafe_code)]
 fn process_a_keyframes_argument(
     cx: &mut JSContext,
     document: &Document,
@@ -268,29 +267,25 @@ fn process_a_keyframes_argument(
     // Step 5. Perform the steps corresponding to the first matching condition below:
     rooted!(&in(cx) let iterable = ObjectValue(keyframes));
     let mut keyframes = Vec::new();
-    let result = for_of(
-        unsafe { cx.raw_cx() },
-        iterable.handle(),
-        |iterator_element| {
-            // Step 5.3.6 If Type(nextItem) is not Undefined, Null or Object, then throw a TypeError
-            // and abort these steps.
-            //
-            // Note: nextItem is later passed to "process a keyframe like object" which cannot handle undefined
-            // or null values. This seems to be a bug in the specification which is tracked by
-            // https://github.com/w3c/csswg-drafts/issues/14113
-            if !iterator_element.is_object() {
-                return Err(ForOfIterationFailure::Other(Error::Type(
-                    c"Keyframe must be an object".to_owned(),
-                )));
-            }
+    let result = for_of(cx, iterable.handle(), |cx, iterator_element| {
+        // Step 5.3.6 If Type(nextItem) is not Undefined, Null or Object, then throw a TypeError
+        // and abort these steps.
+        //
+        // Note: nextItem is later passed to "process a keyframe like object" which cannot handle undefined
+        // or null values. This seems to be a bug in the specification which is tracked by
+        // https://github.com/w3c/csswg-drafts/issues/14113
+        if !iterator_element.is_object() {
+            return Err(ForOfIterationFailure::Other(Error::Type(
+                c"Keyframe must be an object".to_owned(),
+            )));
+        }
 
-            // Step 5.3.7 Append to processed keyframes the result of running the procedure to process a
-            // keyframe-like object passing nextItem as the keyframe input with the allow lists flag set to false.
-            keyframes.push(keyframe_from_value(cx, document, iterator_element)?);
+        // Step 5.3.7 Append to processed keyframes the result of running the procedure to process a
+        // keyframe-like object passing nextItem as the keyframe input with the allow lists flag set to false.
+        keyframes.push(keyframe_from_value(cx, document, iterator_element)?);
 
-            Ok(ControlFlow::Continue(()))
-        },
-    );
+        Ok(ControlFlow::Continue(()))
+    });
     match result {
         Ok(()) => Ok(keyframes),
         Err(ForOfIterationFailure::ValueIsNotIterable) => {
@@ -417,7 +412,7 @@ fn get_property_declarations(
     // The spec tells us to iterate over all animatable properties and see if they're defined
     // on the object. Instead we can iterate over the own properties of the object and see
     // if they're animated properties, that's easier.
-    let mut ids = unsafe { IdVector::new(cx.raw_cx()) };
+    let mut ids = IdVector::new(cx);
     if !unsafe { GetPropertyKeys(cx, object, JSITER_OWNONLY, ids.handle_mut()) } {
         return Ok(Vec::new());
     }

@@ -203,7 +203,7 @@ impl PaddingBorderMargin {
 /// Resolved `aspect-ratio` property with respect to a specific element. Depends
 /// on that element's `box-sizing` (and padding and border, if that `box-sizing`
 /// is `border-box`).
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, MallocSizeOf, PartialEq)]
 pub(crate) struct AspectRatio {
     /// If the element that this aspect ratio belongs to uses box-sizing:
     /// border-box, and the aspect-ratio property does not contain "auto", then
@@ -352,6 +352,11 @@ pub(crate) trait ComputedValuesExt {
     fn establishes_block_formatting_context(&self, fragment_flags: FragmentFlags) -> bool;
     fn establishes_stacking_context(&self, fragment_flags: FragmentFlags) -> bool;
     fn establishes_scroll_container(&self, fragment_flags: FragmentFlags) -> bool;
+    fn establishes_scroll_container_in_axis(
+        &self,
+        fragment_flags: FragmentFlags,
+        axis: AxisDirection,
+    ) -> bool;
     fn establishes_containing_block_for_absolute_descendants(
         &self,
         fragment_flags: FragmentFlags,
@@ -753,6 +758,23 @@ impl ComputedValuesExt for ComputedValues {
     fn establishes_scroll_container(&self, fragment_flags: FragmentFlags) -> bool {
         self.effective_overflow(fragment_flags)
             .establishes_scroll_container()
+    }
+
+    /// Whether this box is a scroll container in the given axis. Note that `overflow: clip`
+    /// isn't scrollable, and it can be specified in a single axis.
+    fn establishes_scroll_container_in_axis(
+        &self,
+        fragment_flags: FragmentFlags,
+        axis: AxisDirection,
+    ) -> bool {
+        let overflow = self.effective_overflow(fragment_flags);
+        let is_horizontal_axis =
+            (axis == AxisDirection::Inline) == self.writing_mode.is_horizontal();
+        if is_horizontal_axis {
+            overflow.x.is_scrollable()
+        } else {
+            overflow.y.is_scrollable()
+        }
     }
 
     /// Returns true if this fragment establishes a new stacking context and false otherwise.

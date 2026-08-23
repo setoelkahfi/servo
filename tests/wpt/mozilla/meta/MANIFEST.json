@@ -13161,6 +13161,13 @@
       {}
      ]
     ],
+    "svg-viewbox-intrinsic-ratio.html": [
+     "d5962661c22ff9aabe51f78dedbd3aa126fe8b19",
+     [
+      null,
+      {}
+     ]
+    ],
     "test-font-family-parsing.html": [
      "fb43bee5635fdfe92f9d187b3f7d3087bff0c76b",
      [
@@ -14521,7 +14528,7 @@
      ]
     ],
     "interfaces.https.html": [
-     "5554472d742e2d7ae640978004be13abdab8e8ca",
+     "c2f50ff3984b553a116252ac5bf376e9a2f4814e",
      [
       null,
       {}
@@ -15031,6 +15038,13 @@
     },
     "servo-max-session-history.html": [
      "79fe4073601d7cbe9620132b281065aa6903af47",
+     [
+      null,
+      {}
+     ]
+    ],
+    "servo_internals.html": [
+     "39a8f6f0f7da1dd398062ea25ca14fc6dcb2b82f",
      [
       null,
       {}

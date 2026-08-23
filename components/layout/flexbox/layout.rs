@@ -2355,6 +2355,34 @@ impl FlexItemBox {
                 return Au::zero();
             }
 
+            let is_replaced = self.independent_formatting_context.is_replaced();
+
+            // The min-content size of the contents, ignoring any preferred aspect ratio.
+            // A box with a preferred aspect ratio contributes the size transferred through
+            // that ratio, but the content size suggestion is about the actual contents, and
+            // the ratio is instead accounted for by the explicit clamping below.
+            let min_content_main_size_ignoring_ratio = || {
+                if preferred_aspect_ratio.is_none() || is_replaced {
+                    return main_content_sizes.min_content;
+                }
+                if cross_axis_is_item_block_axis {
+                    let constraint_space = ConstraintSpace::new(cross_size, style, None);
+                    self.independent_formatting_context
+                        .inline_content_sizes(layout_context, &constraint_space)
+                        .sizes
+                        .min_content
+                } else {
+                    self.layout_for_block_content_size(
+                        flex_context_getter(),
+                        &pbm_auto_is_zero,
+                        content_box_sizes,
+                        None,
+                        automatic_cross_size_for_intrinsic_sizing,
+                        IntrinsicSizingMode::Size,
+                    )
+                }
+            };
+
             // > **specified size suggestion**
             // > If the item’s preferred main size is definite and not automatic, then the specified
             // > size suggestion is that size. It is otherwise undefined.
@@ -2362,14 +2390,12 @@ impl FlexItemBox {
                 .preferred
                 .maybe_resolve_extrinsic(stretch_size.main);
 
-            let is_replaced = self.independent_formatting_context.is_replaced();
-
             // > **content size suggestion**
             // > The content size suggestion is the min-content size in the main axis, clamped, if it has a
             // > preferred aspect ratio, by any definite minimum and maximum cross sizes converted through the
             // > aspect ratio.
             let content_size_suggestion = match preferred_aspect_ratio {
-                Some(ratio) => main_content_sizes.min_content.clamp_between_extremums(
+                Some(ratio) => min_content_main_size_ignoring_ratio().clamp_between_extremums(
                     ratio.compute_dependent_size(main_axis, min_cross_size),
                     max_cross_size.map(|l| ratio.compute_dependent_size(main_axis, l)),
                 ),

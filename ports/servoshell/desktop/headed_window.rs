@@ -57,7 +57,7 @@ use crate::window::{
     ServoShellWindowId,
 };
 
-pub(crate) const INITIAL_WINDOW_TITLE: &str = "smb Browser";
+pub(crate) const INITIAL_WINDOW_TITLE: &str = "smbCloud Browser";
 
 pub struct HeadedWindow {
     /// The egui interface that is responsible for showing the user interface elements of
@@ -555,10 +555,12 @@ impl HeadedWindow {
             {
                 return true;
             }
-            // Otherwise, if the cursor is over the egui interface, forward the event.
-            self.last_mouse_position
-                .get()
-                .is_none_or(|point| self.gui.borrow().is_in_egui_toolbar_rect(point))
+            // Otherwise, if the cursor is over the egui interface, forward the event. That
+            // means the toolbar itself, plus any menu the toolbar has opened over the page.
+            self.last_mouse_position.get().is_none_or(|point| {
+                let gui = self.gui.borrow();
+                gui.is_in_egui_toolbar_rect(point) || gui.is_over_egui_popup(point)
+            })
         };
 
         // Handle the event

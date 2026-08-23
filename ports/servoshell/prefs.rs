@@ -55,7 +55,7 @@ pub(crate) static EXPERIMENTAL_PREFS: &[&str] = &[
 ];
 
 /// Web APIs required by mainstream daily-use sites. Servo still ships these
-/// behind preferences, but smb Browser treats them as part of its compatibility
+/// behind preferences, but smbCloud Browser treats them as part of its compatibility
 /// baseline rather than asking users to discover an experimental toggle.
 const SMB_DAILY_WEB_PREFS: &[&str] = &[
     "dom_adoptedstylesheet_enabled",
@@ -175,7 +175,7 @@ impl Default for ServoShellPreferences {
 ))]
 pub fn default_config_dir() -> Option<PathBuf> {
     let mut config_dir = ::dirs::config_dir().unwrap();
-    config_dir.push("smb-browser");
+    config_dir.push("smbcloud-browser");
     Some(config_dir)
 }
 
@@ -192,14 +192,14 @@ pub fn default_config_dir() -> Option<PathBuf> {
     // FIXME: use `config_dir()` ($HOME/Library/Preferences)
     // instead of `data_dir()` ($HOME/Library/Application Support) ?
     let mut config_dir = ::dirs::data_dir().unwrap();
-    config_dir.push("smb Browser");
+    config_dir.push("smbCloud Browser");
     Some(config_dir)
 }
 
 #[cfg(target_os = "windows")]
 pub fn default_config_dir() -> Option<PathBuf> {
     let mut config_dir = ::dirs::config_dir().unwrap();
-    config_dir.push("smb Browser");
+    config_dir.push("smbCloud Browser");
     Some(config_dir)
 }
 

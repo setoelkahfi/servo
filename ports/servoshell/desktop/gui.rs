@@ -24,7 +24,6 @@ use egui_winit::EventResponse;
 use euclid::{Length, Point2D, Rect, Scale, Size2D};
 #[cfg(any(target_os = "windows", target_os = "linux", target_os = "freebsd"))]
 use log::info;
-use log::warn;
 use servo::{
     DeviceIndependentPixel, DevicePixel, Image, LoadStatus, OffscreenRenderingContext, PixelFormat,
     RenderingContext, WebView, WebViewId,
@@ -393,6 +392,12 @@ impl Gui {
                 memory.surrender_focus(focused);
             }
         });
+
+        // Clicking web content also dismisses any open toolbar menu, the way it would in any
+        // other browser. egui never sees that click, because it was routed to the page, so it
+        // cannot close the menu itself. The menu would otherwise hang over the content until
+        // the user found something else to click.
+        egui::Popup::close_all(&self.context.egui_ctx);
     }
 
     pub(crate) fn on_window_event(
@@ -415,6 +420,22 @@ impl Gui {
         position: Point2D<f32, DeviceIndependentPixel>,
     ) -> bool {
         position.y < self.toolbar_height.get()
+    }
+
+    /// Return true iff the given position is over an egui menu or popup floating above the
+    /// web content. Toolbar menus open *below* the toolbar, so the toolbar rect alone does
+    /// not describe everything the user can click on: without this, a click on a bookmark in
+    /// the toolbar menu never reaches egui, and lands on the page behind the menu instead.
+    /// Panels and the WebView itself both live in egui's background layer, so anything above
+    /// that layer is browser chrome.
+    pub(crate) fn is_over_egui_popup(
+        &self,
+        position: Point2D<f32, DeviceIndependentPixel>,
+    ) -> bool {
+        self.context
+            .egui_ctx
+            .layer_id_at(pos2(position.x, position.y))
+            .is_some_and(|layer_id| layer_id.order != Order::Background)
     }
 
     /// Create a frameless button with square sizing, as used in the toolbar.
@@ -631,32 +652,19 @@ impl Gui {
                                 }
                             }
 
-                            match self.load_status {
-                                LoadStatus::Started | LoadStatus::HeadParsed => {
-                                    let stop_button = ui.add(Gui::toolbar_button("X"));
-                                    stop_button.widget_info(|| {
-                                        let mut info = WidgetInfo::new(WidgetType::Button);
-                                        info.label = Some("Stop".into());
-                                        info
-                                    });
-                                    if stop_button.clicked() {
-                                        warn!("Do not support stop yet.");
-                                    }
-                                },
-                                LoadStatus::Complete => {
-                                    let reload_button = ui.add(Gui::toolbar_button("↻"));
-                                    reload_button.widget_info(|| {
-                                        let mut info = WidgetInfo::new(WidgetType::Button);
-                                        info.label = Some("Reload".into());
-                                        info
-                                    });
-                                    if reload_button.clicked() {
-                                        *location_dirty = false;
-                                        window.queue_user_interface_command(
-                                            UserInterfaceCommand::Reload,
-                                        );
-                                    }
-                                },
+                            // Reload remains useful when a page keeps reporting that it is loading.
+                            // Some sites render their document before every subresource finishes;
+                            // presenting the unsupported Stop action in that state made it
+                            // impossible to retry navigation from the toolbar.
+                            let reload_button = ui.add(Gui::toolbar_button("↻"));
+                            reload_button.widget_info(|| {
+                                let mut info = WidgetInfo::new(WidgetType::Button);
+                                info.label = Some("Reload".into());
+                                info
+                            });
+                            if reload_button.clicked() {
+                                *location_dirty = false;
+                                window.queue_user_interface_command(UserInterfaceCommand::Reload);
                             }
                             ui.add_space(2.0);
 

@@ -80,7 +80,6 @@ use stylo_atoms::Atom;
 use time::Duration as TimeDuration;
 use url::{Host, Position};
 
-use crate::animations::Animations;
 use crate::css::stylesheet_loader::StylesheetContextId;
 use crate::css::stylesheet_set::StylesheetSetRef;
 use crate::dom::FlatTreeParent;
@@ -136,6 +135,7 @@ use crate::dom::css::stylesheetlist::{StyleSheetList, StyleSheetListOwner};
 use crate::dom::customelementregistry::{CustomElementReactionStack, CustomElementRegistry};
 use crate::dom::customevent::CustomEvent;
 use crate::dom::document::accessibility_data::AccessibilityData;
+use crate::dom::document::animations::Animations;
 use crate::dom::document::focus::{DocumentFocusHandler, FocusableArea};
 use crate::dom::document::iframe_collection::IFrameCollection;
 use crate::dom::document::image_animation::ImageAnimationManager;
@@ -1092,6 +1092,7 @@ impl Document {
     /// TODO: Remove this when we create documents after processing headers
     pub(crate) fn mark_as_internal(&self) {
         *self.origin.borrow_mut() = MutableOrigin::new(ImmutableOrigin::new_opaque());
+        self.window().update_jsprincipals_from_document(self);
     }
 
     pub(crate) fn set_protocol_handler_automation_mode(&self, mode: CustomHandlersAutomationMode) {

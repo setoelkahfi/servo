@@ -141,7 +141,7 @@ inventory = "0.3.24"
 ipc-channel = "0.22"
 itertools = "0.15"
 jni = "0.22"
-js = { package = "mozjs", version = "=0.21.5", default-features = false, features = ["intl", "libz-sys"] }
+js = { package = "mozjs", version = "=0.23", default-features = false, features = ["intl", "libz-sys"] }
 k12 = "0.5"
 keccak = "0.2"
 keyboard-types = { version = "0.8.3", features = ["serde", "webdriver"] }
@@ -443,11 +443,17 @@ codegen-units = 1
 # emits an undefined symbol regardless of whether the call is reachable, and
 # Apple scans the import table. Neither feature is used by this browser.
 #
-# scripts/patch-crates.sh unpacks these two crates into .build/crates/ and
+# scripts/patch-crates.sh unpacks these crates into .build/crates/ and
 # applies patches/crates/*.patch. Paths are relative to this workspace root, so
 # they must stay in lockstep with that script's output directory.
+#
+# taffy is patched for a different reason: its grid track-sizing distribution
+# loop can spin forever once the narrowest remaining track gap gets too small
+# to subtract from the running total at f32 precision. That wedges a layout
+# worker at 100% CPU and blocks every reflow behind the layout mutex.
 winit = { path = "../crates/winit-0.30.13" }
 ipc-channel = { path = "../crates/ipc-channel-0.22.0" }
+taffy = { path = "../crates/taffy-0.13.0" }
 
 # If you need to temporarily test Servo with a local fork of some upstream
 # crate, add that here. Use the form:

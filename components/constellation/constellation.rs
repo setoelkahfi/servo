@@ -1388,6 +1388,9 @@ where
             EmbedderToConstellationMessage::StopLoading(webview_id) => {
                 self.handle_stop_loading_msg(webview_id);
             },
+            EmbedderToConstellationMessage::SetKeyboardModifiers(modifiers) => {
+                self.active_keyboard_modifiers = modifiers;
+            },
             EmbedderToConstellationMessage::LogEntry(event_loop_id, thread_name, entry) => {
                 self.handle_log_entry(event_loop_id, thread_name, entry);
             },

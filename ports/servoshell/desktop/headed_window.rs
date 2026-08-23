@@ -44,7 +44,7 @@ use {
 };
 
 use super::geometry::{winit_position_to_euclid_point, winit_size_to_euclid_size};
-use super::keyutils::{CMD_OR_ALT, keyboard_event_from_winit};
+use super::keyutils::{CMD_OR_ALT, keyboard_event_from_winit, keyboard_modifiers_from_winit_modifiers};
 use crate::desktop::accelerated_gl_media::setup_gl_accelerated_media;
 use crate::desktop::dialog::Dialog;
 use crate::desktop::event_loop::AppEvent;
@@ -219,6 +219,18 @@ impl HeadedWindow {
 
     pub(crate) fn winit_window(&self) -> &winit::window::Window {
         &self.winit_window
+    }
+
+    /// Record the modifier keys the user is holding, and tell Servo about them, so that the
+    /// page's view of `metaKey` and friends matches the platform's rather than whatever it could
+    /// infer from the key events this window forwarded.
+    fn set_modifiers_state(&self, state: &Rc<RunningAppState>, modifiers: ModifiersState) {
+        if self.modifiers_state.replace(modifiers) == modifiers {
+            return;
+        }
+        state
+            .servo()
+            .notify_keyboard_modifiers_changed(keyboard_modifiers_from_winit_modifiers(modifiers));
     }
 
     fn handle_keyboard_input(
@@ -563,6 +575,24 @@ impl HeadedWindow {
             })
         };
 
+        // The platform's modifier state is authoritative and has to be tracked whatever else
+        // happens to the event, including when egui consumes it or there is no WebView to
+        // forward it to. Servo cannot work this out on its own: it only ever sees the key
+        // events this window chooses to forward, so a `Cmd` released over a menu, or while
+        // another application was focused, would otherwise stay held down forever -- and every
+        // link clicked afterwards would open in a new tab.
+        match &event {
+            WindowEvent::ModifiersChanged(modifiers) => {
+                self.set_modifiers_state(&state, modifiers.state());
+            },
+            // A window that is losing focus will not see the key that is currently held come
+            // back up, so nothing is held as far as this window is concerned.
+            WindowEvent::Focused(false) => {
+                self.set_modifiers_state(&state, ModifiersState::empty());
+            },
+            _ => {},
+        }
+
         // Handle the event
         let mut consumed = false;
         match event {
@@ -647,9 +677,6 @@ impl HeadedWindow {
             match event {
                 WindowEvent::KeyboardInput { event, .. } => {
                     self.handle_keyboard_input(state, &window, event)
-                },
-                WindowEvent::ModifiersChanged(modifiers) => {
-                    self.modifiers_state.set(modifiers.state())
                 },
                 WindowEvent::MouseInput { state, button, .. } => {
                     self.handle_mouse_button_event(&webview, button, state);

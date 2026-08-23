@@ -59,6 +59,7 @@ mod from_embedder {
                 Self::WebDriverCommand(..) => target!("WebDriverCommand"),
                 Self::Reload(..) => target!("Reload"),
                 Self::StopLoading(..) => target!("StopLoading"),
+                Self::SetKeyboardModifiers(..) => target!("SetKeyboardModifiers"),
                 Self::LogEntry(..) => target!("LogEntry"),
                 Self::NewWebView(..) => target!("NewWebView"),
                 Self::CloseWebView(..) => target!("CloseWebView"),

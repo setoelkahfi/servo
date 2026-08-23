@@ -19,6 +19,7 @@ use std::fs;
 use std::path::Path;
 use std::rc::Rc;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use dpi::PhysicalSize;
 use egui::text::{CCursor, CCursorRange};
@@ -58,6 +59,10 @@ use crate::desktop::headed_window;
 use crate::running_app_state::{RunningAppState, UserInterfaceCommand};
 use crate::window::ServoShellWindow;
 
+/// How long the chrome keeps calling a load a load after the engine last said anything about
+/// it. See [`Gui::is_loading`].
+const LOAD_STALL_TIMEOUT: Duration = Duration::from_secs(20);
+
 /// The user interface of a headed servoshell. Currently this is implemented via
 /// egui.
 pub struct Gui {
@@ -72,6 +77,10 @@ pub struct Gui {
 
     /// The [`LoadStatus`] of the active `WebView`.
     load_status: LoadStatus,
+
+    /// When [`Self::load_status`] last changed, which is what [`Self::is_loading`] measures a
+    /// stalled load against.
+    load_status_changed_at: Instant,
 
     /// The text to display in the status bar on the bottom of the window.
     status_text: Option<String>,
@@ -256,24 +265,18 @@ impl Drop for Gui {
 }
 
 impl Gui {
-    /// Draws an indeterminate, animated multi-color loading bar. It has no real percentage to
-    /// report (Servo does not surface byte progress here), so it sweeps a colored segment across
-    /// the strip to signal that work is ongoing, then requests a repaint to keep animating.
-    fn show_loading_progress_bar(ui: &mut egui::Ui) {
+    /// Draws an indeterminate, animated loading bar in `color`. It has no real percentage to
+    /// report (Servo does not surface byte progress here), so it sweeps a segment across the
+    /// strip to signal that work is ongoing, then requests a repaint to keep animating.
+    fn show_loading_progress_bar(ui: &mut egui::Ui, color: Color32) {
         let bar_height = 3.0;
         let width = ui.available_width().max(1.0);
         let (rect, _) = ui.allocate_exact_size(Vec2::new(width, bar_height), egui::Sense::hover());
         let painter = ui.painter();
 
-        // Faint track behind the moving segment.
-        painter.rect_filled(rect, 0.0, Color32::from_rgba_unmultiplied(0, 0, 0, 20));
-
-        let colors = [
-            Color32::from_rgb(66, 133, 244),  // blue
-            Color32::from_rgb(234, 67, 53),   // red
-            Color32::from_rgb(251, 188, 5),   // yellow
-            Color32::from_rgb(52, 168, 83),   // green
-        ];
+        // Faint track behind the moving segment, in the same hue so that the strip reads as one
+        // thing rather than a coloured bar on an unrelated grey one.
+        painter.rect_filled(rect, 0.0, color.gamma_multiply(0.15));
 
         let time = ui.input(|input| input.time) as f32;
         let full_width = rect.width();
@@ -281,21 +284,12 @@ impl Gui {
         let travel = full_width + segment_width;
         // Two-second sweep, looping.
         let offset = (time * (travel / 2.0)) % travel;
-        let seg_left = rect.left() - segment_width + offset;
-
-        let stripe_width = segment_width / colors.len() as f32;
-        for (i, color) in colors.iter().enumerate() {
-            let start = seg_left + stripe_width * i as f32;
-            let left = start.max(rect.left());
-            let right = (start + stripe_width).min(rect.right());
-            if right <= left {
-                continue;
-            }
-            let stripe = EguiRect::from_min_max(
-                Pos2::new(left, rect.top()),
-                Pos2::new(right, rect.bottom()),
-            );
-            painter.rect_filled(stripe, 0.0, *color);
+        let left = (rect.left() - segment_width + offset).max(rect.left());
+        let right = (rect.left() - segment_width + offset + segment_width).min(rect.right());
+        if right > left {
+            let segment =
+                EguiRect::from_min_max(Pos2::new(left, rect.top()), Pos2::new(right, rect.bottom()));
+            painter.rect_filled(segment, 0.0, color);
         }
 
         // Keep the animation going while the page loads.
@@ -345,6 +339,7 @@ impl Gui {
             location: initial_url.to_string(),
             location_dirty: false,
             load_status: LoadStatus::Complete,
+            load_status_changed_at: Instant::now(),
             status_text: None,
             can_go_back: false,
             can_go_forward: false,
@@ -515,6 +510,11 @@ impl Gui {
         self.rendering_context
             .make_current()
             .expect("Could not make RenderingContext current");
+
+        // Read before `self` is taken apart below, so the closure can borrow the fields it needs
+        // without also holding a borrow of the whole `Gui`.
+        let is_loading = self.is_loading();
+
         let Self {
             rendering_context,
             context,
@@ -602,7 +602,7 @@ impl Gui {
                                 window.queue_user_interface_command(UserInterfaceCommand::GoHome);
                             }
 
-                            let loading = self.load_status != LoadStatus::Complete;
+                            let loading = is_loading;
                             let (reload_glyph, reload_label, reload_command) = if loading {
                                 ("✕", "Stop", UserInterfaceCommand::Stop)
                             } else {
@@ -795,9 +795,10 @@ impl Gui {
                 // WebView is still loading. It sits in its own top panel so that it spans the
                 // full window width and pushes the WebView down without overlapping the tabs.
                 let mut toolbar_bottom = outer.response.rect.max.y;
-                if self.load_status != LoadStatus::Complete {
+                if is_loading {
+                    let progress_bar_color = settings.progress_bar_color();
                     let progress = Panel::top("loading_progress").show_inside(ctx, |ui| {
-                        Self::show_loading_progress_bar(ui);
+                        Self::show_loading_progress_bar(ui, progress_bar_color);
                     });
                     toolbar_bottom = progress.response.rect.max.y;
                 }
@@ -922,6 +923,19 @@ impl Gui {
         }
     }
 
+    /// Whether the chrome should still be presenting the active `WebView` as loading.
+    ///
+    /// This is not simply `load_status != Complete`. `Complete` means `document.readyState` is
+    /// `"complete"`, so a single subresource that never resolves -- a hanging XHR, a script the
+    /// engine cannot finish -- leaves a fully rendered, perfectly usable page marked as loading
+    /// forever, and the bar under the tab strip animates until the tab is closed. A load that
+    /// has not moved in [`LOAD_STALL_TIMEOUT`] is treated as finished, because from the user's
+    /// side it is: whatever is outstanding is no longer producing anything to wait for.
+    fn is_loading(&self) -> bool {
+        self.load_status != LoadStatus::Complete &&
+            self.load_status_changed_at.elapsed() < LOAD_STALL_TIMEOUT
+    }
+
     fn update_load_status(&mut self, window: &ServoShellWindow) -> bool {
         let state_status = window
             .active_webview()
@@ -929,6 +943,9 @@ impl Gui {
             .unwrap_or(LoadStatus::Complete);
         let old_status = std::mem::replace(&mut self.load_status, state_status);
         let status_changed = old_status != self.load_status;
+        if status_changed {
+            self.load_status_changed_at = Instant::now();
+        }
 
         // When the load status changes, we want the new changes to the URL to start
         // being reflected in the location bar.

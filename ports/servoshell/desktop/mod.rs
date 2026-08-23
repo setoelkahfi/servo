@@ -14,6 +14,7 @@ pub(crate) mod gamepad;
 pub mod geometry;
 mod gui;
 pub(crate) mod headed_window;
+pub(crate) mod settings;
 mod headless_window;
 mod keyutils;
 mod protocols;

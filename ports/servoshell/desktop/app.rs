@@ -184,6 +184,12 @@ impl App {
 
 impl ApplicationHandler<AppEvent> for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
+        // winit builds the default macOS menubar during launch, which is over
+        // by the time the first `Resumed` arrives, so the menu is there to
+        // extend.
+        #[cfg(target_os = "macos")]
+        crate::platform::macos::menu::install_settings_item();
+
         self.init(Some(event_loop));
     }
 

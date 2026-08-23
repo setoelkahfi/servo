@@ -57,7 +57,7 @@ pub(crate) static EXPERIMENTAL_PREFS: &[&str] = &[
 /// Web APIs required by mainstream daily-use sites. Servo still ships these
 /// behind preferences, but smbCloud Browser treats them as part of its compatibility
 /// baseline rather than asking users to discover an experimental toggle.
-const SMB_DAILY_WEB_PREFS: &[&str] = &[
+pub(crate) const SMB_DAILY_WEB_PREFS: &[&str] = &[
     "dom_adoptedstylesheet_enabled",
     "dom_fontface_enabled",
     "dom_indexeddb_enabled",

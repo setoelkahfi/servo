@@ -70,6 +70,9 @@ pub struct Gui {
     /// AccessKit tree updates pending the next egui tick.
     /// This allows us to ensure that graft nodes are sent before the subtrees they graft.
     pending_accesskit_updates: Vec<accesskit::TreeUpdate>,
+
+    /// The Settings window, opened from the application menu.
+    settings: crate::desktop::settings::Settings,
 }
 
 fn truncate_with_ellipsis(input: &str, max_length: usize) -> String {
@@ -232,6 +235,7 @@ impl Gui {
             can_go_forward: false,
             favicon_textures: Default::default(),
             pending_accesskit_updates: vec![],
+            settings: Default::default(),
         }
     }
 
@@ -403,6 +407,7 @@ impl Gui {
             location,
             location_dirty,
             favicon_textures,
+            settings,
             ..
         } = self;
 
@@ -671,6 +676,17 @@ impl Gui {
             } else {
                 *toolbar_height = Length::default();
             }
+
+            // The application menu can only raise a flag: AppKit delivers the
+            // click while winit owns the run loop. Only the focused window
+            // claims it, so Settings opens once instead of once per window.
+            #[cfg(target_os = "macos")]
+            if headed_window.winit_window().has_focus() &&
+                crate::platform::macos::menu::take_settings_request()
+            {
+                settings.open();
+            }
+            settings.show(ctx);
 
             let scale =
                 Scale::<_, DeviceIndependentPixel, DevicePixel>::new(ctx.pixels_per_point());

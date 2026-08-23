@@ -71,7 +71,7 @@ fn root_transform_for_layout_node(
         .first()
         .and_then(Fragment::retrieve_box_fragment)?;
     let scroll_tree_node_id = box_fragment.spatial_tree_node()?;
-    Some(scroll_tree.cumulative_node_to_root_transform(scroll_tree_node_id))
+    scroll_tree.try_cumulative_node_to_root_transform(scroll_tree_node_id)
 }
 
 pub(crate) fn process_padding_request(node: ServoLayoutNode<'_>) -> Option<PhysicalSides> {
@@ -699,11 +699,10 @@ pub fn process_offset_parent_query(
     let cumulative_sticky_offsets = fragment
         .retrieve_box_fragment()
         .and_then(|box_fragment| box_fragment.spatial_tree_node())
-        .map(|node_id| {
+        .and_then(|node_id| {
             scroll_tree
-                .cumulative_sticky_offsets(node_id)
-                .map(Au::from_f32_px)
-                .cast_unit()
+                .try_cumulative_sticky_offsets(node_id)
+                .map(|offsets| offsets.map(Au::from_f32_px).cast_unit())
         });
     border_box = border_box.translate(cumulative_sticky_offsets.unwrap_or_default());
 
@@ -758,11 +757,10 @@ pub fn process_offset_parent_query(
     .translate(
         cumulative_sticky_offsets
             .and_then(|_| parent_fragment.spatial_tree_node())
-            .map(|node_id| {
+            .and_then(|node_id| {
                 scroll_tree
-                    .cumulative_sticky_offsets(node_id)
-                    .map(Au::from_f32_px)
-                    .cast_unit()
+                    .try_cumulative_sticky_offsets(node_id)
+                    .map(|offsets| offsets.map(Au::from_f32_px).cast_unit())
             })
             .unwrap_or_default(),
     );

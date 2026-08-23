@@ -24,7 +24,6 @@ use egui_winit::EventResponse;
 use euclid::{Length, Point2D, Rect, Scale, Size2D};
 #[cfg(any(target_os = "windows", target_os = "linux", target_os = "freebsd"))]
 use log::info;
-use log::warn;
 use servo::{
     DeviceIndependentPixel, DevicePixel, Image, LoadStatus, OffscreenRenderingContext, PixelFormat,
     RenderingContext, WebView, WebViewId,
@@ -248,6 +247,12 @@ impl Gui {
                 memory.surrender_focus(focused);
             }
         });
+
+        // Clicking web content also dismisses any open toolbar menu, the way it would in any
+        // other browser. egui never sees that click, because it was routed to the page, so it
+        // cannot close the menu itself. The menu would otherwise hang over the content until
+        // the user found something else to click.
+        egui::Popup::close_all(&self.context.egui_ctx);
     }
 
     pub(crate) fn on_window_event(
@@ -270,6 +275,22 @@ impl Gui {
         position: Point2D<f32, DeviceIndependentPixel>,
     ) -> bool {
         position.y < self.toolbar_height.get()
+    }
+
+    /// Return true iff the given position is over an egui menu or popup floating above the
+    /// web content. Toolbar menus open *below* the toolbar, so the toolbar rect alone does
+    /// not describe everything the user can click on: without this, a click on a bookmark in
+    /// the toolbar menu never reaches egui, and lands on the page behind the menu instead.
+    /// Panels and the WebView itself both live in egui's background layer, so anything above
+    /// that layer is browser chrome.
+    pub(crate) fn is_over_egui_popup(
+        &self,
+        position: Point2D<f32, DeviceIndependentPixel>,
+    ) -> bool {
+        self.context
+            .egui_ctx
+            .layer_id_at(pos2(position.x, position.y))
+            .is_some_and(|layer_id| layer_id.order != Order::Background)
     }
 
     /// Create a frameless button with square sizing, as used in the toolbar.
@@ -401,6 +422,31 @@ impl Gui {
                         ui.available_size(),
                         egui::Layout::left_to_right(egui::Align::Center),
                         |ui| {
+                            if ui.input(|input| {
+                                input
+                                    .clone()
+                                    .consume_key(Modifiers::COMMAND | Modifiers::SHIFT, Key::H)
+                            }) {
+                                *location_dirty = false;
+                                window.queue_user_interface_command(UserInterfaceCommand::GoHome);
+                            }
+                            if ui.input(|input| {
+                                input.clone().consume_key(Modifiers::COMMAND, Key::D)
+                            }) {
+                                window.queue_user_interface_command(
+                                    UserInterfaceCommand::ToggleBookmark,
+                                );
+                            }
+                            if ui.input(|input| {
+                                input
+                                    .clone()
+                                    .consume_key(Modifiers::COMMAND | Modifiers::SHIFT, Key::T)
+                            }) {
+                                window.queue_user_interface_command(
+                                    UserInterfaceCommand::ReopenClosedWebView,
+                                );
+                            }
+
                             let back_button =
                                 ui.add_enabled(self.can_go_back, Gui::toolbar_button("⏴"));
                             back_button.widget_info(|| {
@@ -425,34 +471,81 @@ impl Gui {
                                 window.queue_user_interface_command(UserInterfaceCommand::Forward);
                             }
 
-                            match self.load_status {
-                                LoadStatus::Started | LoadStatus::HeadParsed => {
-                                    let stop_button = ui.add(Gui::toolbar_button("X"));
-                                    stop_button.widget_info(|| {
-                                        let mut info = WidgetInfo::new(WidgetType::Button);
-                                        info.label = Some("Stop".into());
-                                        info
-                                    });
-                                    if stop_button.clicked() {
-                                        warn!("Do not support stop yet.");
-                                    }
-                                },
-                                LoadStatus::Complete => {
-                                    let reload_button = ui.add(Gui::toolbar_button("↻"));
-                                    reload_button.widget_info(|| {
-                                        let mut info = WidgetInfo::new(WidgetType::Button);
-                                        info.label = Some("Reload".into());
-                                        info
-                                    });
-                                    if reload_button.clicked() {
-                                        *location_dirty = false;
-                                        window.queue_user_interface_command(
-                                            UserInterfaceCommand::Reload,
-                                        );
-                                    }
-                                },
+                            let home_button = ui.add(Gui::toolbar_button("⌂"));
+                            home_button.widget_info(|| {
+                                let mut info = WidgetInfo::new(WidgetType::Button);
+                                info.label = Some("Home".into());
+                                info
+                            });
+                            if home_button.clicked() {
+                                *location_dirty = false;
+                                window.queue_user_interface_command(UserInterfaceCommand::GoHome);
+                            }
+
+                            // Reload remains useful when a page keeps reporting that it is loading.
+                            // Some sites render their document before every subresource finishes;
+                            // presenting the unsupported Stop action in that state made it
+                            // impossible to retry navigation from the toolbar.
+                            let reload_button = ui.add(Gui::toolbar_button("↻"));
+                            reload_button.widget_info(|| {
+                                let mut info = WidgetInfo::new(WidgetType::Button);
+                                info.label = Some("Reload".into());
+                                info
+                            });
+                            if reload_button.clicked() {
+                                *location_dirty = false;
+                                window.queue_user_interface_command(UserInterfaceCommand::Reload);
                             }
                             ui.add_space(2.0);
+
+                            let active_url =
+                                window.active_webview().and_then(|webview| webview.url());
+                            let bookmarkable = active_url
+                                .as_ref()
+                                .is_some_and(|url| matches!(url.scheme(), "http" | "https"));
+                            let is_bookmarked = active_url
+                                .as_ref()
+                                .is_some_and(|url| state.is_bookmarked(url));
+                            let bookmark_button = ui.add_enabled(
+                                bookmarkable,
+                                Gui::toolbar_button(if is_bookmarked { "★" } else { "☆" }),
+                            );
+                            bookmark_button.widget_info(|| {
+                                let mut info = WidgetInfo::new(WidgetType::Button);
+                                info.label = Some(if is_bookmarked {
+                                    "Remove bookmark".into()
+                                } else {
+                                    "Add bookmark".into()
+                                });
+                                info
+                            });
+                            if bookmark_button.clicked() {
+                                window.queue_user_interface_command(
+                                    UserInterfaceCommand::ToggleBookmark,
+                                );
+                            }
+
+                            ui.menu_button("☰", |ui| {
+                                ui.strong("Bookmarks");
+                                let bookmarks = state.bookmarks();
+                                if bookmarks.is_empty() {
+                                    ui.label("No bookmarks yet");
+                                }
+                                for bookmark in bookmarks {
+                                    let label = bookmark
+                                        .host_str()
+                                        .map(|host| truncate_with_ellipsis(host, 28))
+                                        .unwrap_or_else(|| {
+                                            truncate_with_ellipsis(bookmark.as_str(), 28)
+                                        });
+                                    if ui.button(label).on_hover_text(bookmark.as_str()).clicked() {
+                                        window.queue_user_interface_command(
+                                            UserInterfaceCommand::Go(bookmark.to_string()),
+                                        );
+                                        ui.close();
+                                    }
+                                }
+                            });
 
                             ui.allocate_ui_with_layout(
                                 ui.available_size(),
@@ -461,11 +554,11 @@ impl Gui {
                                     let mut experimental_preferences_enabled =
                                         state.experimental_preferences_enabled();
                                     let prefs_toggle = ui
-                                        .toggle_value(&mut experimental_preferences_enabled, "☢")
-                                        .on_hover_text("Enable experimental prefs");
+                                        .toggle_value(&mut experimental_preferences_enabled, "⚙")
+                                        .on_hover_text("Experimental web features");
                                     prefs_toggle.widget_info(|| {
                                         let mut info = WidgetInfo::new(WidgetType::Button);
-                                        info.label = Some("Enable experimental preferences".into());
+                                        info.label = Some("Experimental web features".into());
                                         info.selected = Some(experimental_preferences_enabled);
                                         info
                                     });

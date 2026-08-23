@@ -59,7 +59,7 @@ use servo_base::text::Utf32CodeUnits;
 use servo_url::{ImmutableOrigin, ServoUrl};
 use style::Atom;
 use style::animation::DocumentAnimationSet;
-use style::attr::{AttrValue, parse_integer, parse_unsigned_integer};
+use style::attr::AttrValue;
 use style::context::QuirksMode;
 use style::data::ElementDataWrapper;
 use style::device::Device;
@@ -171,23 +171,98 @@ pub struct SVGElementData<'dom> {
 
 impl SVGElementData<'_> {
     pub fn ratio_from_view_box(&self) -> Option<f32> {
-        let mut iter = self.view_box?.chars();
-        let _min_x = parse_integer(&mut iter).ok()?;
-        let _min_y = parse_integer(&mut iter).ok()?;
+        // <https://svgwg.org/svg2-draft/coords.html#ViewBoxAttribute>
+        // The viewBox is four `<number>`s, so it cannot be parsed with the HTML
+        // integer parsers: `viewBox="0 0 114.778 100"` is valid and common.
+        let [_min_x, _min_y, width, height] = parse_view_box(self.view_box?)?;
 
-        let width = parse_unsigned_integer(&mut iter).ok()?;
-        if width == 0 {
-            return None;
-        }
-
-        let height = parse_unsigned_integer(&mut iter).ok()?;
-        if height == 0 {
-            return None;
-        }
-
-        let mut iter = iter.skip_while(|c| char_is_whitespace(*c));
-        iter.next().is_none().then(|| width as f32 / height as f32)
+        // A negative width or height makes the attribute invalid, and a zero one
+        // disables rendering of the element. Neither yields a natural ratio.
+        (width > 0. && height > 0.).then(|| width / height)
     }
+}
+
+/// Parses the four `<number>`s of an SVG `viewBox` attribute, which are separated
+/// by whitespace and/or a single comma.
+/// <https://svgwg.org/svg2-draft/coords.html#ViewBoxAttribute>
+fn parse_view_box(value: &str) -> Option<[f32; 4]> {
+    let mut numbers = [0f32; 4];
+    let mut rest = value;
+
+    for (index, number) in numbers.iter_mut().enumerate() {
+        rest = rest.trim_start_matches(char_is_whitespace);
+        if index != 0 {
+            // Separators are required between numbers, but a lone comma is enough.
+            rest = rest.strip_prefix(',').unwrap_or(rest);
+            rest = rest.trim_start_matches(char_is_whitespace);
+        }
+
+        let (value, remainder) = parse_number_prefix(rest)?;
+        *number = value;
+        rest = remainder;
+
+        // Without a separator, `1 2 34` would parse as four numbers.
+        if index != 3 &&
+            !rest.starts_with(',') &&
+            !rest.starts_with(char_is_whitespace) &&
+            !rest.is_empty()
+        {
+            return None;
+        }
+    }
+
+    rest.trim_matches(char_is_whitespace)
+        .is_empty()
+        .then_some(numbers)
+}
+
+/// Splits the leading SVG `<number>` off `input`, returning it and the rest of the
+/// string. <https://svgwg.org/svg2-draft/types.html#syntax>
+fn parse_number_prefix(input: &str) -> Option<(f32, &str)> {
+    let bytes = input.as_bytes();
+    let mut end = 0;
+
+    if matches!(bytes.get(end), Some(b'+' | b'-')) {
+        end += 1;
+    }
+
+    let integer_start = end;
+    while matches!(bytes.get(end), Some(byte) if byte.is_ascii_digit()) {
+        end += 1;
+    }
+    let mut digits = end - integer_start;
+
+    if bytes.get(end) == Some(&b'.') {
+        end += 1;
+        let fraction_start = end;
+        while matches!(bytes.get(end), Some(byte) if byte.is_ascii_digit()) {
+            end += 1;
+        }
+        digits += end - fraction_start;
+    }
+
+    if digits == 0 {
+        return None;
+    }
+
+    // An exponent only counts if it has at least one digit; `1e` is `1` followed
+    // by junk, which makes the whole attribute invalid rather than this number.
+    if matches!(bytes.get(end), Some(b'e' | b'E')) {
+        let mut exponent_end = end + 1;
+        if matches!(bytes.get(exponent_end), Some(b'+' | b'-')) {
+            exponent_end += 1;
+        }
+        let exponent_start = exponent_end;
+        while matches!(bytes.get(exponent_end), Some(byte) if byte.is_ascii_digit()) {
+            exponent_end += 1;
+        }
+        if exponent_end > exponent_start {
+            end = exponent_end;
+        }
+    }
+
+    let number = input[..end].parse::<f32>().ok()?;
+    number.is_finite().then(|| (number, &input[end..]))
 }
 
 /// The address of a node known to be valid. These are sent from script to layout.
@@ -1027,6 +1102,48 @@ mod test {
     use pixels::{CorsStatus, ImageFrame, ImageMetadata, PixelFormat, RasterImage, Repeat};
 
     use crate::ImageAnimationState;
+
+    #[test]
+    fn test_parse_view_box() {
+        use crate::parse_view_box;
+
+        let approximately_equal = |result: Option<[f32; 4]>, expected: Option<[f32; 4]>| {
+            match (result, expected) {
+                (Some(result), Some(expected)) => result
+                    .iter()
+                    .zip(expected.iter())
+                    .all(|(result, expected)| (result - expected).abs() < 1e-4),
+                (None, None) => true,
+                _ => false,
+            }
+        };
+
+        for (input, expected) in [
+            // The App Store's badge icons use fractional numbers, which the HTML
+            // integer parsers this used to rely on could not read.
+            ("0 0 114.778 100", Some([0., 0., 114.778, 100.])),
+            ("0 0 115 100", Some([0., 0., 115., 100.])),
+            ("0, 0, 115, 100", Some([0., 0., 115., 100.])),
+            ("  -5 -5.5 115 100  ", Some([-5., -5.5, 115., 100.])),
+            ("+0 +0 +115 +100", Some([0., 0., 115., 100.])),
+            ("0 0 1e2 50", Some([0., 0., 100., 50.])),
+            ("0 0 .5 .25", Some([0., 0., 0.5, 0.25])),
+            ("0 0 -115 100", Some([0., 0., -115., 100.])),
+            ("0 0 1e 50", None),
+            ("0 0 115 100 5", None),
+            ("0 0 115", None),
+            ("1 2 34", None),
+            ("0 0 115 abc", None),
+            ("0,0,115,100,", None),
+            ("", None),
+        ] {
+            assert!(
+                approximately_equal(parse_view_box(input), expected),
+                "parse_view_box({input:?}) was {:?}, expected {expected:?}",
+                parse_view_box(input),
+            );
+        }
+    }
 
     #[test]
     fn test_animated_image_update() {

@@ -315,7 +315,19 @@ impl SystemFontService {
         family: &SingleFontFamily,
     ) -> LowercaseFontFamilyName {
         let generic = match family {
-            SingleFontFamily::FamilyName(family_name) => return family_name.name.clone().into(),
+            SingleFontFamily::FamilyName(family_name) => {
+                let name: LowercaseFontFamilyName = family_name.name.clone().into();
+                // `-apple-system` and `BlinkMacSystemFont` aren't real family names, but
+                // they are widely used on the web to select the platform UI font, so map
+                // them to `system-ui`. Otherwise they are skipped during font matching,
+                // and the next family in the list is used, which is often an emoji font
+                // that only covers a few characters of the text (including the space).
+                if &*name == "-apple-system" || &*name == "blinkmacsystemfont" {
+                    &GenericFontFamily::SystemUi
+                } else {
+                    return name;
+                }
+            },
             SingleFontFamily::Generic(generic) => generic,
         };
 

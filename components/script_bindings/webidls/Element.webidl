@@ -123,6 +123,17 @@ partial interface Element {
   readonly attribute long clientHeight;
 
   readonly attribute double currentCSSZoom;
+
+  boolean checkVisibility(optional CheckVisibilityOptions options = {});
+};
+
+// https://drafts.csswg.org/cssom-view/#dictdef-checkvisibilityoptions
+dictionary CheckVisibilityOptions {
+  boolean checkOpacity = false;
+  boolean checkVisibilityCSS = false;
+  boolean contentVisibilityAuto = false;
+  boolean opacityProperty = false;
+  boolean visibilityProperty = false;
 };
 
 // https://html.spec.whatwg.org/multipage/#dom-parsing-and-serialization

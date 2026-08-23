@@ -36,8 +36,8 @@ use style::properties::longhands::visibility::computed_value::T as Visibility;
 use style::properties::style_structs::Border;
 use style::values::computed::basic_shape::ClipPath as ComputedClipPath;
 use style::values::computed::{
-    BorderImageSideWidth, BorderImageWidth, BorderStyle, LengthPercentage,
-    NonNegativeLengthOrNumber, NumberOrPercentage, OutlineStyle,
+    BorderImageSideWidth, BorderImageWidth, BorderStyle, Image as ComputedImage,
+    LengthPercentage, NonNegativeLengthOrNumber, NumberOrPercentage, OutlineStyle,
 };
 use style::values::generics::NonNegative;
 use style::values::generics::color::ColorOrAuto;
@@ -1645,6 +1645,28 @@ impl<'a> BuilderForBoxFragment<'a> {
         state: &TraversalState,
         painter: &BackgroundPainter,
     ) {
+        // `mask-image` (and its `-webkit-` alias) has no rendering implementation:
+        // nothing here or in `build_background_image` clips the background to the
+        // mask shape. Painting the background regardless would draw the full,
+        // unmasked box — usually an opaque, wrong-looking rectangle, since this
+        // pattern (a solid-colored box masked to an icon shape) is how sites
+        // commonly draw monochrome icons. Skipping the background paint entirely
+        // is closer to the author's intent than an incorrect solid box: the
+        // element still takes up its layout box, it just isn't painted.
+        //
+        // TODO: implement real `mask-image` support (resolve the mask image and
+        // apply it as a WebRender clip) and remove this fallback.
+        let is_masked = painter
+            .style
+            .get_svg()
+            .mask_image
+            .0
+            .iter()
+            .any(|image| *image != ComputedImage::None);
+        if is_masked {
+            return;
+        }
+
         let b = painter.style.get_background();
         let background_color = painter.style.resolve_color(&b.background_color);
         if background_color.alpha > 0.0 {

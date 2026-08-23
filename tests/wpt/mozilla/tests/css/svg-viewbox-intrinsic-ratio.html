@@ -1,0 +1,52 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>An inline SVG takes its natural ratio from a fractional viewBox</title>
+<link rel="help" href="https://svgwg.org/svg2-draft/coords.html#ViewBoxAttribute">
+<link rel="help" href="https://svgwg.org/svg2-draft/coords.html#SizingSVGInCSS">
+<script src="/resources/testharness.js"></script>
+<script src="/resources/testharnessreport.js"></script>
+<style>
+  .flex { display: flex; width: 35px; height: 25px; }
+  .fixed-height { height: 25px; }
+</style>
+<div id="log"></div>
+<div class="flex"><svg id="stretched" viewBox="0 0 114.778 100"></svg></div>
+<svg id="fractional" class="fixed-height" viewBox="0 0 114.778 100"></svg>
+<svg id="integral" class="fixed-height" viewBox="0 0 115 100"></svg>
+<svg id="comma-separated" class="fixed-height" viewBox="0,0,114.778,100"></svg>
+<svg id="exponent" class="fixed-height" viewBox="0 0 1.14778e2 1e2"></svg>
+<svg id="degenerate" class="fixed-height" viewBox="0 0 0 100"></svg>
+<svg id="invalid" class="fixed-height" viewBox="0 0 114.778"></svg>
+<script>
+function width_of(id) {
+  return document.getElementById(id).getBoundingClientRect().width;
+}
+
+test(function() {
+  assert_approx_equals(width_of("fractional"), 28.6945, 0.01);
+}, "A fractional viewBox gives a natural ratio");
+
+test(function() {
+  assert_approx_equals(width_of("integral"), 28.75, 0.01);
+}, "An integral viewBox gives a natural ratio");
+
+test(function() {
+  assert_approx_equals(width_of("comma-separated"), 28.6945, 0.01);
+}, "A comma-separated viewBox gives a natural ratio");
+
+test(function() {
+  assert_approx_equals(width_of("exponent"), 28.6945, 0.01);
+}, "A viewBox written in scientific notation gives a natural ratio");
+
+test(function() {
+  assert_approx_equals(width_of("stretched"), 28.6945, 0.01);
+}, "A stretched flex item resolves its inline size from the viewBox ratio");
+
+test(function() {
+  assert_equals(width_of("degenerate"), 300);
+}, "A zero-width viewBox gives no natural ratio");
+
+test(function() {
+  assert_equals(width_of("invalid"), 300);
+}, "A viewBox with too few numbers gives no natural ratio");
+</script>

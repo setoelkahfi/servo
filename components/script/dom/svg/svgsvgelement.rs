@@ -13,6 +13,7 @@ use layout_api::SVGElementData;
 use servo_url::ServoUrl;
 use style::attr::AttrValue;
 use style::parser::ParserContext;
+use style::properties::{LonghandId, PropertyDeclarationId};
 use style::stylesheets::Origin;
 use style::values::specified::LengthPercentage;
 use style_traits::ParsingMode;
@@ -33,6 +34,29 @@ use crate::dom::node::{
     ChildrenMutation, CloneChildrenFlag, Node, NodeDamage, NodeTraits, UnbindContext,
 };
 use crate::dom::svg::svggraphicselement::SVGGraphicsElement;
+
+/// The paint properties whose computed values are copied onto the serialized
+/// subtree before it is rasterized.
+///
+/// Rasterization only ever sees the serialized source, so every declaration a
+/// document stylesheet contributed is gone by the time the SVG is drawn and the
+/// SVG initial values take over. `fill: currentColor` set on an icon class is
+/// the case that matters in practice: without this, every stylesheet-painted
+/// icon on the web rasterizes black.
+const COPIED_PAINT_PROPERTIES: &[LonghandId] = &[
+    LonghandId::Color,
+    LonghandId::Fill,
+    LonghandId::FillOpacity,
+    LonghandId::FillRule,
+    LonghandId::Stroke,
+    LonghandId::StrokeOpacity,
+    LonghandId::StrokeWidth,
+    LonghandId::StrokeLinecap,
+    LonghandId::StrokeLinejoin,
+    LonghandId::StrokeDasharray,
+    LonghandId::StrokeDashoffset,
+    LonghandId::StrokeMiterlimit,
+];
 
 #[dom_struct]
 pub(crate) struct SVGSVGElement {
@@ -94,6 +118,7 @@ impl SVGSVGElement {
             return;
         }
 
+        self.copy_computed_paint(cx, &cloned_node);
         self.process_use_elements(cx, &cloned_node);
 
         let Ok(xml_source) = cloned_node.xml_serialize(TraversalScope::IncludeNode) else {
@@ -108,6 +133,58 @@ impl SVGSVGElement {
             Ok(url) => *self.cached_serialized_data_url.borrow_mut() = Some(Ok(url)),
             Err(error) => error!("Unable to parse serialized SVG data url: {error}"),
         };
+    }
+
+    /// Walks the live subtree and its clone in lockstep, writing each element's
+    /// computed paint onto the clone as presentation attributes.
+    ///
+    /// Presentation attributes lose to both the element's own `style` attribute
+    /// and to any rule inside the serialized subtree, which is what we want:
+    /// whatever those declared already went into the computed value being
+    /// copied here, so letting them win again changes nothing.
+    ///
+    /// This runs before `<use>` references are inlined, deliberately. A used
+    /// element is styled where it sits — typically inside a `<defs>` that
+    /// inherits nothing from the icon it ends up drawn in — so stamping its own
+    /// paint onto the copy would override the paint of the `<svg>` that
+    /// referenced it.
+    fn copy_computed_paint(&self, cx: &mut JSContext, cloned_root: &Node) {
+        for (original_node, cloned_node) in self
+            .upcast::<Node>()
+            .traverse_preorder(ShadowIncluding::No)
+            .zip(cloned_root.traverse_preorder(ShadowIncluding::No))
+        {
+            let (Some(original_element), Some(cloned_element)) = (
+                original_node.downcast::<Element>(),
+                cloned_node.downcast::<Element>(),
+            ) else {
+                continue;
+            };
+
+            // The clone is structurally identical to the original, so the two
+            // traversals stay in step. Stop rather than paint the wrong element
+            // if that ever stops being true.
+            if original_element.local_name() != cloned_element.local_name() {
+                warn!("SVG clone diverged from its source; skipping the rest of its paint");
+                return;
+            }
+
+            // A subtree that layout never styled — inside a `<defs>`, say — has
+            // nothing to copy, and keeps whatever it declares for itself.
+            let Some(style) = original_element.computed_style_without_reflow() else {
+                continue;
+            };
+
+            for longhand in COPIED_PAINT_PROPERTIES {
+                let value =
+                    style.computed_value_to_string(PropertyDeclarationId::Longhand(*longhand));
+                cloned_element.set_string_attribute(
+                    cx,
+                    &LocalName::from(longhand.name()),
+                    value.into(),
+                );
+            }
+        }
     }
 
     fn process_use_elements(&self, cx: &mut JSContext, root_node: &Node) {

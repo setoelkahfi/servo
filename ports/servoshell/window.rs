@@ -367,6 +367,7 @@ impl ServoShellWindow {
                         active_webview.reload();
                     }
                 },
+                UserInterfaceCommand::Stop => {},
                 UserInterfaceCommand::ReloadAll => {
                     for window in state.windows().values() {
                         window.set_needs_update();

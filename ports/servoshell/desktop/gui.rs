@@ -24,8 +24,8 @@ use dpi::PhysicalSize;
 use egui::text::{CCursor, CCursorRange};
 use egui::text_edit::TextEditState;
 use egui::{
-    Button, FontDefinitions, Id, Key, Label, LayerId, Modifiers, Order, PaintCallback, Panel, Vec2,
-    WidgetInfo, WidgetType, pos2,
+    Button, Color32, FontDefinitions, Id, Key, Label, LayerId, Modifiers, Order, PaintCallback,
+    Panel, Pos2, Rect as EguiRect, Stroke, Vec2, WidgetInfo, WidgetType, pos2,
 };
 #[cfg(any(
     target_os = "windows",
@@ -256,6 +256,34 @@ impl Drop for Gui {
 }
 
 impl Gui {
+    fn show_loading_progress_bar(ui: &mut egui::Ui) {
+        let width = ui.available_width().max(1.0);
+        let (rect, _) = ui.allocate_exact_size(Vec2::new(width, 3.0), egui::Sense::hover());
+        let painter = ui.painter();
+        let stripe_width = 12.0;
+        let colors = [
+            Color32::from_rgb(66, 133, 244),
+            Color32::from_rgb(234, 67, 53),
+            Color32::from_rgb(251, 188, 5),
+            Color32::from_rgb(52, 168, 83),
+        ];
+        let mut x = rect.left();
+        let mut i = 0usize;
+        while x < rect.right() {
+            let right = (x + stripe_width).min(rect.right());
+            let stripe = EguiRect::from_min_max(Pos2::new(x, rect.top()), Pos2::new(right, rect.bottom()));
+            painter.rect_filled(stripe, 0.0, colors[i % colors.len()]);
+            x = right;
+            i += 1;
+        }
+        painter.rect_stroke(
+            rect,
+            0.0,
+            Stroke::new(1.0, Color32::from_rgba_unmultiplied(0, 0, 0, 30)),
+            egui::StrokeKind::Inside,
+        );
+    }
+
     pub(crate) fn new(
         winit_window: &Window,
         event_loop: &ActiveEventLoop,
@@ -556,19 +584,21 @@ impl Gui {
                                 window.queue_user_interface_command(UserInterfaceCommand::GoHome);
                             }
 
-                            // Reload remains useful when a page keeps reporting that it is loading.
-                            // Some sites render their document before every subresource finishes;
-                            // presenting the unsupported Stop action in that state made it
-                            // impossible to retry navigation from the toolbar.
-                            let reload_button = ui.add(Gui::toolbar_button("↻"));
+                            let loading = self.load_status != LoadStatus::Complete;
+                            let (reload_glyph, reload_label, reload_command) = if loading {
+                                ("✕", "Stop", UserInterfaceCommand::Stop)
+                            } else {
+                                ("↻", "Reload", UserInterfaceCommand::Reload)
+                            };
+                            let reload_button = ui.add(Gui::toolbar_button(reload_glyph));
                             reload_button.widget_info(|| {
                                 let mut info = WidgetInfo::new(WidgetType::Button);
-                                info.label = Some("Reload".into());
+                                info.label = Some(reload_label.into());
                                 info
                             });
                             if reload_button.clicked() {
                                 *location_dirty = false;
-                                window.queue_user_interface_command(UserInterfaceCommand::Reload);
+                                window.queue_user_interface_command(reload_command);
                             }
                             ui.add_space(2.0);
 
@@ -591,6 +621,7 @@ impl Gui {
                                 } else {
                                     "Add bookmark".into()
                                 });
+
                                 info
                             });
                             if bookmark_button.clicked() {
@@ -719,6 +750,12 @@ impl Gui {
                                         info.label = Some("New tab".into());
                                         info
                                     });
+                                    if self.load_status != LoadStatus::Complete {
+                                        Panel::top("loading_progress").show_inside(ctx, |ui| {
+                                            Self::show_loading_progress_bar(ui);
+                                        });
+                                    }
+
                                     if new_tab_button.clicked() {
                                         window.queue_user_interface_command(
                                             UserInterfaceCommand::NewWebView,

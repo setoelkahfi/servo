@@ -1899,6 +1899,9 @@ impl ScriptThread {
                 self.handle_css_error_reporting(pipeline_id, filename, line, column, msg)
             },
             ScriptThreadMessage::Reload(pipeline_id) => self.handle_reload(pipeline_id, cx),
+            ScriptThreadMessage::StopLoading(pipeline_id) => {
+                self.handle_stop_loading(pipeline_id, cx)
+            },
             ScriptThreadMessage::Resize(id, size, size_type) => {
                 self.handle_resize_message(id, size, size_type);
             },
@@ -4328,6 +4331,16 @@ impl ScriptThread {
         let window = self.documents.borrow().find_window(pipeline_id);
         if let Some(window) = window {
             window.Location(cx).reload_without_origin_check(cx);
+        }
+    }
+
+    fn handle_stop_loading(&self, pipeline_id: PipelineId, cx: &mut js::context::JSContext) {
+        // Mirror the `window.stop()` DOM steps: prevent any planned navigation and abort the
+        // active document (and its descendants), which cancels in-flight parsing and fetches.
+        let window = self.documents.borrow().find_window(pipeline_id);
+        if let Some(window) = window {
+            window.set_ongoing_navigation();
+            window.Document().abort_a_document_and_its_descendants(cx);
         }
     }
 

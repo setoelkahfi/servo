@@ -66,6 +66,8 @@ pub enum EmbedderToConstellationMessage {
     WebDriverCommand(WebDriverCommandMsg),
     /// Reload a top-level browsing context.
     Reload(WebViewId),
+    /// Stop loading a top-level browsing context, aborting any in-flight load.
+    StopLoading(WebViewId),
     /// A log entry, with the top-level browsing context id and thread name
     LogEntry(Option<ScriptEventLoopId>, Option<String>, LogEntry),
     /// Create a new top level browsing context.

@@ -27,7 +27,7 @@ use servo_base::id::WebViewId;
 use servo_config::pref;
 use servo_constellation_traits::{
     EmbedderToConstellationMessage, HistoryTraversalSource, SessionHistoryTraversalRequest,
-    ScriptThreadMessage, TraversalDirection,
+    TraversalDirection,
 };
 use servo_geometry::DeviceIndependentPixel;
 use servo_url::ServoUrl;
@@ -554,14 +554,11 @@ impl WebView {
 
     /// Request cancellation of the in-flight navigation for this [`WebView`].
     pub fn stop(&self) {
-        self.inner().servo.constellation_proxy().send(
-            EmbedderToConstellationMessage::SendToWebView(
-                self.id(),
-                ScriptThreadMessage::SendMessage(
-                    script_traits::ScriptThreadMessage::StopDelayingLoadEventsMode,
-                ),
-            ),
-        );
+        self.inner_mut().load_status = LoadStatus::Complete;
+        self.inner()
+            .servo
+            .constellation_proxy()
+            .send(EmbedderToConstellationMessage::StopLoading(self.id()))
     }
 
     /// Whether or not this [`WebView`] can go backward in its navigation history.

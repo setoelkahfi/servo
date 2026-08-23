@@ -1385,6 +1385,9 @@ where
             EmbedderToConstellationMessage::Reload(webview_id) => {
                 self.handle_reload_msg(webview_id);
             },
+            EmbedderToConstellationMessage::StopLoading(webview_id) => {
+                self.handle_stop_loading_msg(webview_id);
+            },
             EmbedderToConstellationMessage::LogEntry(event_loop_id, thread_name, entry) => {
                 self.handle_log_entry(event_loop_id, thread_name, entry);
             },
@@ -4836,6 +4839,21 @@ where
         );
         self.paint_proxy
             .send(PaintMessage::EnableLCPCalculation(webview_id));
+    }
+
+    fn handle_stop_loading_msg(&mut self, webview_id: WebViewId) {
+        let browsing_context_id = BrowsingContextId::from(webview_id);
+        let pipeline_id = match self.browsing_contexts.get(&browsing_context_id) {
+            Some(browsing_context) => browsing_context.pipeline_id,
+            None => {
+                return warn!("{}: Got stop event after closure", browsing_context_id);
+            },
+        };
+        self.send_message_to_pipeline(
+            pipeline_id,
+            ScriptThreadMessage::StopLoading(pipeline_id),
+            "Got stop event after closure",
+        );
     }
 
     /// <https://html.spec.whatwg.org/multipage/#window-post-message-steps>

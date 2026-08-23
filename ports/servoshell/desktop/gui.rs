@@ -25,7 +25,7 @@ use egui::text::{CCursor, CCursorRange};
 use egui::text_edit::TextEditState;
 use egui::{
     Button, Color32, FontDefinitions, Id, Key, Label, LayerId, Modifiers, Order, PaintCallback,
-    Panel, Pos2, Rect as EguiRect, Stroke, Vec2, WidgetInfo, WidgetType, pos2,
+    Panel, Pos2, Rect as EguiRect, Vec2, WidgetInfo, WidgetType, pos2,
 };
 #[cfg(any(
     target_os = "windows",
@@ -256,32 +256,50 @@ impl Drop for Gui {
 }
 
 impl Gui {
+    /// Draws an indeterminate, animated multi-color loading bar. It has no real percentage to
+    /// report (Servo does not surface byte progress here), so it sweeps a colored segment across
+    /// the strip to signal that work is ongoing, then requests a repaint to keep animating.
     fn show_loading_progress_bar(ui: &mut egui::Ui) {
+        let bar_height = 3.0;
         let width = ui.available_width().max(1.0);
-        let (rect, _) = ui.allocate_exact_size(Vec2::new(width, 3.0), egui::Sense::hover());
+        let (rect, _) = ui.allocate_exact_size(Vec2::new(width, bar_height), egui::Sense::hover());
         let painter = ui.painter();
-        let stripe_width = 12.0;
+
+        // Faint track behind the moving segment.
+        painter.rect_filled(rect, 0.0, Color32::from_rgba_unmultiplied(0, 0, 0, 20));
+
         let colors = [
-            Color32::from_rgb(66, 133, 244),
-            Color32::from_rgb(234, 67, 53),
-            Color32::from_rgb(251, 188, 5),
-            Color32::from_rgb(52, 168, 83),
+            Color32::from_rgb(66, 133, 244),  // blue
+            Color32::from_rgb(234, 67, 53),   // red
+            Color32::from_rgb(251, 188, 5),   // yellow
+            Color32::from_rgb(52, 168, 83),   // green
         ];
-        let mut x = rect.left();
-        let mut i = 0usize;
-        while x < rect.right() {
-            let right = (x + stripe_width).min(rect.right());
-            let stripe = EguiRect::from_min_max(Pos2::new(x, rect.top()), Pos2::new(right, rect.bottom()));
-            painter.rect_filled(stripe, 0.0, colors[i % colors.len()]);
-            x = right;
-            i += 1;
+
+        let time = ui.input(|input| input.time) as f32;
+        let full_width = rect.width();
+        let segment_width = (full_width * 0.3).max(60.0);
+        let travel = full_width + segment_width;
+        // Two-second sweep, looping.
+        let offset = (time * (travel / 2.0)) % travel;
+        let seg_left = rect.left() - segment_width + offset;
+
+        let stripe_width = segment_width / colors.len() as f32;
+        for (i, color) in colors.iter().enumerate() {
+            let start = seg_left + stripe_width * i as f32;
+            let left = start.max(rect.left());
+            let right = (start + stripe_width).min(rect.right());
+            if right <= left {
+                continue;
+            }
+            let stripe = EguiRect::from_min_max(
+                Pos2::new(left, rect.top()),
+                Pos2::new(right, rect.bottom()),
+            );
+            painter.rect_filled(stripe, 0.0, *color);
         }
-        painter.rect_stroke(
-            rect,
-            0.0,
-            Stroke::new(1.0, Color32::from_rgba_unmultiplied(0, 0, 0, 30)),
-            egui::StrokeKind::Inside,
-        );
+
+        // Keep the animation going while the page loads.
+        ui.ctx().request_repaint();
     }
 
     pub(crate) fn new(
@@ -750,11 +768,6 @@ impl Gui {
                                         info.label = Some("New tab".into());
                                         info
                                     });
-                                    if self.load_status != LoadStatus::Complete {
-                                        Panel::top("loading_progress").show_inside(ctx, |ui| {
-                                            Self::show_loading_progress_bar(ui);
-                                        });
-                                    }
 
                                     if new_tab_button.clicked() {
                                         window.queue_user_interface_command(
@@ -778,7 +791,18 @@ impl Gui {
                         })
                 });
 
-                *toolbar_height = Length::new(outer.response.rect.max.y);
+                // A thin colorful progress strip shown below the tab bar while the active
+                // WebView is still loading. It sits in its own top panel so that it spans the
+                // full window width and pushes the WebView down without overlapping the tabs.
+                let mut toolbar_bottom = outer.response.rect.max.y;
+                if self.load_status != LoadStatus::Complete {
+                    let progress = Panel::top("loading_progress").show_inside(ctx, |ui| {
+                        Self::show_loading_progress_bar(ui);
+                    });
+                    toolbar_bottom = progress.response.rect.max.y;
+                }
+
+                *toolbar_height = Length::new(toolbar_bottom);
             } else {
                 *toolbar_height = Length::default();
             }

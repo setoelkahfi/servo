@@ -93,6 +93,7 @@ impl MixedMessage {
                 ScriptThreadMessage::DispatchStorageEvent(id, ..) => Some(*id),
                 ScriptThreadMessage::ReportCSSError(id, ..) => Some(*id),
                 ScriptThreadMessage::Reload(id, ..) => Some(*id),
+                ScriptThreadMessage::StopLoading(id, ..) => Some(*id),
                 ScriptThreadMessage::PaintMetric(id, ..) => Some(*id),
                 ScriptThreadMessage::ExitFullScreen(id, ..) => Some(*id),
                 ScriptThreadMessage::MediaSessionAction(..) => None,

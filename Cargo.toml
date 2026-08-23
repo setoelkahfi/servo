@@ -435,7 +435,7 @@ lto = "thin"
 codegen-units = 1
 
 [patch.crates-io]
-# smb Browser: winit and ipc-channel each declare an Apple SPI symbol that App
+# smbCloud Browser: winit and ipc-channel each declare an Apple SPI symbol that App
 # Review rejects under ITMS-90338 -- CGSSetWindowBackgroundBlurRadius (plus
 # CGSMainConnectionID) for window blur, and bootstrap_register2 for the Mach
 # one-shot server. Declaring them is enough to fail review: an `extern` block

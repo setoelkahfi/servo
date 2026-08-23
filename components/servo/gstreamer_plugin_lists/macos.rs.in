@@ -6,14 +6,14 @@
 "gstosxvideo",
 // gst-plugins-bad
 //
-// smb Browser: "gstapplemedia" is deliberately absent, and is not upstreamable
+// smbCloud Browser: "gstapplemedia" is deliberately absent, and is not upstreamable
 // -- it is a distribution constraint of this product, not a Servo bug.
 //
 // That plugin's avfvideosrc imports the AVFoundation capture classes
 // (AVCaptureDevice, AVCaptureSession, AVCaptureDeviceInput). Mac App Store
 // review scans the bundle for those references and reads them as the app
 // providing camera functionality, then rejects the submission unless it
-// declares com.apple.security.device.camera. smb Browser has no camera feature
+// declares com.apple.security.device.camera. smbCloud Browser has no camera feature
 // to back that entitlement with: navigator.mediaDevices and getUserMedia are
 // both gated on dom_webrtc_enabled, which defaults to false and stays off in
 // this build, so web content cannot reach a capture device at all.

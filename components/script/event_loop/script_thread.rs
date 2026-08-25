@@ -42,8 +42,8 @@ use devtools_traits::{
 use embedder_traits::user_contents::{UserContentManagerId, UserContents, UserScript};
 use embedder_traits::{
     EmbedderControlId, EmbedderControlResponse, EmbedderMsg, FocusSequenceNumber,
-    InputEventOutcome, JavaScriptEvaluationError, JavaScriptEvaluationId, MediaSessionActionType,
-    Theme, ViewportDetails, WebDriverScriptCommand,
+    InputEventOutcome, JavaScriptEvaluationError, JavaScriptEvaluationId, LoadStatus,
+    MediaSessionActionType, Theme, ViewportDetails, WebDriverScriptCommand,
 };
 use encoding_rs::Encoding;
 use fonts::{FontContext, SystemFontServiceProxy, WebFontLoadEvent};
@@ -113,7 +113,6 @@ use url::Position;
 #[cfg(feature = "webgpu")]
 use webgpu_traits::{WebGPUDevice, WebGPUMsg};
 
-use crate::devtools::DevtoolsState;
 use crate::dom::bindings::codegen::Bindings::DocumentBinding::{
     DocumentMethods, DocumentReadyState,
 };
@@ -144,27 +143,27 @@ use crate::dom::types::DebuggerGlobalScope;
 use crate::dom::webgpu::identityhub::IdentityHub;
 use crate::dom::window::Window;
 use crate::dom::windowproxy::{CreatorBrowsingContextInfo, WindowProxy};
+use crate::event_loop::devtools::{self, DevtoolsState};
 use crate::event_loop::document_collection::DocumentCollection;
 use crate::event_loop::document_loader::DocumentLoader;
 use crate::event_loop::script_mutation_observers::ScriptMutationObservers;
 use crate::event_loop::script_window_proxies::ScriptWindowProxies;
 use crate::event_loop::svg_font::SvgFontResolver;
+use crate::event_loop::webdriver_handlers::{self, jsval_to_webdriver};
 use crate::fetch::fetch::FetchCanceller;
 use crate::fetch::network_listener::{FetchResponseListener, submit_timing};
 use crate::messaging::{
     CommonScriptMsg, MainThreadScriptMsg, MixedMessage, ScriptEventLoopSender,
     ScriptThreadReceivers, ScriptThreadSenders,
 };
-use crate::microtask::{MicrotaskQueue, MicrotaskRunnable};
 use crate::mime::{APPLICATION, CHARSET, MimeExt, TEXT, XML};
 use crate::navigation::{InProgressLoad, NavigationListener};
 use crate::realms::enter_auto_realm;
-use crate::script_runtime::{
+use crate::runtime::microtask::{MicrotaskQueue, MicrotaskRunnable};
+use crate::runtime::script_runtime::{
     IntroductionType, Runtime, ScriptThreadEventCategory, ThreadSafeJSContext, get_reports,
 };
 use crate::tasks::task_queue::TaskQueue;
-use crate::webdriver_handlers::jsval_to_webdriver;
-use crate::{devtools, webdriver_handlers};
 
 thread_local!(static SCRIPT_THREAD_ROOT: Cell<Option<*const ScriptThread>> = const { Cell::new(None) });
 
@@ -3654,7 +3653,20 @@ impl ScriptThread {
             image_cache,
         );
 
-        document.set_ready_state(cx, DocumentReadyState::Loading);
+        // Only send loading-related messages if this document is actually in the loading state.
+        // `about:blank` documents should never be in that state when starting.
+        if !incomplete.load_data.is_initial_about_blank {
+            debug_assert_eq!(document.ReadyState(), DocumentReadyState::Loading);
+            if window.is_top_level() {
+                window.send_to_embedder(EmbedderMsg::NotifyLoadStatusChanged(
+                    incomplete.webview_id,
+                    LoadStatus::Started,
+                ));
+                window.send_to_embedder(EmbedderMsg::Status(incomplete.webview_id, None));
+            }
+        } else {
+            debug_assert_eq!(document.ReadyState(), DocumentReadyState::Complete);
+        }
 
         // Step 8. Let loadTimingInfo be a new document load timing info with its
         //   navigation start time set to navigationParams's response's timing

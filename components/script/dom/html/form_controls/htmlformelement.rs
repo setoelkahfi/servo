@@ -75,6 +75,9 @@ use crate::dom::html::htmlobjectelement::HTMLObjectElement;
 use crate::dom::html::htmloutputelement::HTMLOutputElement;
 use crate::dom::html::htmlselectelement::HTMLSelectElement;
 use crate::dom::html::htmltextareaelement::HTMLTextAreaElement;
+use crate::dom::html::links::relations::{
+    LinkRelations, get_element_target, valid_navigable_target_name_or_keyword,
+};
 use crate::dom::node::virtualmethods::VirtualMethods;
 use crate::dom::node::{Node, NodeFlags, NodeTraits, UnbindContext, VecPreOrderInsertionHelper};
 use crate::dom::nodelist::{NodeList, RadioListMode};
@@ -84,7 +87,6 @@ use crate::dom::types::{DocumentFragment, HTMLIFrameElement};
 use crate::dom::window::Window;
 use crate::event_loop::script_thread::ScriptThread;
 use crate::fetch::body::Extractable;
-use crate::links::{LinkRelations, get_element_target, valid_navigable_target_name_or_keyword};
 use crate::navigation::navigate;
 
 /// <https://html.spec.whatwg.org/multipage/#the-form-element>
@@ -1289,7 +1291,7 @@ impl HTMLFormElement {
                         let custom = child.downcast::<HTMLElement>().unwrap();
                         if custom.is_form_associated_custom_element() {
                             // https://html.spec.whatwg.org/multipage/#face-entry-construction
-                            let internals = custom.upcast::<Element>().ensure_element_internals(cx);
+                            let internals = custom.ensure_element_internals(cx);
                             internals.perform_entry_construction(&mut data_set);
                             // Otherwise no form value has been set so there is nothing to do.
                         }

@@ -206,6 +206,42 @@ pub extern "C" fn servoshell_ios_load_url(url: *const c_char) {
 }
 
 #[unsafe(no_mangle)]
+pub extern "C" fn servoshell_ios_touch_down(x: f32, y: f32, pointer_id: i32) {
+    APP.with(|slot| {
+        if let Some(app) = slot.borrow().as_ref() {
+            app.touch_down(x, y, pointer_id);
+        }
+    });
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn servoshell_ios_touch_move(x: f32, y: f32, pointer_id: i32) {
+    APP.with(|slot| {
+        if let Some(app) = slot.borrow().as_ref() {
+            app.touch_move(x, y, pointer_id);
+        }
+    });
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn servoshell_ios_touch_up(x: f32, y: f32, pointer_id: i32) {
+    APP.with(|slot| {
+        if let Some(app) = slot.borrow().as_ref() {
+            app.touch_up(x, y, pointer_id);
+        }
+    });
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn servoshell_ios_touch_cancel(x: f32, y: f32, pointer_id: i32) {
+    APP.with(|slot| {
+        if let Some(app) = slot.borrow().as_ref() {
+            app.touch_cancel(x, y, pointer_id);
+        }
+    });
+}
+
+#[unsafe(no_mangle)]
 pub extern "C" fn servoshell_ios_shutdown() {
     APP.with(|slot| {
         if let Some(app) = slot.borrow_mut().take() {

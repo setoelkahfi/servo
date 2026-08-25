@@ -161,6 +161,18 @@ pub extern "C" fn servoshell_ios_spin_event_loop() {
 }
 
 #[unsafe(no_mangle)]
+pub extern "C" fn servoshell_ios_notify_vsync() {
+    APP.with(|slot| {
+        if let Some(app) = slot.borrow().as_ref() {
+            // The embedded window uses VsyncRefreshDriver, so merely draining
+            // Servo's event queue does not make a frame eligible to paint.
+            // UIKit's CADisplayLink is the platform vsync source.
+            app.notify_vsync();
+        }
+    });
+}
+
+#[unsafe(no_mangle)]
 pub extern "C" fn servoshell_ios_resize(width: i32, height: i32, _scale: f32) {
     APP.with(|slot| {
         if let Some(app) = slot.borrow().as_ref() {

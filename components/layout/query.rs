@@ -60,18 +60,16 @@ use crate::layout_impl::LayoutThread;
 use crate::style_ext::ComputedValuesExt;
 use crate::taffy::SpecificTaffyGridInfo;
 
-/// Get a scroll node that would represents this [`ServoLayoutNode`]'s transform and
-/// calculate its cumulative transform from its root scroll node to the scroll node.
-fn root_transform_for_layout_node(
+/// Calculate the cumulative transform from the root scroll node for `fragments`.
+fn root_transform_for_fragments(
     scroll_tree: &ScrollTree,
-    node: ServoLayoutNode<'_>,
+    fragments: &[Fragment],
 ) -> Option<FastLayoutTransform> {
-    let fragments = node.fragments_for_pseudo(None);
     let box_fragment = fragments
         .first()
         .and_then(Fragment::retrieve_box_fragment)?;
     let scroll_tree_node_id = box_fragment.spatial_tree_node()?;
-    Some(scroll_tree.cumulative_node_to_root_transform(scroll_tree_node_id))
+    scroll_tree.try_cumulative_node_to_root_transform(scroll_tree_node_id)
 }
 
 pub(crate) fn process_padding_request(node: ServoLayoutNode<'_>) -> Option<PhysicalSides> {
@@ -100,32 +98,35 @@ pub(crate) fn process_box_area_request(
     area: BoxAreaType,
     exclude_transform_and_inline: bool,
 ) -> Option<Rect<Au, CSSPixel>> {
-    let fragments = node.fragments_for_pseudo(None);
-    let mut rects = fragments
-        .iter()
-        .filter(|fragment| {
-            !exclude_transform_and_inline ||
-                fragment
-                    .retrieve_box_fragment()
-                    .is_none_or(|fragment| !fragment.with_style().is_inline_box())
-        })
-        .filter_map(|node| node.cumulative_box_area_rect(area, layout_thread.into()))
-        .peekable();
+    // Borrow fragments to avoid cloning on this hot path for accessibility and
+    // `getBoundingClientRect()`.
+    node.with_fragments(|fragments| {
+        let mut rects = fragments
+            .iter()
+            .filter(|fragment| {
+                !exclude_transform_and_inline ||
+                    fragment
+                        .retrieve_box_fragment()
+                        .is_none_or(|fragment| !fragment.with_style().is_inline_box())
+            })
+            .filter_map(|node| node.cumulative_box_area_rect(area, layout_thread.into()))
+            .peekable();
 
-    rects.peek()?;
-    let rect_union = rects.fold(Rect::zero(), |unioned_rect, rect| rect.union(&unioned_rect));
+        rects.peek()?;
+        let rect_union = rects.fold(Rect::zero(), |unioned_rect, rect| rect.union(&unioned_rect));
 
-    if exclude_transform_and_inline {
-        return Some(rect_union);
-    }
+        if exclude_transform_and_inline {
+            return Some(rect_union);
+        }
 
-    let Some(transform) =
-        root_transform_for_layout_node(&stacking_context_tree.paint_info.scroll_tree, node)
-    else {
-        return Some(Rect::new(rect_union.origin, Size2D::zero()));
-    };
+        let Some(transform) =
+            root_transform_for_fragments(&stacking_context_tree.paint_info.scroll_tree, fragments)
+        else {
+            return Some(Rect::new(rect_union.origin, Size2D::zero()));
+        };
 
-    transform_au_rectangle(rect_union, transform)
+        transform_au_rectangle(rect_union, transform)
+    })?
 }
 
 pub(crate) fn process_box_areas_request(
@@ -134,20 +135,21 @@ pub(crate) fn process_box_areas_request(
     node: ServoLayoutNode<'_>,
     area: BoxAreaType,
 ) -> CSSPixelRectVec {
-    let fragments = node
-        .fragments_for_pseudo(None)
+    let fragments = node.fragments_for_pseudo(None);
+    let transform =
+        root_transform_for_fragments(&stacking_context_tree.paint_info.scroll_tree, &fragments);
+
+    let rects = fragments
         .into_iter()
         .filter_map(move |fragment| fragment.cumulative_box_area_rect(area, layout_thread.into()));
 
-    let Some(transform) =
-        root_transform_for_layout_node(&stacking_context_tree.paint_info.scroll_tree, node)
-    else {
-        return fragments
+    let Some(transform) = transform else {
+        return rects
             .map(|rect| Rect::new(rect.origin, Size2D::zero()))
             .collect();
     };
 
-    fragments
+    rects
         .filter_map(move |rect| transform_au_rectangle(rect, transform))
         .collect()
 }
@@ -699,11 +701,10 @@ pub fn process_offset_parent_query(
     let cumulative_sticky_offsets = fragment
         .retrieve_box_fragment()
         .and_then(|box_fragment| box_fragment.spatial_tree_node())
-        .map(|node_id| {
+        .and_then(|node_id| {
             scroll_tree
-                .cumulative_sticky_offsets(node_id)
-                .map(Au::from_f32_px)
-                .cast_unit()
+                .try_cumulative_sticky_offsets(node_id)
+                .map(|offsets| offsets.map(Au::from_f32_px).cast_unit())
         });
     border_box = border_box.translate(cumulative_sticky_offsets.unwrap_or_default());
 
@@ -758,11 +759,10 @@ pub fn process_offset_parent_query(
     .translate(
         cumulative_sticky_offsets
             .and_then(|_| parent_fragment.spatial_tree_node())
-            .map(|node_id| {
+            .and_then(|node_id| {
                 scroll_tree
-                    .cumulative_sticky_offsets(node_id)
-                    .map(Au::from_f32_px)
-                    .cast_unit()
+                    .try_cumulative_sticky_offsets(node_id)
+                    .map(|offsets| offsets.map(Au::from_f32_px).cast_unit())
             })
             .unwrap_or_default(),
     );

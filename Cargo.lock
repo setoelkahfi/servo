@@ -2342,9 +2342,9 @@ dependencies = [
 
 [[package]]
 name = "either"
-version = "1.17.0"
+version = "1.18.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9e5e8f6c15a24b9a3ee5efec809ccd006d3b30e8b3bb63c39af737c7f87daa1d"
+checksum = "252afb9ae5eaa683babdc6a068b3f5726eb19e05070c731f9b2a23a7c3e8ed34"
 
 [[package]]
 name = "elliptic-curve"
@@ -5242,7 +5242,9 @@ dependencies = [
 
 [[package]]
 name = "mozjs"
-version = "0.23.0"
+version = "0.23.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "89b0250ec78781bceb8c3bf523771654583e4db2625e815138bc65fa2b1ec7fe"
 dependencies = [
  "bindgen",
  "cc",
@@ -5255,7 +5257,9 @@ dependencies = [
 
 [[package]]
 name = "mozjs_sys"
-version = "140.14.0-0"
+version = "140.14.0-1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4cb5edb8729da5f2b09939fcad2559ba1c54e55d222f14d485b88c7d645890d5"
 dependencies = [
  "bindgen",
  "cc",
@@ -6101,9 +6105,9 @@ dependencies = [
 
 [[package]]
 name = "ohos-sys-opaque-types"
-version = "0.1.10"
+version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f0135000ddab1491bd02a60e855c02e71be855845ca354162c1e189dea79d015"
+checksum = "709d9a23a7fd92c4c1f94c6772fd0e6607aa302c382601cc475000b68758cbbf"
 
 [[package]]
 name = "ohos-vsync"
@@ -7576,7 +7580,7 @@ dependencies = [
 [[package]]
 name = "selectors"
 version = "0.40.0"
-source = "git+https://github.com/servo/stylo?rev=800d90bf8018da8d596e3cb50d0df5491bf1df78#800d90bf8018da8d596e3cb50d0df5491bf1df78"
+source = "git+https://github.com/servo/stylo?rev=3c9c571d44d7b3d82e0b8981ddf5cc73661a68cb#3c9c571d44d7b3d82e0b8981ddf5cc73661a68cb"
 dependencies = [
  "bitflags 2.13.1",
  "cssparser",
@@ -8500,9 +8504,9 @@ name = "servo-media-examples"
 version = "0.5.0"
 dependencies = [
  "euclid",
+ "freetype-sys",
  "rand 0.10.2",
  "serde",
- "servo",
  "servo-media",
  "servo-media-auto",
  "servo-media-dummy",
@@ -9384,7 +9388,7 @@ dependencies = [
 [[package]]
 name = "servo_arc"
 version = "0.4.3"
-source = "git+https://github.com/servo/stylo?rev=800d90bf8018da8d596e3cb50d0df5491bf1df78#800d90bf8018da8d596e3cb50d0df5491bf1df78"
+source = "git+https://github.com/servo/stylo?rev=3c9c571d44d7b3d82e0b8981ddf5cc73661a68cb#3c9c571d44d7b3d82e0b8981ddf5cc73661a68cb"
 dependencies = [
  "serde",
  "stable_deref_trait",
@@ -9877,7 +9881,7 @@ dependencies = [
 [[package]]
 name = "stylo"
 version = "0.20.0"
-source = "git+https://github.com/servo/stylo?rev=800d90bf8018da8d596e3cb50d0df5491bf1df78#800d90bf8018da8d596e3cb50d0df5491bf1df78"
+source = "git+https://github.com/servo/stylo?rev=3c9c571d44d7b3d82e0b8981ddf5cc73661a68cb#3c9c571d44d7b3d82e0b8981ddf5cc73661a68cb"
 dependencies = [
  "app_units",
  "arrayvec",
@@ -9933,7 +9937,7 @@ dependencies = [
 [[package]]
 name = "stylo_atoms"
 version = "0.20.0"
-source = "git+https://github.com/servo/stylo?rev=800d90bf8018da8d596e3cb50d0df5491bf1df78#800d90bf8018da8d596e3cb50d0df5491bf1df78"
+source = "git+https://github.com/servo/stylo?rev=3c9c571d44d7b3d82e0b8981ddf5cc73661a68cb#3c9c571d44d7b3d82e0b8981ddf5cc73661a68cb"
 dependencies = [
  "string_cache",
  "string_cache_codegen",
@@ -9942,7 +9946,7 @@ dependencies = [
 [[package]]
 name = "stylo_derive"
 version = "0.20.0"
-source = "git+https://github.com/servo/stylo?rev=800d90bf8018da8d596e3cb50d0df5491bf1df78#800d90bf8018da8d596e3cb50d0df5491bf1df78"
+source = "git+https://github.com/servo/stylo?rev=3c9c571d44d7b3d82e0b8981ddf5cc73661a68cb#3c9c571d44d7b3d82e0b8981ddf5cc73661a68cb"
 dependencies = [
  "darling",
  "proc-macro2",
@@ -9954,7 +9958,7 @@ dependencies = [
 [[package]]
 name = "stylo_dom"
 version = "0.20.0"
-source = "git+https://github.com/servo/stylo?rev=800d90bf8018da8d596e3cb50d0df5491bf1df78#800d90bf8018da8d596e3cb50d0df5491bf1df78"
+source = "git+https://github.com/servo/stylo?rev=3c9c571d44d7b3d82e0b8981ddf5cc73661a68cb#3c9c571d44d7b3d82e0b8981ddf5cc73661a68cb"
 dependencies = [
  "bitflags 2.13.1",
  "stylo_malloc_size_of",
@@ -9963,7 +9967,7 @@ dependencies = [
 [[package]]
 name = "stylo_malloc_size_of"
 version = "0.20.0"
-source = "git+https://github.com/servo/stylo?rev=800d90bf8018da8d596e3cb50d0df5491bf1df78#800d90bf8018da8d596e3cb50d0df5491bf1df78"
+source = "git+https://github.com/servo/stylo?rev=3c9c571d44d7b3d82e0b8981ddf5cc73661a68cb#3c9c571d44d7b3d82e0b8981ddf5cc73661a68cb"
 dependencies = [
  "app_units",
  "cssparser",
@@ -9980,7 +9984,7 @@ dependencies = [
 [[package]]
 name = "stylo_static_prefs"
 version = "0.20.0"
-source = "git+https://github.com/servo/stylo?rev=800d90bf8018da8d596e3cb50d0df5491bf1df78#800d90bf8018da8d596e3cb50d0df5491bf1df78"
+source = "git+https://github.com/servo/stylo?rev=3c9c571d44d7b3d82e0b8981ddf5cc73661a68cb#3c9c571d44d7b3d82e0b8981ddf5cc73661a68cb"
 dependencies = [
  "toml",
 ]
@@ -9988,7 +9992,7 @@ dependencies = [
 [[package]]
 name = "stylo_traits"
 version = "0.20.0"
-source = "git+https://github.com/servo/stylo?rev=800d90bf8018da8d596e3cb50d0df5491bf1df78#800d90bf8018da8d596e3cb50d0df5491bf1df78"
+source = "git+https://github.com/servo/stylo?rev=3c9c571d44d7b3d82e0b8981ddf5cc73661a68cb#3c9c571d44d7b3d82e0b8981ddf5cc73661a68cb"
 dependencies = [
  "app_units",
  "bitflags 2.13.1",
@@ -10403,7 +10407,7 @@ checksum = "1f3ccbac311fea05f86f61904b462b55fb3df8837a366dfc601a0161d0532f20"
 [[package]]
 name = "to_shmem"
 version = "0.5.0"
-source = "git+https://github.com/servo/stylo?rev=800d90bf8018da8d596e3cb50d0df5491bf1df78#800d90bf8018da8d596e3cb50d0df5491bf1df78"
+source = "git+https://github.com/servo/stylo?rev=3c9c571d44d7b3d82e0b8981ddf5cc73661a68cb#3c9c571d44d7b3d82e0b8981ddf5cc73661a68cb"
 dependencies = [
  "cssparser",
  "servo_arc",
@@ -10416,7 +10420,7 @@ dependencies = [
 [[package]]
 name = "to_shmem_derive"
 version = "0.1.0"
-source = "git+https://github.com/servo/stylo?rev=800d90bf8018da8d596e3cb50d0df5491bf1df78#800d90bf8018da8d596e3cb50d0df5491bf1df78"
+source = "git+https://github.com/servo/stylo?rev=3c9c571d44d7b3d82e0b8981ddf5cc73661a68cb#3c9c571d44d7b3d82e0b8981ddf5cc73661a68cb"
 dependencies = [
  "darling",
  "proc-macro2",
@@ -12870,3 +12874,11 @@ dependencies = [
  "syn",
  "winnow",
 ]
+
+[[patch.unused]]
+name = "mozjs"
+version = "0.23.0"
+
+[[patch.unused]]
+name = "mozjs_sys"
+version = "140.14.0-0"

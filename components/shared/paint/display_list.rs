@@ -473,6 +473,11 @@ impl ScrollTree {
         &self.nodes[id.index]
     }
 
+    /// Return true if the given [`ScrollTreeNodeId`] exists in this tree.
+    pub fn contains_node(&self, id: ScrollTreeNodeId) -> bool {
+        id.index < self.nodes.len()
+    }
+
     /// Get the WebRender [`SpatialId`] for the given [`ScrollNodeId`]. This will
     /// panic if [`ScrollTree::build_display_list`] has not been called yet.
     pub fn webrender_id(&self, id: ScrollTreeNodeId) -> SpatialId {
@@ -613,6 +618,15 @@ impl ScrollTree {
             .node_to_root_transform
     }
 
+    /// Find a transformation that can convert a point in the node coordinate system to a
+    /// point in the root coordinate system, or `None` if the node is not present in this tree.
+    pub fn try_cumulative_node_to_root_transform(
+        &self,
+        node_id: ScrollTreeNodeId,
+    ) -> Option<FastLayoutTransform> {
+        self.contains_node(node_id).then(|| self.cumulative_node_to_root_transform(node_id))
+    }
+
     /// Find a transformation that can convert a point in the root coordinate system to a
     /// point in the coordinate system of the given node. This may be `None` if the cumulative
     /// transform is uninvertible.
@@ -643,6 +657,15 @@ impl ScrollTree {
     pub fn cumulative_sticky_offsets(&self, node_id: ScrollTreeNodeId) -> LayoutVector2D {
         self.cumulative_node_transform(node_id)
             .cumulative_sticky_offsets
+    }
+
+    /// Find the cumulative offsets of sticky positioned boxes from the given node up to
+    /// the root, or `None` if the node is not present in this tree.
+    pub fn try_cumulative_sticky_offsets(
+        &self,
+        node_id: ScrollTreeNodeId,
+    ) -> Option<LayoutVector2D> {
+        self.contains_node(node_id).then(|| self.cumulative_sticky_offsets(node_id))
     }
 
     fn cumulative_node_transform(

@@ -22,6 +22,11 @@ use crate::{init_crypto, init_tracing};
 
 type WakeCallback = extern "C" fn(*mut c_void);
 
+#[cfg(feature = "bundled")]
+unsafe extern "C" {
+    fn servo_force_link_default_resources();
+}
+
 thread_local! {
     static APP: RefCell<Option<Rc<App>>> = const { RefCell::new(None) };
 }
@@ -108,6 +113,13 @@ pub extern "C" fn servoshell_ios_init(
     let Some(raw_window_handle) = window_handle(view) else {
         return false;
     };
+
+    // Rust static libraries are linked as native archives. Keep the baked-in
+    // resource reader's constructor-bearing member in the final iOS binary.
+    #[cfg(feature = "bundled")]
+    unsafe {
+        servo_force_link_default_resources();
+    }
 
     init_crypto();
     init_tracing(None);

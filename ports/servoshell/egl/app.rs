@@ -306,6 +306,7 @@ pub struct App {
 impl App {
     #[servo::servo_tracing::instrument(skip_all, name = "App::new", level = "info")]
     pub(super) fn new(init: AppInitOptions) -> Rc<Self> {
+        let config_dir = init.opts.config_dir.clone();
         let mut servo_builder = ServoBuilder::default()
             .opts(init.opts)
             .preferences(init.preferences.clone())
@@ -324,7 +325,7 @@ impl App {
         let state = Rc::new(RunningAppState::new(
             servo,
             init.servoshell_preferences,
-            init.opts.config_dir.clone(),
+            config_dir,
             init.event_loop_waker,
             user_content_manager,
             init.preferences,

@@ -5258,8 +5258,6 @@ dependencies = [
 [[package]]
 name = "mozjs_sys"
 version = "140.14.0-1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4cb5edb8729da5f2b09939fcad2559ba1c54e55d222f14d485b88c7d645890d5"
 dependencies = [
  "bindgen",
  "cc",
@@ -5812,8 +5810,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d425caf1df73233f29fd8a5c3e5edbc30d2d4307870f802d18f00d83dc5141a6"
 dependencies = [
  "bitflags 2.13.1",
+ "objc2 0.6.4",
  "objc2-core-foundation",
  "objc2-core-graphics",
+ "objc2-io-surface",
 ]
 
 [[package]]
@@ -5973,6 +5973,7 @@ dependencies = [
  "objc2 0.6.4",
  "objc2-core-foundation",
  "objc2-foundation 0.3.2",
+ "objc2-quartz-core 0.3.2",
 ]
 
 [[package]]
@@ -10037,6 +10038,7 @@ dependencies = [
  "objc2-io-surface",
  "objc2-metal 0.3.2",
  "objc2-quartz-core 0.3.2",
+ "objc2-ui-kit 0.3.2",
  "raw-window-handle",
  "wayland-sys",
  "winapi",
@@ -12878,7 +12880,3 @@ dependencies = [
 [[patch.unused]]
 name = "mozjs"
 version = "0.23.0"
-
-[[patch.unused]]
-name = "mozjs_sys"
-version = "140.14.0-0"

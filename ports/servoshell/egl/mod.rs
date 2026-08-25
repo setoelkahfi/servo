@@ -6,6 +6,8 @@
 mod android;
 pub(crate) mod app;
 mod host_trait;
+#[cfg(target_os = "ios")]
+mod ios;
 mod log;
 #[cfg(target_env = "ohos")]
 mod ohos;

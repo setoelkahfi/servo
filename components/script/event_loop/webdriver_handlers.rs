@@ -20,10 +20,10 @@ use js::jsapi::{HandleValueArray, JSITER_OWNONLY, JSType, PropertyDescriptor};
 use js::jsval::UndefinedValue;
 use js::realm::CurrentRealm;
 use js::rust::wrappers2::{
-    GetPropertyKeys, JS_CallFunctionName, JS_GetOwnPropertyDescriptorById, JS_GetProperty,
-    JS_GetPropertyById, JS_HasOwnProperty, JS_IsExceptionPending, JS_TypeOfValue,
+    GetPropertyKeys, IsArgumentsObject, JS_CallFunctionName, JS_GetOwnPropertyDescriptorById,
+    JS_GetProperty, JS_GetPropertyById, JS_HasOwnProperty, JS_IsExceptionPending, JS_TypeOfValue,
 };
-use js::rust::{HandleObject, HandleValue, IdVector, ToString};
+use js::rust::{HandleObject, HandleValue, IdVector};
 use net_traits::CookieSource::{HTTP, NonHTTP};
 use net_traits::CoreResourceMsg::{DeleteCookie, DeleteCookies, GetCookiesForUrl, SetCookieForUrl};
 use script_bindings::codegen::GenericBindings::ShadowRootBinding::ShadowRootMethods;
@@ -318,7 +318,7 @@ fn all_matching_links(
     // Step 7.2. If a DOMException, SyntaxError, XPathException, or other error occurs
     // during the execution of the element location strategy, return error invalid selector.
     root_node
-        .query_selector_all(cx, DOMString::from("a"))
+        .query_selector_all(cx, DOMString::from_static("a"))
         .map_err(|_| ErrorStatus::InvalidSelector)
         .map(|nodes| matching_links(cx, &nodes, link_text, partial).collect())
 }
@@ -350,13 +350,8 @@ fn object_has_to_json_property(
 
 #[expect(unsafe_code)]
 /// <https://w3c.github.io/webdriver/#dfn-collection>
-fn is_arguments_object(cx: &mut JSContext, value: HandleValue) -> bool {
-    rooted!(&in(cx) let class_name = unsafe { ToString(cx, value) });
-    let Some(class_name) = NonNull::new(class_name.get()) else {
-        return false;
-    };
-    let class_name = unsafe { jsstr_to_string(cx, class_name) };
-    class_name == "[object Arguments]"
+fn is_arguments_object(object: HandleObject) -> bool {
+    unsafe { IsArgumentsObject(object) }
 }
 
 #[derive(Clone, Eq, Hash, PartialEq)]
@@ -506,7 +501,7 @@ fn clone_an_object(
     seen.insert(hashable.clone());
 
     let return_val = if is_array_like::<crate::DomTypeHolder>(cx, val) ||
-        is_arguments_object(cx, val)
+        is_arguments_object(object_handle)
     {
         let mut result: Vec<JSValue> = Vec::new();
 

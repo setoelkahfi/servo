@@ -30,12 +30,14 @@ use html5ever::{LocalName, QualName, local_name, ns};
 use hyper_serde::Serde;
 use indexmap::IndexSet;
 use js::context::{JSContext, NoGC};
+use js::jsapi::JSObject;
 use js::realm::CurrentRealm;
 use js::rust::{HandleObject, HandleValue, MutableHandleValue};
 use layout_api::{
     PendingRestyle, ReflowGoal, ReflowPhasesRun, ReflowStatistics, RestyleReason,
     ScrollContainerQueryFlags, TrustedNodeAddress,
 };
+use malloc_size_of::MallocSizeOfOps;
 use metrics::{InteractiveFlag, InteractiveWindow, ProgressiveWebMetrics};
 use net_traits::CookieSource::NonHTTP;
 use net_traits::CoreResourceMsg::{GetCookieStringForUrl, SetCookiesForUrl};
@@ -48,10 +50,12 @@ use net_traits::request::{
 use net_traits::{ReferrerPolicy, ResourceFetchTiming};
 use paint_api::largest_contentful_paint_candidate::LCPCandidateID;
 use percent_encoding::percent_decode;
-use profile_traits::generic_channel as profile_generic_channel;
+use profile_traits::mem::{Report, ReportKind};
 use profile_traits::time::TimerMetadataFrameType;
+use profile_traits::{generic_channel as profile_generic_channel, path};
 use regex::bytes::Regex;
 use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet};
+use script_bindings::callback::ThisReflector;
 use script_bindings::cell::{DomRefCell, Ref, RefMut};
 use script_bindings::interfaces::DocumentHelpers;
 use script_bindings::reflector::reflect_dom_object_with_proto;
@@ -150,6 +154,7 @@ use crate::dom::documentorshadowroot::{
 use crate::dom::documenttimeline::DocumentTimeline;
 use crate::dom::documenttype::DocumentType;
 use crate::dom::domimplementation::DOMImplementation;
+use crate::dom::domstringlist::DOMStringList;
 use crate::dom::element::attributes::storage::AttrRef;
 use crate::dom::element::{CustomElementCreationMode, Element, ElementCreator};
 use crate::dom::event::{Event, EventBubbles, EventCancelable};
@@ -213,14 +218,15 @@ use crate::dom::xpathevaluator::XPathEvaluator;
 use crate::dom::xpathexpression::XPathExpression;
 use crate::event_loop::document_loader::{DocumentLoader, LoadType};
 use crate::event_loop::script_thread::{ScriptThread, SharedRwLocks};
+use crate::event_loop::timers::{OneshotTimerCallback, OneshotTimers};
 use crate::fetch::fetch::{DeferredFetchRecordInvokeState, FetchCanceller};
 use crate::fetch::network_listener::{FetchResponseListener, NetworkListener};
 use crate::mime::{APPLICATION, CHARSET};
 use crate::navigation::navigate;
+use crate::runtime::script_runtime::compute_size;
 use crate::tasks::task::NonSendTaskBox;
 use crate::tasks::task_manager::TaskManager;
 use crate::tasks::task_source::TaskSourceName;
-use crate::timers::{OneshotTimerCallback, OneshotTimers};
 use crate::xpath::parse_expression;
 
 #[derive(Clone, Copy, PartialEq)]
@@ -725,6 +731,13 @@ pub(crate) struct Document {
     /// True if this document is no longer the active document of its associated
     /// window.
     window_detached: Cell<bool>,
+
+    /// <https://html.spec.whatwg.org/multipage/#concept-document-ancestor-origins-list>
+    ancestor_origins_list: MutNullableDom<DOMStringList>,
+
+    /// <https://html.spec.whatwg.org/multipage/#concept-document-internal-ancestor-origin-objects-list>
+    #[no_trace]
+    internal_ancestor_origin_objects_list: RefCell<Option<Vec<ImmutableOrigin>>>,
 }
 
 impl Document {
@@ -995,12 +1008,25 @@ impl Document {
         self.content_type.matches(APPLICATION, "xhtml+xml")
     }
 
+    /// <https://html.spec.whatwg.org/multipage/#fully-active>
     pub(crate) fn is_fully_active(&self) -> bool {
-        !self.window_detached() && self.activity.get() == DocumentActivity::FullyActive
+        // > A Document d is said to be fully active when d is the active document of a
+        // > navigable navigable, and either navigable is a top-level traversable or
+        // > navigable's container document is fully active.
+        self.is_active() &&
+            (self.window.is_top_level() || self.activity.get() == DocumentActivity::FullyActive)
     }
 
+    /// <https://html.spec.whatwg.org/multipage/#nav-document>
     pub(crate) fn is_active(&self) -> bool {
-        !self.window_detached() && self.activity.get() != DocumentActivity::Inactive
+        // > A navigable's active document is its active session history entry's document.
+        //
+        // The first two checks stand in for when the document is not the active session history
+        // entry's document, as when that happens they will be false. The session history entry
+        // is not really implemented in script in the same way the specification says.
+        self.browsing_context().is_some() &&
+            !self.window_detached() &&
+            self.activity.get() != DocumentActivity::Inactive
     }
 
     #[inline]
@@ -1426,35 +1452,58 @@ impl Document {
             .map(|element| DomRoot::from_ref(&**element))
     }
 
-    // https://html.spec.whatwg.org/multipage/#current-document-readiness
-    pub(crate) fn set_ready_state(&self, cx: &mut JSContext, state: DocumentReadyState) {
+    pub(crate) fn notify_embedder_of_load_completion(&self) {
+        if self.window().is_top_level() {
+            self.send_to_embedder(EmbedderMsg::NotifyLoadStatusChanged(
+                self.webview_id(),
+                LoadStatus::Complete,
+            ));
+        }
+    }
+
+    /// <https://html.spec.whatwg.org/multipage/#update-the-current-document-readiness>
+    pub(crate) fn update_the_current_document_readiness(
+        &self,
+        cx: &mut JSContext,
+        state: DocumentReadyState,
+    ) {
+        // Step 1. If document's current document readiness equals readinessValue, then return.
+        if self.ready_state.get() == state {
+            return;
+        }
+
+        // Step 2. Set document's current document readiness to readinessValue.
+        self.ready_state.set(state);
+
+        // Step 3. If document is associated with an HTML parser:
+        // Step 3.1: Let now be the current high resolution time given document's relevant
+        // global object.
+        // Note: Handled implicitly by update_with_current_instant.
         match state {
             DocumentReadyState::Loading => {
-                if self.window().is_top_level() {
-                    self.send_to_embedder(EmbedderMsg::NotifyLoadStatusChanged(
-                        self.webview_id(),
-                        LoadStatus::Started,
-                    ));
-                    self.send_to_embedder(EmbedderMsg::Status(self.webview_id(), None));
-                    update_with_current_instant(&self.navigation_timing.dom_loading);
-                }
+                unreachable!("Loading is an initial state, so we never transition to it.")
             },
             DocumentReadyState::Complete => {
-                if self.window().is_top_level() {
-                    self.send_to_embedder(EmbedderMsg::NotifyLoadStatusChanged(
-                        self.webview_id(),
-                        LoadStatus::Complete,
-                    ));
-                }
+                // This isn't part of the specification, but it's useful to have it here to
+                // avoid code duplication.
+                self.notify_embedder_of_load_completion();
+
+                // Step 3.2: If readinessValue is "complete", and document's load timing info's
+                // DOM complete time is 0, then set document's load timing info's DOM complete
+                // time to now.
+                // Note: "check for zero" is handled by `.update_with_current_instant`.
                 update_with_current_instant(&self.navigation_timing.dom_complete);
             },
             DocumentReadyState::Interactive => {
+                // Step 3.3: Otherwise, if readinessValue is "interactive", and document's load timing
+                // info's DOM interactive time is 0, then set document's load timing info's DOM
+                // interactive time to now.
+                // Note: "check for zero" is handled by `.update_with_current_instant`.
                 update_with_current_instant(&self.navigation_timing.dom_interactive)
             },
         };
 
-        self.ready_state.set(state);
-
+        // Step 4. Fire an event named readystatechange at document.
         self.upcast::<EventTarget>()
             .fire_event(cx, atom!("readystatechange"));
     }
@@ -2410,7 +2459,7 @@ impl Document {
                 }
 
                 // Step 9.1. Update the current document readiness to "complete".
-                document.set_ready_state(cx,DocumentReadyState::Complete);
+                document.update_the_current_document_readiness(cx,DocumentReadyState::Complete);
 
                 // Step 9.2. If the Document object's browsing context is null, then abort these steps.
                 if document.browsing_context().is_none() {
@@ -2983,6 +3032,32 @@ impl Document {
             .unwrap_or(0)
     }
 
+    /// <https://html.spec.whatwg.org/multipage/#concept-document-ancestor-origins-list>
+    pub(crate) fn set_ancestor_origins_list(&self, ancestor_origins_list: &DOMStringList) {
+        self.ancestor_origins_list.set(Some(ancestor_origins_list));
+    }
+
+    /// <https://html.spec.whatwg.org/multipage/#concept-document-ancestor-origins-list>
+    pub(crate) fn ancestor_origins_list(&self) -> Option<DomRoot<DOMStringList>> {
+        self.ancestor_origins_list.get()
+    }
+
+    /// <https://html.spec.whatwg.org/multipage/#concept-document-internal-ancestor-origin-objects-list>
+    pub(crate) fn set_internal_ancestor_origin_objects_list(
+        &self,
+        internal_ancestor_origin_objects_list: Vec<ImmutableOrigin>,
+    ) {
+        *self.internal_ancestor_origin_objects_list.borrow_mut() =
+            Some(internal_ancestor_origin_objects_list);
+    }
+
+    /// <https://html.spec.whatwg.org/multipage/#concept-document-internal-ancestor-origin-objects-list>
+    pub(crate) fn internal_ancestor_origin_objects_list(
+        &self,
+    ) -> Ref<'_, Option<Vec<ImmutableOrigin>>> {
+        self.internal_ancestor_origin_objects_list.borrow()
+    }
+
     /// A reference to the [`IFrameCollection`] of this [`Document`], holding information about
     /// `<iframe>`s found within it.
     pub(crate) fn iframes(&self) -> Ref<'_, IFrameCollection> {
@@ -3142,7 +3217,7 @@ impl Document {
         if !self.window().layout_blocked() &&
             (!self.restyle_reason(no_gc).is_empty() ||
                 self.window().layout().needs_new_display_list() ||
-                self.window().layout().needs_accessibility_update())
+                self.window().layout().force_accessibility_update())
         {
             return true;
         }
@@ -3679,6 +3754,78 @@ impl Document {
     ) -> Option<UnrootedDom<'a, Element>> {
         self.upcast::<Node>().child_elements_unrooted(no_gc).next()
     }
+
+    pub(crate) fn collect_reports(
+        &self,
+        reports: &mut Vec<Report>,
+        ops: &mut MallocSizeOfOps,
+    ) -> HashSet<*const JSObject> {
+        let mut computed_objects = HashSet::new();
+        let mut sizes = DocumentSizes::default();
+
+        for node in self
+            .upcast::<Node>()
+            .traverse_preorder(ShadowIncluding::Yes)
+        {
+            let size = compute_size(node.jsobject(), ops, &computed_objects);
+
+            match node.type_id() {
+                NodeTypeId::Element(_) => {
+                    sizes.element_nodes_size += size;
+
+                    let element = node.downcast::<Element>().expect("node must be Element");
+                    for attr in element.attrs().borrow().iter() {
+                        if let Some(attr) = attr.as_attr() {
+                            let size = compute_size(
+                                attr.upcast::<Node>().jsobject(),
+                                ops,
+                                &computed_objects,
+                            );
+                            sizes.attribute_nodes_size += size;
+                            computed_objects.insert(attr.upcast::<Node>().jsobject());
+                        }
+                    }
+                },
+                NodeTypeId::CharacterData(_) => sizes.text_nodes_size += size,
+                _ => sizes.other_nodes_size += size,
+            };
+
+            computed_objects.insert(node.jsobject());
+        }
+
+        let prefix = format!("url({})", self.url());
+        reports.push(Report {
+            path: path![prefix, "js", "dom", "element-nodes"],
+            kind: ReportKind::ExplicitJemallocHeapSize,
+            size: sizes.element_nodes_size,
+        });
+        reports.push(Report {
+            path: path![prefix, "js", "dom", "text-nodes"],
+            kind: ReportKind::ExplicitJemallocHeapSize,
+            size: sizes.text_nodes_size,
+        });
+        reports.push(Report {
+            path: path![prefix, "js", "dom", "attribute-nodes"],
+            kind: ReportKind::ExplicitJemallocHeapSize,
+            size: sizes.attribute_nodes_size,
+        });
+        reports.push(Report {
+            path: path![prefix, "js", "dom", "other-nodes"],
+            kind: ReportKind::ExplicitJemallocHeapSize,
+            size: sizes.other_nodes_size,
+        });
+
+        computed_objects
+    }
+}
+
+/// Holds DOM object memory sizes for fine-grained memory reports.
+#[derive(Default)]
+struct DocumentSizes {
+    element_nodes_size: usize,
+    text_nodes_size: usize,
+    attribute_nodes_size: usize,
+    other_nodes_size: usize,
 }
 
 #[derive(MallocSizeOf, PartialEq)]
@@ -3863,6 +4010,14 @@ impl Document {
             QuirksMode::NoQuirks
         };
 
+        // From <https://w3c.github.io/navigation-timing/#dom-performancetiming-domloading>:
+        // > This attribute must return the time immediately before the user agent sets the
+        // > current document readiness to "loading".
+        let navigation_timing = Rc::new(NavigationTiming::default());
+        if ready_state == DocumentReadyState::Loading {
+            update_with_current_instant(&navigation_timing.dom_loading);
+        }
+
         Document {
             node: Node::new_document_node(),
             document_or_shadow_root: DocumentOrShadowRoot::new(window),
@@ -3914,6 +4069,8 @@ impl Document {
             current_parser: Default::default(),
             base_element: Default::default(),
             target_base_element: Default::default(),
+            ancestor_origins_list: Default::default(),
+            internal_ancestor_origin_objects_list: Default::default(),
             appropriate_template_contents_owner_document: Default::default(),
             pending_restyles: DomRefCell::new(FxHashMap::default()),
             needs_restyle: Cell::new(RestyleReason::DOMChanged),
@@ -3936,7 +4093,7 @@ impl Document {
             active_parser_was_aborted: Cell::new(false),
             fired_unload: Cell::new(false),
             responsive_images: Default::default(),
-            navigation_timing: Default::default(),
+            navigation_timing,
             resource_fetch_timing: RefCell::new(None),
             completely_loaded: Cell::new(false),
             script_and_layout_blockers: Cell::new(0),
@@ -5253,7 +5410,7 @@ impl DocumentMethods<crate::DomTypeHolder> for Document {
         sanitizer.sanitize(cx, document.upcast(), false)?;
 
         // Step 7. Return document.
-        document.set_ready_state(cx, DocumentReadyState::Complete);
+        document.update_the_current_document_readiness(cx, DocumentReadyState::Complete);
         Ok(document)
     }
 
@@ -5449,7 +5606,7 @@ impl DocumentMethods<crate::DomTypeHolder> for Document {
 
     /// <https://dom.spec.whatwg.org/#dom-document-characterset>
     fn CharacterSet(&self) -> DOMString {
-        DOMString::from(self.encoding.get().name())
+        DOMString::from_static(self.encoding.get().name())
     }
 
     /// <https://dom.spec.whatwg.org/#dom-document-charset>
@@ -5927,7 +6084,7 @@ impl DocumentMethods<crate::DomTypeHolder> for Document {
 
     /// <https://html.spec.whatwg.org/multipage/#document.title>
     fn Title(&self) -> DOMString {
-        self.title().unwrap_or_else(|| DOMString::from(""))
+        self.title().unwrap_or_default()
     }
 
     /// <https://html.spec.whatwg.org/multipage/#document.title>

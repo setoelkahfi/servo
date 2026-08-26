@@ -42,6 +42,25 @@ fn add_mock_scroll_node(tree: &mut ScrollTree) -> (ScrollTreeNodeId, ExternalScr
 }
 
 #[test]
+fn test_scroll_tree_fallible_transform_queries_reject_missing_node() {
+    let mut scroll_tree = ScrollTree::default();
+    add_mock_scroll_node(&mut scroll_tree);
+
+    let missing_node = ScrollTreeNodeId { index: 2 };
+    assert!(!scroll_tree.contains_node(missing_node));
+    assert!(
+        scroll_tree
+            .try_cumulative_node_to_root_transform(missing_node)
+            .is_none()
+    );
+    assert!(
+        scroll_tree
+            .try_cumulative_sticky_offsets(missing_node)
+            .is_none()
+    );
+}
+
+#[test]
 fn test_scroll_tree_simple_scroll() {
     let mut scroll_tree = ScrollTree::default();
     let (id, external_id) = add_mock_scroll_node(&mut scroll_tree);

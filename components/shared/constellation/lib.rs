@@ -23,6 +23,7 @@ use embedder_traits::{
     ViewportDetails, WebDriverCommandMsg,
 };
 pub use from_script_message::*;
+use keyboard_types::Modifiers;
 use malloc_size_of_derive::MallocSizeOf;
 use paint_api::PinchZoomInfos;
 use paint_api::largest_contentful_paint_candidate::LCPCandidateID;
@@ -66,6 +67,18 @@ pub enum EmbedderToConstellationMessage {
     WebDriverCommand(WebDriverCommandMsg),
     /// Reload a top-level browsing context.
     Reload(WebViewId),
+    /// Stop loading a top-level browsing context, aborting any in-flight load.
+    StopLoading(WebViewId),
+    /// The set of keyboard modifiers the user is currently holding down, as the embedder sees
+    /// them.
+    ///
+    /// The Constellation otherwise infers this from the keyboard events it is forwarded, which
+    /// goes stale the moment the embedder keeps one to itself -- a menu accelerator, a shortcut
+    /// bound in the browser chrome, or any key pressed while the window is not focused. A stale
+    /// modifier is not harmless: a `Meta` that never came back up makes every subsequent click
+    /// on a link open in a new tab. Embedders that can observe the real state should send it
+    /// whenever it changes, and clear it when the window loses focus.
+    SetKeyboardModifiers(Modifiers),
     /// A log entry, with the top-level browsing context id and thread name
     LogEntry(Option<ScriptEventLoopId>, Option<String>, LogEntry),
     /// Create a new top level browsing context.

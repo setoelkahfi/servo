@@ -58,6 +58,8 @@ mod from_embedder {
                 Self::TickAnimation(..) => target!("TickAnimation"),
                 Self::WebDriverCommand(..) => target!("WebDriverCommand"),
                 Self::Reload(..) => target!("Reload"),
+                Self::StopLoading(..) => target!("StopLoading"),
+                Self::SetKeyboardModifiers(..) => target!("SetKeyboardModifiers"),
                 Self::LogEntry(..) => target!("LogEntry"),
                 Self::NewWebView(..) => target!("NewWebView"),
                 Self::CloseWebView(..) => target!("CloseWebView"),
@@ -161,6 +163,10 @@ mod from_script {
                 Self::GetTopForBrowsingContext(..) => target!("GetTopForBrowsingContext"),
                 Self::GetBrowsingContextInfo(..) => target!("GetBrowsingContextInfo"),
                 Self::GetDocumentOrigin(..) => target!("GetDocumentOrigin"),
+                Self::IsCurrentlyFullyActive(..) => target!("IsCurrentlyFullyActive"),
+                Self::GetInternalAncestorOriginObjectsList(..) => {
+                    target!("GetInternalAncestorOriginObjectsList")
+                },
                 Self::GetChildBrowsingContextId(..) => target!("GetChildBrowsingContextId"),
                 Self::LoadComplete => target!("LoadComplete"),
                 Self::LoadUrl(..) => target!("LoadUrl"),

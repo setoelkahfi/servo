@@ -119,9 +119,7 @@ use crate::dom::eventsource::EventSource;
 use crate::dom::eventtarget::EventTarget;
 use crate::dom::file::File;
 use crate::dom::globalscope::broadcastchannel::BroadcastChannel;
-use crate::dom::globalscope::script_execution::{
-    ErrorReporting, evaluate_script, fill_compile_options,
-};
+use crate::dom::globalscope::script_execution::{evaluate_script, fill_compile_options};
 use crate::dom::idbfactory::IDBFactory;
 use crate::dom::messageport::MessagePort;
 use crate::dom::paintworkletglobalscope::PaintWorkletGlobalScope;
@@ -129,6 +127,7 @@ use crate::dom::performance::performance::Performance;
 use crate::dom::performance::performanceentry::EntryType;
 use crate::dom::promise::Promise;
 use crate::dom::readablestream::{CrossRealmTransformReadable, ReadableStream};
+use crate::dom::script_execution::ScriptOptions;
 use crate::dom::serviceworker::ServiceWorker;
 use crate::dom::serviceworkerglobalscope::ServiceWorkerGlobalScope;
 use crate::dom::serviceworkerregistration::ServiceWorkerRegistration;
@@ -145,22 +144,22 @@ use crate::dom::window::Window;
 use crate::dom::workerglobalscope::WorkerGlobalScope;
 use crate::dom::workletglobalscope::WorkletGlobalScope;
 use crate::event_loop::script_thread::{ScriptThread, with_script_thread};
+use crate::event_loop::timers::{
+    IsInterval, OneshotTimerCallback, OneshotTimerHandle, OneshotTimers, TimerCallback,
+    TimerEventId, TimerSource,
+};
 use crate::fetch::fetch::{DeferredFetchRecordId, FetchGroup, QueuedDeferredFetchRecord};
 use crate::fetch::network_listener::{FetchResponseListener, NetworkListener};
 use crate::messaging::{CommonScriptMsg, ScriptEventLoopReceiver, ScriptEventLoopSender};
-use crate::microtask::MicrotaskRunnable;
 use crate::modules::import_map::ImportMap;
 use crate::modules::script_module::{
     ModuleRequest, ModuleStatus, ModuleTree, ResolvedModule, ScriptFetchOptions,
 };
 use crate::realms::enter_auto_realm;
-use crate::script_runtime::ThreadSafeJSContext;
+use crate::runtime::microtask::MicrotaskRunnable;
+use crate::runtime::script_runtime::ThreadSafeJSContext;
 use crate::tasks::task_manager::TaskManager;
 use crate::tasks::task_source::SendableTaskSource;
-use crate::timers::{
-    IsInterval, OneshotTimerCallback, OneshotTimerHandle, OneshotTimers, TimerCallback,
-    TimerEventId, TimerSource,
-};
 use crate::unminify::unminified_path;
 
 #[derive(JSTraceable, MallocSizeOf)]
@@ -2968,13 +2967,15 @@ impl GlobalScope {
             let url = self.api_base_url();
             let fetch_options = ScriptFetchOptions::default_classic_script();
 
+            let mut script_options = ScriptOptions::empty();
+            script_options.set(ScriptOptions::ReturnsAValue, rval.is_some());
+
             let options = fill_compile_options(
                 cx,
                 filename,
+                script_options,
                 introduction_type,
-                ErrorReporting::Unmuted,
-                rval.is_none(), // noScriptRval
-                1,              // lineno
+                1, // line_number
             );
 
             let mut source = transform_str_to_source_text(&code);
@@ -3572,7 +3573,7 @@ impl GlobalScope {
 
             // Step 4. Run the following steps in parallel:
             //   (We schedule a oneshot that will enforce the sub-steps when it fires.)
-            let callback = crate::timers::OneshotTimerCallback::RunStepsAfterTimeout {
+            let callback = OneshotTimerCallback::RunStepsAfterTimeout {
                 // Step 1. timerKey
                 timer_key,
                 // Step 4. orderingIdentifier
@@ -3660,6 +3661,10 @@ impl GlobalScopeHelpers<crate::DomTypeHolder> for GlobalScope {
 
     fn pipeline_id(&self) -> PipelineId {
         self.pipeline_id()
+    }
+
+    fn script_to_constellation_chan(&self) -> ScriptToConstellationChan {
+        self.script_to_constellation_chan()
     }
 }
 

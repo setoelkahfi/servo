@@ -45,8 +45,8 @@ use crate::dom::{AttributeMutation, cors_setting_for_element};
 use crate::event_loop::script_thread::ScriptThread;
 use crate::fetch::fetch::{RequestWithGlobalScope, create_a_potential_cors_request};
 use crate::fetch::network_listener::{self, FetchResponseListener, ResourceTimingListener};
-use crate::microtask::MicrotaskRunnable;
 use crate::realms::enter_auto_realm;
+use crate::runtime::microtask::MicrotaskRunnable;
 
 #[derive(Clone, Copy, Default, JSTraceable, MallocSizeOf, PartialEq)]
 #[repr(u16)]
@@ -201,12 +201,12 @@ impl HTMLTrackElementMethods<crate::DomTypeHolder> for HTMLTrackElement {
             _ if kind.is_empty() => {
                 // The default value should be "subtitles". If "kind" has not
                 // been set, the real value for "kind" is "subtitles"
-                DOMString::from("subtitles")
+                DOMString::from_static("subtitles")
             },
             _ => {
                 // If "kind" has been set but it is not one of the valid
                 // values, return the default invalid value of "metadata"
-                DOMString::from("metadata")
+                DOMString::from_static("metadata")
             },
         }
     }

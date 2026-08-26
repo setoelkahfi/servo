@@ -57,7 +57,7 @@ pub(crate) static EXPERIMENTAL_PREFS: &[&str] = &[
 /// Web APIs required by mainstream daily-use sites. Servo still ships these
 /// behind preferences, but smbCloud Browser treats them as part of its compatibility
 /// baseline rather than asking users to discover an experimental toggle.
-const SMB_DAILY_WEB_PREFS: &[&str] = &[
+pub(crate) const SMB_DAILY_WEB_PREFS: &[&str] = &[
     "dom_adoptedstylesheet_enabled",
     "dom_fontface_enabled",
     "dom_indexeddb_enabled",
@@ -144,7 +144,7 @@ impl Default for ServoShellPreferences {
             clean_shutdown: false,
             device_pixel_ratio_override: None,
             headless: false,
-            homepage: "https://smbcloud.xyz/".into(),
+            homepage: "smb:newtab".into(),
             initial_window_size: Size2D::new(1024, 740),
             no_native_titlebar: true,
             screen_size_override: None,
@@ -605,7 +605,7 @@ struct CmdArgs {
     zealous_gc: bool,
 
     /// The url we should load.
-    #[bpaf(positional("URL"), fallback(String::from("https://smbcloud.xyz/")))]
+    #[bpaf(positional("URL"), fallback(String::from("smb:newtab")))]
     url: String,
 }
 
@@ -949,12 +949,7 @@ fn test_servoshell_cmd() {
 
     assert_eq!(
         test_parse("").2.url.as_deref(),
-        Some("https://smbcloud.xyz/"),
-    );
-
-    assert_eq!(
-        test_parse("").2.url.as_deref(),
-        Some("https://smbcloud.xyz/"),
+        Some("smb:newtab"),
     );
 
     assert_eq!(

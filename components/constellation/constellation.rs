@@ -1385,6 +1385,12 @@ where
             EmbedderToConstellationMessage::Reload(webview_id) => {
                 self.handle_reload_msg(webview_id);
             },
+            EmbedderToConstellationMessage::StopLoading(webview_id) => {
+                self.handle_stop_loading_msg(webview_id);
+            },
+            EmbedderToConstellationMessage::SetKeyboardModifiers(modifiers) => {
+                self.active_keyboard_modifiers = modifiers;
+            },
             EmbedderToConstellationMessage::LogEntry(event_loop_id, thread_name, entry) => {
                 self.handle_log_entry(event_loop_id, thread_name, entry);
             },
@@ -1896,11 +1902,31 @@ where
                     );
                 }
             },
+            ScriptToConstellationMessage::IsCurrentlyFullyActive(pipeline_id, response_sender) => {
+                if let Err(error) = response_sender
+                    .send(self.get_activity(pipeline_id) == DocumentActivity::FullyActive)
+                {
+                    warn!("Sending reply to get document activity failed ({error:?}).");
+                }
+            },
             ScriptToConstellationMessage::GetDocumentOrigin(pipeline_id, response_sender) => {
                 self.send_message_to_pipeline(
                     pipeline_id,
                     ScriptThreadMessage::GetDocumentOrigin(pipeline_id, response_sender),
                     "Document origin retrieval after closure",
+                );
+            },
+            ScriptToConstellationMessage::GetInternalAncestorOriginObjectsList(
+                pipeline_id,
+                response_sender,
+            ) => {
+                self.send_message_to_pipeline(
+                    pipeline_id,
+                    ScriptThreadMessage::GetInternalAncestorOriginObjectsList(
+                        pipeline_id,
+                        response_sender,
+                    ),
+                    "Document ancestor origin objects list retrieval after closure",
                 );
             },
             ScriptToConstellationMessage::ServiceWorkerAlgorithm(algorithm) => {
@@ -4237,9 +4263,6 @@ where
                     warn!("Could not find WebView for URL load: ({webview_id:?})");
                 }
 
-                self.paint_proxy
-                    .send(PaintMessage::EnableLCPCalculation(webview_id));
-
                 Some(new_pipeline_id)
             },
         }
@@ -4834,8 +4857,21 @@ where
             ScriptThreadMessage::Reload(pipeline_id),
             "Got reload event after closure",
         );
-        self.paint_proxy
-            .send(PaintMessage::EnableLCPCalculation(webview_id));
+    }
+
+    fn handle_stop_loading_msg(&mut self, webview_id: WebViewId) {
+        let browsing_context_id = BrowsingContextId::from(webview_id);
+        let pipeline_id = match self.browsing_contexts.get(&browsing_context_id) {
+            Some(browsing_context) => browsing_context.pipeline_id,
+            None => {
+                return warn!("{}: Got stop event after closure", browsing_context_id);
+            },
+        };
+        self.send_message_to_pipeline(
+            pipeline_id,
+            ScriptThreadMessage::StopLoading(pipeline_id),
+            "Got stop event after closure",
+        );
     }
 
     /// <https://html.spec.whatwg.org/multipage/#window-post-message-steps>

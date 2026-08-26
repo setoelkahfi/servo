@@ -108,8 +108,8 @@ use crate::fetch::fetch::{
     FetchCanceller, RequestWithGlobalScope, create_a_potential_cors_request,
 };
 use crate::fetch::network_listener::{self, FetchResponseListener, ResourceTimingListener};
-use crate::microtask::MicrotaskRunnable;
 use crate::realms::enter_auto_realm;
+use crate::runtime::microtask::MicrotaskRunnable;
 use crate::tasks::task_source::SendableTaskSource;
 
 /// A CSS file to style the media controls.
@@ -2416,7 +2416,7 @@ impl HTMLMediaElement {
 
             // Step 1. Create an AudioTrack object to represent the audio track.
             let kind = match i {
-                0 => DOMString::from("main"),
+                0 => DOMString::from_static("main"),
                 _ => DOMString::new(),
             };
 
@@ -2483,7 +2483,7 @@ impl HTMLMediaElement {
 
             // Step 1. Create a VideoTrack object to represent the video track.
             let kind = match i {
-                0 => DOMString::from("main"),
+                0 => DOMString::from_static("main"),
                 _ => DOMString::new(),
             };
 

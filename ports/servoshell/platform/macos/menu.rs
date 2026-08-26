@@ -2,7 +2,7 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
-//! smb Browser's additions to the macOS application menu.
+//! smbCloud Browser's additions to the macOS application menu.
 //!
 //! winit builds the default menubar during launch — About, Services, Hide,
 //! Quit — and offers no way to extend it, so the Settings item is inserted

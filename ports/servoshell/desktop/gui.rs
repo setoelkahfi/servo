@@ -3,26 +3,48 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 use std::collections::HashMap;
-#[cfg(any(target_os = "windows", target_os = "linux", target_os = "freebsd"))]
+#[cfg(any(
+    target_os = "windows",
+    target_os = "linux",
+    target_os = "freebsd",
+    target_os = "macos"
+))]
 use std::fs;
-#[cfg(any(target_os = "windows", target_os = "linux", target_os = "freebsd"))]
+#[cfg(any(
+    target_os = "windows",
+    target_os = "linux",
+    target_os = "freebsd",
+    target_os = "macos"
+))]
 use std::path::Path;
 use std::rc::Rc;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
+use accesskit::Affine;
 use dpi::PhysicalSize;
 use egui::text::{CCursor, CCursorRange};
 use egui::text_edit::TextEditState;
 use egui::{
-    Button, FontDefinitions, Id, Key, Label, LayerId, Modifiers, Order, PaintCallback, Panel, Vec2,
-    WidgetInfo, WidgetType, pos2,
+    Button, Color32, FontDefinitions, Id, Key, Label, LayerId, Modifiers, Order, PaintCallback,
+    Panel, Pos2, Rect as EguiRect, Vec2, WidgetInfo, WidgetType, pos2,
 };
-#[cfg(any(target_os = "windows", target_os = "linux", target_os = "freebsd"))]
+#[cfg(any(
+    target_os = "windows",
+    target_os = "linux",
+    target_os = "freebsd",
+    target_os = "macos"
+))]
 use egui::{FontData, FontFamily};
 use egui_glow::{CallbackFn, EguiGlow};
 use egui_winit::EventResponse;
 use euclid::{Length, Point2D, Rect, Scale, Size2D};
-#[cfg(any(target_os = "windows", target_os = "linux", target_os = "freebsd"))]
+#[cfg(any(
+    target_os = "windows",
+    target_os = "linux",
+    target_os = "freebsd",
+    target_os = "macos"
+))]
 use log::info;
 use servo::{
     DeviceIndependentPixel, DevicePixel, Image, LoadStatus, OffscreenRenderingContext, PixelFormat,
@@ -38,6 +60,10 @@ use crate::desktop::headed_window;
 use crate::running_app_state::{RunningAppState, UserInterfaceCommand};
 use crate::window::ServoShellWindow;
 
+/// How long the chrome keeps calling a load a load after the engine last said anything about
+/// it. See [`Gui::is_loading`].
+const LOAD_STALL_TIMEOUT: Duration = Duration::from_secs(20);
+
 /// The user interface of a headed servoshell. Currently this is implemented via
 /// egui.
 pub struct Gui {
@@ -52,6 +78,10 @@ pub struct Gui {
 
     /// The [`LoadStatus`] of the active `WebView`.
     load_status: LoadStatus,
+
+    /// When [`Self::load_status`] last changed, which is what [`Self::is_loading`] measures a
+    /// stalled load against.
+    load_status_changed_at: Instant,
 
     /// The text to display in the status bar on the bottom of the window.
     status_text: Option<String>,
@@ -81,7 +111,6 @@ pub struct Gui {
     chat_open: bool,
 
     /// The Settings window, opened from the application menu.
-    #[cfg(target_os = "macos")]
     settings: crate::desktop::settings::Settings,
 }
 
@@ -94,8 +123,21 @@ fn truncate_with_ellipsis(input: &str, max_length: usize) -> String {
     }
 }
 
-#[cfg(any(target_os = "windows", target_os = "linux", target_os = "freebsd"))]
-fn load_cjk_fonts(font_candidates: &[(&str, &str)]) -> FontDefinitions {
+/// Load whichever of `font_candidates` exist and add them to the proportional
+/// family.
+///
+/// `prefer` decides whether they go in front of egui's bundled faces or behind
+/// them. In front means they also render Latin text, which is what the CJK
+/// faces on Windows and Linux have always done. Behind means they are consulted
+/// only for glyphs the bundled faces lack, which is what macOS wants: the
+/// chrome should keep looking like the rest of the system.
+#[cfg(any(
+    target_os = "windows",
+    target_os = "linux",
+    target_os = "freebsd",
+    target_os = "macos"
+))]
+fn load_cjk_fonts(font_candidates: &[(&str, &str)], prefer: bool) -> FontDefinitions {
     let mut fonts = FontDefinitions::default();
     let mut loaded_font_names = Vec::new();
 
@@ -122,7 +164,11 @@ fn load_cjk_fonts(font_candidates: &[(&str, &str)]) -> FontDefinitions {
     if !loaded_font_names.is_empty() {
         let proportional = fonts.families.get_mut(&FontFamily::Proportional).unwrap();
         for font_name in loaded_font_names.iter() {
-            proportional.insert(0, font_name.clone());
+            if prefer {
+                proportional.insert(0, font_name.clone());
+            } else {
+                proportional.push(font_name.clone());
+            }
         }
     }
 
@@ -131,10 +177,13 @@ fn load_cjk_fonts(font_candidates: &[(&str, &str)]) -> FontDefinitions {
 
 #[cfg(target_os = "windows")]
 fn configure_fonts() -> FontDefinitions {
-    load_cjk_fonts(&[
-        (r"C:\Windows\Fonts\malgun.ttf", "Malgun Gothic"), // Korean
-        (r"C:\Windows\Fonts\msyh.ttc", "Microsoft YaHei"), // Chinese + Japanese
-    ])
+    load_cjk_fonts(
+        &[
+            (r"C:\Windows\Fonts\malgun.ttf", "Malgun Gothic"), // Korean
+            (r"C:\Windows\Fonts\msyh.ttc", "Microsoft YaHei"), // Chinese + Japanese
+        ],
+        true,
+    )
 }
 
 #[cfg(any(target_os = "linux", target_os = "freebsd"))]
@@ -177,14 +226,43 @@ fn configure_fonts() -> FontDefinitions {
             "/usr/local/share/fonts/wqy/wqy-microhei.ttc",
             "WenQuanYi Micro Hei",
         ), // FreeBSD
-    ])
+    ], true)
 }
 
 #[cfg(target_os = "macos")]
 fn configure_fonts() -> FontDefinitions {
-    // TODO: Default proportional fonts: ["Ubuntu-Light", "NotoEmoji-Regular", "emoji-icon-font"]
-    // does not support CJK. Add them for Mac.
-    FontDefinitions::default()
+    // egui's bundled faces cover Latin and little else, so any chrome that
+    // shows page-supplied text renders tofu outside that range. The select
+    // element popup is drawn here rather than by the engine, so a language
+    // picker on a site like about.google turns into a column of boxes.
+    //
+    // These are fallbacks, not preferences: the toolbar keeps egui's own face
+    // and only unmapped glyphs reach them. Arial Unicode comes first because it
+    // covers most of the BMP on its own; the rest fill in scripts it renders
+    // poorly, and any that a given macOS release has moved or dropped are
+    // skipped.
+    load_cjk_fonts(
+        &[
+            (
+                "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
+                "Arial Unicode MS",
+            ),
+            ("/System/Library/Fonts/Hiragino Sans GB.ttc", "Hiragino Sans GB"), // Chinese
+            (
+                "/System/Library/Fonts/ヒラギノ角ゴシック W3.ttc",
+                "Hiragino Kaku Gothic", // Japanese
+            ),
+            ("/System/Library/Fonts/AppleSDGothicNeo.ttc", "Apple SD Gothic Neo"), // Korean
+            ("/System/Library/Fonts/GeezaPro.ttc", "Geeza Pro"),                   // Arabic
+            ("/System/Library/Fonts/Supplemental/Thonburi.ttc", "Thonburi"),       // Thai
+            (
+                "/System/Library/Fonts/Supplemental/DevanagariMT.ttc",
+                "Devanagari MT",
+            ),
+            ("/System/Library/Fonts/Apple Symbols.ttf", "Apple Symbols"),
+        ],
+        false,
+    )
 }
 
 impl Drop for Gui {
@@ -197,6 +275,37 @@ impl Drop for Gui {
 }
 
 impl Gui {
+    /// Draws an indeterminate, animated loading bar in `color`. It has no real percentage to
+    /// report (Servo does not surface byte progress here), so it sweeps a segment across the
+    /// strip to signal that work is ongoing, then requests a repaint to keep animating.
+    fn show_loading_progress_bar(ui: &mut egui::Ui, color: Color32) {
+        let bar_height = 3.0;
+        let width = ui.available_width().max(1.0);
+        let (rect, _) = ui.allocate_exact_size(Vec2::new(width, bar_height), egui::Sense::hover());
+        let painter = ui.painter();
+
+        // Faint track behind the moving segment, in the same hue so that the strip reads as one
+        // thing rather than a coloured bar on an unrelated grey one.
+        painter.rect_filled(rect, 0.0, color.gamma_multiply(0.15));
+
+        let time = ui.input(|input| input.time) as f32;
+        let full_width = rect.width();
+        let segment_width = (full_width * 0.3).max(60.0);
+        let travel = full_width + segment_width;
+        // Two-second sweep, looping.
+        let offset = (time * (travel / 2.0)) % travel;
+        let left = (rect.left() - segment_width + offset).max(rect.left());
+        let right = (rect.left() - segment_width + offset + segment_width).min(rect.right());
+        if right > left {
+            let segment =
+                EguiRect::from_min_max(Pos2::new(left, rect.top()), Pos2::new(right, rect.bottom()));
+            painter.rect_filled(segment, 0.0, color);
+        }
+
+        // Keep the animation going while the page loads.
+        ui.ctx().request_repaint();
+    }
+
     pub(crate) fn new(
         winit_window: &Window,
         event_loop: &ActiveEventLoop,
@@ -240,6 +349,7 @@ impl Gui {
             location: initial_url.to_string(),
             location_dirty: false,
             load_status: LoadStatus::Complete,
+            load_status_changed_at: Instant::now(),
             status_text: None,
             can_go_back: false,
             can_go_forward: false,
@@ -249,7 +359,6 @@ impl Gui {
             inference: crate::desktop::inference::Inference::new(),
             #[cfg(target_os = "macos")]
             chat_open: false,
-            #[cfg(target_os = "macos")]
             settings: Default::default(),
         }
     }
@@ -541,6 +650,11 @@ impl Gui {
         self.rendering_context
             .make_current()
             .expect("Could not make RenderingContext current");
+
+        // Read before `self` is taken apart below, so the closure can borrow the fields it needs
+        // without also holding a borrow of the whole `Gui`.
+        let is_loading = self.is_loading();
+
         let Self {
             rendering_context,
             context,
@@ -552,7 +666,6 @@ impl Gui {
             inference,
             #[cfg(target_os = "macos")]
             chat_open,
-            #[cfg(target_os = "macos")]
             settings,
             ..
         } = self;
@@ -641,30 +754,37 @@ impl Gui {
                                     info.label = Some("Chat".into());
                                     info
                                 });
-                                if chat_button.clicked()
-                                    || ui.input(|input| {
-                                        input
-                                            .clone()
-                                            .consume_key(Modifiers::COMMAND | Modifiers::SHIFT, Key::A)
+                                if chat_button.clicked() ||
+                                    ui.input(|input| {
+                                        input.clone().consume_key(
+                                            Modifiers::COMMAND | Modifiers::SHIFT,
+                                            Key::A,
+                                        )
                                     })
                                 {
                                     *chat_open = !*chat_open;
                                 }
                             }
 
-                            // Reload remains useful when a page keeps reporting that it is loading.
-                            // Some sites render their document before every subresource finishes;
-                            // presenting the unsupported Stop action in that state made it
-                            // impossible to retry navigation from the toolbar.
-                            let reload_button = ui.add(Gui::toolbar_button("↻"));
+                            // Stop is only offered while the load is still moving:
+                            // `is_loading` treats a stalled load as finished, so a page
+                            // that reports loading forever still leaves Reload reachable
+                            // from the toolbar.
+                            let loading = is_loading;
+                            let (reload_glyph, reload_label, reload_command) = if loading {
+                                ("✕", "Stop", UserInterfaceCommand::Stop)
+                            } else {
+                                ("↻", "Reload", UserInterfaceCommand::Reload)
+                            };
+                            let reload_button = ui.add(Gui::toolbar_button(reload_glyph));
                             reload_button.widget_info(|| {
                                 let mut info = WidgetInfo::new(WidgetType::Button);
-                                info.label = Some("Reload".into());
+                                info.label = Some(reload_label.into());
                                 info
                             });
                             if reload_button.clicked() {
                                 *location_dirty = false;
-                                window.queue_user_interface_command(UserInterfaceCommand::Reload);
+                                window.queue_user_interface_command(reload_command);
                             }
                             ui.add_space(2.0);
 
@@ -687,6 +807,7 @@ impl Gui {
                                 } else {
                                     "Add bookmark".into()
                                 });
+
                                 info
                             });
                             if bookmark_button.clicked() {
@@ -815,6 +936,7 @@ impl Gui {
                                         info.label = Some("New tab".into());
                                         info
                                     });
+
                                     if new_tab_button.clicked() {
                                         window.queue_user_interface_command(
                                             UserInterfaceCommand::NewWebView,
@@ -837,7 +959,19 @@ impl Gui {
                         })
                 });
 
-                *toolbar_height = Length::new(outer.response.rect.max.y);
+                // A thin colorful progress strip shown below the tab bar while the active
+                // WebView is still loading. It sits in its own top panel so that it spans the
+                // full window width and pushes the WebView down without overlapping the tabs.
+                let mut toolbar_bottom = outer.response.rect.max.y;
+                if is_loading {
+                    let progress_bar_color = settings.progress_bar_color();
+                    let progress = Panel::top("loading_progress").show_inside(ctx, |ui| {
+                        Self::show_loading_progress_bar(ui, progress_bar_color);
+                    });
+                    toolbar_bottom = progress.response.rect.max.y;
+                }
+
+                *toolbar_height = Length::new(toolbar_bottom);
             } else {
                 *toolbar_height = Length::default();
             }
@@ -863,6 +997,7 @@ impl Gui {
             // click while winit owns the run loop. Only the focused window
             // claims it, so Settings opens once instead of once per window.
             #[cfg(target_os = "macos")]
+            #[cfg(target_os = "macos")]
             {
                 if headed_window.winit_window().has_focus() &&
                     crate::platform::macos::menu::take_settings_request()
@@ -871,6 +1006,8 @@ impl Gui {
                 }
                 settings.show(ctx, inference);
             }
+            #[cfg(not(target_os = "macos"))]
+            settings.show(ctx);
 
             let scale =
                 Scale::<_, DeviceIndependentPixel, DevicePixel>::new(ctx.pixels_per_point());
@@ -882,11 +1019,24 @@ impl Gui {
             let available_rect = ctx.available_rect_before_wrap();
 
             // Build a graft node for each WebView.
+            let affine = {
+                // The grafted WebView tree reports bounds in device pixels relative to the
+                // WebView's own origin, so this node supplies the offset of the WebView within
+                // the window, and scales it to the same scale as the rest of the nodes in egui's
+                // AccessKit tree.
+                let scale = (1.0 / window.platform_window().hidpi_scale_factor().get()) as f64;
+                let x = available_rect.min.x as f64;
+                let y = available_rect.min.y as f64;
+                Affine::new([scale, 0.0, 0.0, scale, x, y])
+            };
             for (webview_id, webview) in window.webviews() {
                 if let Some(tree_id) = webview.accesskit_tree_id() {
                     let id = egui::Id::new(webview_id);
                     ctx.accesskit_node_builder(id, |node| {
                         node.set_tree_id(tree_id);
+                        // Only the transform is set: AccessKit consumers exclude graft nodes from
+                        // the presented tree, so bounds on this node would never be read.
+                        node.set_transform(affine);
                     });
                 }
             }
@@ -976,6 +1126,19 @@ impl Gui {
         }
     }
 
+    /// Whether the chrome should still be presenting the active `WebView` as loading.
+    ///
+    /// This is not simply `load_status != Complete`. `Complete` means `document.readyState` is
+    /// `"complete"`, so a single subresource that never resolves -- a hanging XHR, a script the
+    /// engine cannot finish -- leaves a fully rendered, perfectly usable page marked as loading
+    /// forever, and the bar under the tab strip animates until the tab is closed. A load that
+    /// has not moved in [`LOAD_STALL_TIMEOUT`] is treated as finished, because from the user's
+    /// side it is: whatever is outstanding is no longer producing anything to wait for.
+    fn is_loading(&self) -> bool {
+        self.load_status != LoadStatus::Complete &&
+            self.load_status_changed_at.elapsed() < LOAD_STALL_TIMEOUT
+    }
+
     fn update_load_status(&mut self, window: &ServoShellWindow) -> bool {
         let state_status = window
             .active_webview()
@@ -983,6 +1146,9 @@ impl Gui {
             .unwrap_or(LoadStatus::Complete);
         let old_status = std::mem::replace(&mut self.load_status, state_status);
         let status_changed = old_status != self.load_status;
+        if status_changed {
+            self.load_status_changed_at = Instant::now();
+        }
 
         // When the load status changes, we want the new changes to the URL to start
         // being reflected in the location bar.

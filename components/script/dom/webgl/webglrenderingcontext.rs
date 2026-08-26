@@ -226,8 +226,15 @@ impl WebGLRenderingContext {
             None => return Err("WebGL initialization failed early on".into()),
         };
 
-        let (sender, receiver) = webgl_channel().unwrap();
-        webgl_chan
+        // Every step below can fail if the WebGL thread is gone -- it shuts down with the
+        // WebView, and a document can still be running script for a moment after that. None of
+        // those are panics: the specified behaviour for a context that cannot be created is to
+        // fire `webglcontextcreationerror` and hand `getContext` a null, which is what returning
+        // `Err` here does.
+        let Some((sender, receiver)) = webgl_channel() else {
+            return Err("Failed to create a channel to the WebGL thread".into());
+        };
+        if webgl_chan
             .send(WebGLMsg::CreateContext(
                 window.webview_id().into(),
                 webgl_version,
@@ -235,8 +242,13 @@ impl WebGLRenderingContext {
                 attrs,
                 sender,
             ))
-            .unwrap();
-        let result = receiver.recv().unwrap();
+            .is_err()
+        {
+            return Err("The WebGL thread is no longer running".into());
+        }
+        let Ok(result) = receiver.recv() else {
+            return Err("The WebGL thread hung up before creating a context".into());
+        };
 
         result.map(|ctx_data| {
             let max_combined_texture_image_units = ctx_data.limits.max_combined_texture_image_units;

@@ -35,7 +35,7 @@ use crate::dom::serviceworkerglobalscope::ServiceWorkerScriptMsg;
 use crate::dom::sharedworkerglobalscope::SharedWorkerScriptMsg;
 use crate::dom::worker::TrustedWorkerAddress;
 use crate::dom::{WorkletControl, WorkletExecutor};
-use crate::script_runtime::ScriptThreadEventCategory;
+use crate::runtime::script_runtime::ScriptThreadEventCategory;
 use crate::tasks::task::TaskBox;
 use crate::tasks::task_queue::{QueuedTask, QueuedTaskConversion, TaskQueue};
 use crate::tasks::task_source::TaskSourceName;
@@ -70,6 +70,7 @@ impl MixedMessage {
                 ScriptThreadMessage::RefreshCursor(id, ..) => Some(*id),
                 ScriptThreadMessage::GetTitle(id) => Some(*id),
                 ScriptThreadMessage::GetDocumentOrigin(id, _) => Some(*id),
+                ScriptThreadMessage::GetInternalAncestorOriginObjectsList(id, _) => Some(*id),
                 ScriptThreadMessage::SetDocumentActivity(id, ..) => Some(*id),
                 ScriptThreadMessage::SetThrottled(_, id, ..) => Some(*id),
                 ScriptThreadMessage::SetThrottledInContainingIframe(_, id, ..) => Some(*id),
@@ -93,6 +94,7 @@ impl MixedMessage {
                 ScriptThreadMessage::DispatchStorageEvent(id, ..) => Some(*id),
                 ScriptThreadMessage::ReportCSSError(id, ..) => Some(*id),
                 ScriptThreadMessage::Reload(id, ..) => Some(*id),
+                ScriptThreadMessage::StopLoading(id, ..) => Some(*id),
                 ScriptThreadMessage::PaintMetric(id, ..) => Some(*id),
                 ScriptThreadMessage::ExitFullScreen(id, ..) => Some(*id),
                 ScriptThreadMessage::MediaSessionAction(..) => None,

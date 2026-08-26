@@ -137,6 +137,7 @@ egui_glow = { workspace = true, features = ["winit"] }
 gilrs = { workspace = true }
 glow = { workspace = true }
 headers = { workspace = true }
+serde = { workspace = true }
 serde_json = { workspace = true }
 # For optional feature servo-allocator/use-jemalloc and servo-allocator/allocation-tracking
 servo-allocator = { workspace = true }

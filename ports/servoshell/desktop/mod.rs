@@ -18,6 +18,7 @@ pub(crate) mod inference;
 #[cfg(target_os = "macos")]
 pub(crate) mod settings;
 pub(crate) mod headed_window;
+pub(crate) mod settings;
 mod headless_window;
 mod keyutils;
 mod protocols;

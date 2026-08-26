@@ -61,7 +61,7 @@ cbc = { version = "0.2", features = ["alloc", "zeroize"] }
 cc = "1.2"
 cfg-if = "1.0.4"
 chacha20poly1305 = { version = "0.11", features = ["rand_core", "zeroize"] }
-chardetng = "0.1"
+chardetng = "1.0"
 chrono = { version = "0.4", features = ["serde"] }
 content-security-policy = { version = "0.8.1", features = ["serde"] }
 cookie = { package = "cookie", version = "0.18" }
@@ -141,7 +141,7 @@ inventory = "0.3.24"
 ipc-channel = "0.22"
 itertools = "0.15"
 jni = "0.22"
-js = { package = "mozjs", version = "=0.23", default-features = false, features = ["intl", "libz-sys"] }
+js = { package = "mozjs", version = "=0.23.1", default-features = false, features = ["intl", "libz-sys"] }
 k12 = "0.5"
 keccak = "0.2"
 keyboard-types = { version = "0.8.3", features = ["serde", "webdriver"] }
@@ -174,7 +174,7 @@ objc2-core-foundation = "0.3.2"
 objc2-core-graphics = "0.3.2"
 objc2-core-text = "0.3.2"
 objc2-foundation = { version = "0.3.1", default-features = false }
-ocb3 = { version = "=0.2.0-rc.3", features = ["zeroize"] }
+ocb3 = "0.2"
 ohos-abilitykit-sys = "0.1.6"
 ohos-deviceinfo = "0.1.0"
 ohos-deviceinfo-sys = "0.1.7"
@@ -221,13 +221,13 @@ rustls-pki-types = "1.14"
 rustls-platform-verifier = "0.7.0"
 sea-query = { version = "1.0.1", default-features = false, features = ["backend-sqlite", "derive"] }
 sea-query-rusqlite = "0.8.0"
-selectors = { git = "https://github.com/servo/stylo", rev = "800d90bf8018da8d596e3cb50d0df5491bf1df78" }
+selectors = { git = "https://github.com/servo/stylo", rev = "3c9c571d44d7b3d82e0b8981ddf5cc73661a68cb" }
 serde = "1.0.228"
 serde_bytes = "0.11"
 serde_core = "1.0.226"
 serde_json = "1.0"
 serde_test = "1.0"
-servo_arc = { git = "https://github.com/servo/stylo", rev = "800d90bf8018da8d596e3cb50d0df5491bf1df78" }
+servo_arc = { git = "https://github.com/servo/stylo", rev = "3c9c571d44d7b3d82e0b8981ddf5cc73661a68cb" }
 sha1 = "0.11"
 sha2 = "0.11"
 sha3 = "0.12"
@@ -238,18 +238,18 @@ speexdsp-resampler = "0.1.0"
 sponge-cursor = "0.1"
 string_cache = "0.9"
 strum = { version = "0.28", features = ["derive"] }
-stylo = { git = "https://github.com/servo/stylo", rev = "800d90bf8018da8d596e3cb50d0df5491bf1df78" }
-stylo_atoms = { git = "https://github.com/servo/stylo", rev = "800d90bf8018da8d596e3cb50d0df5491bf1df78" }
-stylo_dom = { git = "https://github.com/servo/stylo", rev = "800d90bf8018da8d596e3cb50d0df5491bf1df78" }
-stylo_malloc_size_of = { git = "https://github.com/servo/stylo", rev = "800d90bf8018da8d596e3cb50d0df5491bf1df78" }
-stylo_static_prefs = { git = "https://github.com/servo/stylo", rev = "800d90bf8018da8d596e3cb50d0df5491bf1df78" }
-stylo_traits = { git = "https://github.com/servo/stylo", rev = "800d90bf8018da8d596e3cb50d0df5491bf1df78" }
+stylo = { git = "https://github.com/servo/stylo", rev = "3c9c571d44d7b3d82e0b8981ddf5cc73661a68cb" }
+stylo_atoms = { git = "https://github.com/servo/stylo", rev = "3c9c571d44d7b3d82e0b8981ddf5cc73661a68cb" }
+stylo_dom = { git = "https://github.com/servo/stylo", rev = "3c9c571d44d7b3d82e0b8981ddf5cc73661a68cb" }
+stylo_malloc_size_of = { git = "https://github.com/servo/stylo", rev = "3c9c571d44d7b3d82e0b8981ddf5cc73661a68cb" }
+stylo_static_prefs = { git = "https://github.com/servo/stylo", rev = "3c9c571d44d7b3d82e0b8981ddf5cc73661a68cb" }
+stylo_traits = { git = "https://github.com/servo/stylo", rev = "3c9c571d44d7b3d82e0b8981ddf5cc73661a68cb" }
 surfman = { version = "0.13.0", features = ["chains"] }
 swapper = "0.1"
 syn = { version = "2", default-features = false, features = ["clone-impls", "derive", "parsing"] }
 synstructure = "0.13"
 sys-locale = "0.3"
-taffy = { version = "0.13.0", default-features = false, features = ["calc", "detailed_layout_info", "grid", "std"] }
+taffy = { version = "0.14.0", default-features = false, features = ["calc", "detailed_layout_info", "grid", "std"] }
 tempfile = "3"
 tendril = { version = "0.5", features = ["encoding_rs"] }
 tikv-jemalloc-sys = "0.6.1"
@@ -436,7 +436,7 @@ lto = "thin"
 codegen-units = 1
 
 [patch.crates-io]
-# smb Browser: winit and ipc-channel each declare an Apple SPI symbol that App
+# smbCloud Browser: winit and ipc-channel each declare an Apple SPI symbol that App
 # Review rejects under ITMS-90338 -- CGSSetWindowBackgroundBlurRadius (plus
 # CGSMainConnectionID) for window blur, and bootstrap_register2 for the Mach
 # one-shot server. Declaring them is enough to fail review: an `extern` block
@@ -446,14 +446,8 @@ codegen-units = 1
 # scripts/patch-crates.sh unpacks these crates into .build/crates/ and
 # applies patches/crates/*.patch. Paths are relative to this workspace root, so
 # they must stay in lockstep with that script's output directory.
-#
-# taffy is patched for a different reason: its grid track-sizing distribution
-# loop can spin forever once the narrowest remaining track gap gets too small
-# to subtract from the running total at f32 precision. That wedges a layout
-# worker at 100% CPU and blocks every reflow behind the layout mutex.
 winit = { path = "../crates/winit-0.30.13" }
 ipc-channel = { path = "../crates/ipc-channel-0.22.0" }
-taffy = { path = "../crates/taffy-0.13.0" }
 
 # If you need to temporarily test Servo with a local fork of some upstream
 # crate, add that here. Use the form:

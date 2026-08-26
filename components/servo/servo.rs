@@ -24,6 +24,7 @@ use fonts::SystemFontService;
 ))]
 use gaol::sandbox::{ChildSandbox, ChildSandboxMethods};
 use ipc_channel::ipc::{self, IpcSender};
+use keyboard_types::Modifiers;
 use layout::LayoutFactoryImpl;
 use layout_api::ScriptThreadFactory;
 use log::{Log, Metadata, Record, debug, warn};
@@ -327,6 +328,7 @@ impl ServoInner {
         }
 
         self.paint.borrow_mut().perform_updates();
+        self.resend_accessibility_root_nodes_for_viewport_changes();
         self.send_new_frame_ready_messages();
         self.handle_delegate_errors();
         self.clean_up_destroyed_webview_handles();
@@ -336,6 +338,27 @@ impl ServoInner {
         }
 
         true
+    }
+
+    /// Resend the root accessibility node for any [`WebView`] whose viewport geometry changed
+    /// post-last-spin (see [`WebView::note_accessibility_viewport_changed()`]). This runs
+    /// after `perform_updates` so the paint `RefCell` is no longer borrowed, and our
+    /// embedder-facing methods calling into the [`WebViewDelegate`] avoid re-entrant
+    /// borrows within the embedder!
+    fn resend_accessibility_root_nodes_for_viewport_changes(&self) {
+        // Collect handles first so the `webviews` borrow is released before we call into the
+        // WebViewDelegate, which the embedder may re-enter.
+        let webviews: Vec<WebView> = self
+            .webviews
+            .borrow()
+            .values()
+            .filter_map(WebView::from_weak_handle)
+            .collect();
+        for webview in webviews {
+            if webview.take_accessibility_viewport_changed() {
+                webview.send_accessibility_root_node();
+            }
+        }
     }
 
     fn send_new_frame_ready_messages(&self) {
@@ -1070,6 +1093,23 @@ impl Servo {
         self.0
             .constellation_proxy
             .send(EmbedderToConstellationMessage::CreateMemoryReport(snd));
+    }
+
+    /// Tell Servo which keyboard modifiers the user is currently holding down.
+    ///
+    /// Servo otherwise infers this from the keyboard events it is given, which is only as
+    /// complete as the embedder's forwarding. Anything the embedder handles itself -- a menu
+    /// accelerator, a shortcut in the browser chrome, a key pressed while another window is
+    /// focused -- leaves a gap, and a `Meta` whose release fell into one makes every later click
+    /// on a link behave as a `Cmd`-click. Embedders that can observe the platform's real modifier
+    /// state should call this whenever it changes, and pass [`Modifiers::empty`] when the window
+    /// loses focus.
+    pub fn notify_keyboard_modifiers_changed(&self, modifiers: Modifiers) {
+        self.0
+            .constellation_proxy
+            .send(EmbedderToConstellationMessage::SetKeyboardModifiers(
+                modifiers,
+            ));
     }
 
     pub fn execute_webdriver_command(&self, command: WebDriverCommandMsg) {

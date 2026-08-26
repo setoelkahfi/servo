@@ -1237,7 +1237,6 @@ impl Painter {
         };
 
         self.send_root_pipeline_display_list();
-        self.lcp_calculator.enable_for_webview(&webview_id);
     }
 
     pub(crate) fn is_empty(&mut self) -> bool {
@@ -1271,6 +1270,7 @@ impl Painter {
         if !webview_renderer.set_hidpi_scale_factor(new_scale_factor) {
             return;
         }
+        webview_renderer.webview.notify_viewport_updated();
 
         self.send_root_pipeline_display_list();
         self.set_needs_repaint(RepaintReason::Resize);
@@ -1301,6 +1301,7 @@ impl Painter {
         let new_viewport_rect = Rect::from(new_size).to_box2d();
         for webview_renderer in self.webview_renderers.values_mut() {
             webview_renderer.set_rect(new_viewport_rect);
+            webview_renderer.webview.notify_viewport_updated();
         }
 
         let mut transaction = Transaction::new();
@@ -1312,8 +1313,10 @@ impl Painter {
     }
 
     pub(crate) fn set_page_zoom(&mut self, webview_id: WebViewId, new_zoom: f32) {
-        if let Some(webview_renderer) = self.webview_renderers.get_mut(&webview_id) {
-            webview_renderer.set_page_zoom(Scale::new(new_zoom));
+        if let Some(webview_renderer) = self.webview_renderers.get_mut(&webview_id) &&
+            webview_renderer.set_page_zoom(Scale::new(new_zoom))
+        {
+            webview_renderer.webview.notify_viewport_updated();
         }
     }
 
@@ -1345,10 +1348,7 @@ impl Painter {
                     InputEvent::MouseLeftViewport(_) => {
                         self.last_mouse_move_position = None;
                     },
-                    _ => {
-                        // Disable LCP calculation on any other input event except mouse moves.
-                        self.lcp_calculator.disable_for_webview(webview_id);
-                    },
+                    _ => {},
                 }
 
                 webview_renderer.notify_input_event(&self.webrender_api, &self.needs_repaint, event)
@@ -1364,16 +1364,6 @@ impl Painter {
         if let Some(webview_renderer) = self.webview_renderers.get_mut(&webview_id) {
             webview_renderer.notify_scroll_event(scroll, point);
         }
-        // Disable LCP calculation on any scroll event.
-        self.lcp_calculator.disable_for_webview(webview_id);
-    }
-
-    pub(crate) fn enable_lcp_calculation(&mut self, webview_id: &WebViewId) {
-        self.lcp_calculator.enable_for_webview(webview_id);
-    }
-
-    pub(crate) fn lcp_calculation_enabled_for_webview(&self, webview_id: &WebViewId) -> bool {
-        self.lcp_calculator.enabled_for_webview(webview_id)
     }
 
     pub(crate) fn adjust_pinch_zoom(
@@ -1508,19 +1498,14 @@ impl Painter {
         pipeline_id: PipelineId,
         epoch: Epoch,
     ) {
-        if self.lcp_calculation_enabled_for_webview(&webview_id) {
-            self.lcp_calculator.append_lcp_candidate(
-                lcp_candidate,
-                pipeline_id.into(),
-                &webview_id,
-            );
-            if let Some(webview_renderer) = self.webview_renderers.get_mut(&webview_id) {
-                webview_renderer
-                    .ensure_pipeline_details(pipeline_id)
-                    .largest_contentful_paint_metric
-                    .set(PaintMetricState::Seen(epoch.into(), false));
-            }
-        };
+        self.lcp_calculator
+            .append_lcp_candidate(lcp_candidate, pipeline_id.into());
+        if let Some(webview_renderer) = self.webview_renderers.get_mut(&webview_id) {
+            webview_renderer
+                .ensure_pipeline_details(pipeline_id)
+                .largest_contentful_paint_metric
+                .set(PaintMetricState::Seen(epoch.into(), false));
+        }
     }
 }
 

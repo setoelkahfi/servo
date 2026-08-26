@@ -432,10 +432,13 @@ pub(crate) fn follow_hyperlink(
     //         choosing a navigable given targetAttributeValue, subject's node navigable, and
     //         noopener.
     let window = document.window();
-    let source = document.browsing_context().unwrap();
+
+    let Some(source) = document.browsing_context() else {
+        return;
+    };
     let (maybe_chosen, history_handling) = match target_attribute_value {
         Some(name) => {
-            let (maybe_chosen, new) = source.choose_browsing_context(cx, name, noopener);
+            let (maybe_chosen, new) = source.choose_a_navigable(cx, name, noopener);
             let history_handling = if new {
                 NavigationHistoryBehavior::Replace
             } else {
@@ -443,7 +446,7 @@ pub(crate) fn follow_hyperlink(
             };
             (maybe_chosen, history_handling)
         },
-        None => (Some(window.window_proxy()), NavigationHistoryBehavior::Push),
+        None => (Some(source), NavigationHistoryBehavior::Push),
     };
 
     // Step 8: If targetNavigable is null, then return.

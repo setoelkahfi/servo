@@ -5287,16 +5287,13 @@ impl Element {
         self.upcast::<Node>().is_connected()
     }
 
-    // https://html.spec.whatwg.org/multipage/#cannot-navigate
+    /// <https://html.spec.whatwg.org/multipage/#cannot-navigate>
     pub(crate) fn cannot_navigate(&self) -> bool {
+        // > An element element cannot navigate if any of the following are true:
+        // >  - element's node document is not fully active; or
+        // >  - element is not an a element and is not connected.
         let document = self.owner_document();
-
-        // Step 1.
-        !document.is_fully_active() ||
-            (
-                // Step 2.
-                !self.is::<HTMLAnchorElement>() && !self.is_connected()
-            )
+        !document.is_fully_active() || (!self.is::<HTMLAnchorElement>() && !self.is_connected())
     }
 }
 
@@ -5441,7 +5438,7 @@ pub(crate) fn reflect_cross_origin_attribute(element: &Element) -> Option<DOMStr
     element
         .get_attribute_string_value(&local_name!("crossorigin"))
         .map(|value| {
-            DOMString::from(
+            DOMString::from_static(
                 ["anonymous", "use-credentials"]
                     .into_iter()
                     .find(|keyword| value.eq_ignore_ascii_case(keyword))

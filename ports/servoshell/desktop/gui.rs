@@ -477,7 +477,7 @@ impl Gui {
                     ready && !busy,
                     egui::TextEdit::singleline(&mut inference.draft)
                         .desired_width(ui.available_width())
-                        .hint_text("Ask something"),
+                        .hint_text(if ready { "Ask something" } else { "Load a model to start" }),
                 );
                 let submitted = field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
                 if send.clicked() || submitted {

@@ -20,7 +20,7 @@ use servo::protocol_handler::{
     Response, ResponseBody,
 };
 
-use crate::protocols::resource::ResourceProtocolHandler;
+use crate::desktop::protocols::resource::ResourceProtocolHandler;
 use crate::prefs::EXPERIMENTAL_PREFS;
 
 #[derive(Default)]

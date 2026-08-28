@@ -15,10 +15,6 @@ mod crash_handler;
 pub(crate) mod desktop;
 #[cfg(any(target_os = "android", target_env = "ohos"))]
 mod egl;
-// Shared rather than desktop-only: the `smb:` scheme is the default homepage on
-// every platform, so the EGL ports need the same handlers registered or every
-// launch lands on "Unsupported scheme".
-mod protocols;
 #[cfg(not(any(target_os = "android", target_env = "ohos")))]
 mod panic_hook;
 mod parser;

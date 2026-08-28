@@ -9,7 +9,7 @@ use std::fs::{self, read_to_string};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::str::FromStr;
-#[cfg(any(target_os = "android", target_env = "ohos"))]
+#[cfg(any(target_os = "android", target_os = "ios", target_env = "ohos"))]
 use std::sync::OnceLock;
 use std::{env, fmt};
 
@@ -195,9 +195,9 @@ pub fn default_config_dir() -> Option<PathBuf> {
 }
 
 /// Overrides the default preference dir
-#[cfg(any(target_os = "android", target_env = "ohos"))]
+#[cfg(any(target_os = "android", target_os = "ios", target_env = "ohos"))]
 pub(crate) static DEFAULT_CONFIG_DIR: OnceLock<PathBuf> = OnceLock::new();
-#[cfg(any(target_os = "android", target_env = "ohos"))]
+#[cfg(any(target_os = "android", target_os = "ios", target_env = "ohos"))]
 pub fn default_config_dir() -> Option<PathBuf> {
     DEFAULT_CONFIG_DIR.get().cloned()
 }
@@ -962,10 +962,7 @@ fn test_servoshell_cmd() {
     assert!(daily_preferences.dom_intersection_observer_enabled);
     assert!(daily_preferences.layout_container_queries_enabled);
 
-    assert_eq!(
-        test_parse("").2.url.as_deref(),
-        Some("smb:newtab"),
-    );
+    assert_eq!(test_parse("").2.url.as_deref(), Some("smb:newtab"),);
 
     assert_eq!(
         test_parse("--screen-size=1000x1000")

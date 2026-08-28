@@ -150,7 +150,7 @@ pub fn content_process_sandbox_profile() {
     target_os = "android",
     target_env = "ohos",
     target_arch = "arm",
-    target_arch = "aarch64",
+    all(target_arch = "aarch64", not(target_os = "ios")),
     target_arch = "riscv32",
     target_arch = "riscv64"
 ))]
@@ -248,7 +248,7 @@ pub fn spawn_multiprocess(content: UnprivilegedContent) -> Result<Process, IpcEr
 }
 
 #[cfg(target_os = "ios")]
-pub fn spawn_multiprocess(_content: UnprivilegedContent) -> Result<Process, Error> {
+pub fn spawn_multiprocess(_content: UnprivilegedContent) -> Result<Process, IpcError> {
     log::error!("Multiprocess is not supported on iOS.");
     process::exit(1);
 }

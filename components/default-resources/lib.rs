@@ -37,3 +37,12 @@ impl ResourceReaderMethods for DefaultResourceReader {
 }
 
 embedder_traits::submit_resource_reader!(&DefaultResourceReader);
+
+/// Keeps this crate's inventory constructor in native static-library embeds.
+///
+/// A constructor-only archive member is not selected by Apple's linker during
+/// the final application link. Embedders that expose Servo through a Rust
+/// `staticlib` can call this symbol to retain the member without force-loading
+/// the entire archive (which can introduce duplicate bundled C symbols).
+#[unsafe(no_mangle)]
+pub extern "C" fn servo_force_link_default_resources() {}

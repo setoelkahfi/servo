@@ -32,16 +32,17 @@ fn main() {
         let _result = Console::AttachConsole(Console::ATTACH_PARENT_PROCESS);
     }
     cfg_if::cfg_if! {
-        if #[cfg(not(any(target_os = "android", target_env = "ohos")))] {
+        if #[cfg(not(any(target_os = "android", target_os = "ios", target_env = "ohos")))] {
             servoshell::main()
         } else {
             // Android: see ports/servoshell/egl/android/mod.rs.
             // OpenHarmony: see ports/servoshell/egl/ohos/mod.rs.
             println!(
                 "Cannot run the servoshell `bin` executable on platforms such as \
-                 Android or OpenHarmony. On these platforms you need to compile \
+                 Android, iOS or OpenHarmony. On these platforms you need to compile \
                  the servoshell library as a `cdylib` and integrate it with the \
-                 platform app code into an `apk` (android) or `hap` (OpenHarmony).\
+                 platform app code into an `apk` (Android), an app bundle (iOS) or \
+                 `hap` (OpenHarmony).\
                  For Android `mach build` will do these steps automatically for you."
             );
         }

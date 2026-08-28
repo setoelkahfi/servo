@@ -11,15 +11,15 @@ mod test;
 mod backtrace;
 #[cfg(not(target_env = "ohos"))]
 mod crash_handler;
-#[cfg(not(any(target_os = "android", target_env = "ohos")))]
+#[cfg(not(any(target_os = "android", target_os = "ios", target_env = "ohos")))]
 pub(crate) mod desktop;
-#[cfg(any(target_os = "android", target_env = "ohos"))]
+#[cfg(any(target_os = "android", target_os = "ios", target_env = "ohos"))]
 mod egl;
-#[cfg(not(any(target_os = "android", target_env = "ohos")))]
+#[cfg(not(any(target_os = "android", target_os = "ios", target_env = "ohos")))]
 mod panic_hook;
 mod parser;
 mod prefs;
-#[cfg(not(any(target_os = "android", target_env = "ohos")))]
+#[cfg(not(any(target_os = "android", target_os = "ios", target_env = "ohos")))]
 mod resources;
 mod running_app_state;
 mod webdriver;
@@ -36,7 +36,7 @@ pub mod platform {
     pub fn deinit(_clean_shutdown: bool) {}
 }
 
-#[cfg(not(any(target_os = "android", target_env = "ohos")))]
+#[cfg(not(any(target_os = "android", target_os = "ios", target_env = "ohos")))]
 pub fn main() {
     desktop::cli::main()
 }

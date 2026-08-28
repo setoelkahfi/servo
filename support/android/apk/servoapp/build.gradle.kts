@@ -12,11 +12,23 @@ android {
     namespace = "org.servo.servoshell"
 
     defaultConfig {
-        applicationId = "org.servo.servoshell"
+        // The Play Store listing identity. This deliberately matches the Apple
+        // bundle ID character for character, including the capital B: the two
+        // storefronts are the same product, and an app ID can never be changed
+        // once a build has been uploaded under it.
+        applicationId = "xyz.smbcloud.Browser"
         minSdk = libs.versions.android.sdk.min.get().toInt()
-        targetSdk = 34
-        versionCode = generatedVersionCode
-        versionName = "0.5.0"
+        // Google Play refuses new uploads below API 36 from 31 August 2026.
+        // Servo's own 34 was already a year past its deadline for the Play
+        // Store; upstream ships APKs from CI and never sees that gate.
+        targetSdk = 36
+
+        // smbCloud Browser drives its own release numbering from
+        // scripts/build-android.sh, which is where the storefront version
+        // lives. Servo's date-derived versionCode stays as the fallback so a
+        // plain `./mach package --android` still produces something installable.
+        versionCode = System.getenv("SMB_VERSION_CODE")?.toInt() ?: generatedVersionCode
+        versionName = System.getenv("SMB_VERSION_NAME") ?: "1.0.0"
     }
 
     compileOptions {

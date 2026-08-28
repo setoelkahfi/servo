@@ -9,7 +9,7 @@ use std::fs::{self, read_to_string};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::str::FromStr;
-#[cfg(any(target_os = "android", target_env = "ohos"))]
+#[cfg(any(target_os = "android", target_os = "ios", target_env = "ohos"))]
 use std::sync::OnceLock;
 use std::{env, fmt};
 
@@ -144,6 +144,21 @@ impl Default for ServoShellPreferences {
             clean_shutdown: false,
             device_pixel_ratio_override: None,
             headless: false,
+            // Android has no resource reader. `smb:newtab` is served by
+            // ResourceProtocolHandler, which reads resource_protocol/ from a
+            // directory beside the executable -- a layout that exists on
+            // desktop and OpenHarmony and not inside an APK, where there is no
+            // executable to sit beside. Servo's Android port never calls
+            // resources::set at all, so nothing under smb: or resource: can be
+            // served there yet.
+            //
+            // Until an Android ResourceReaderMethods exists, the homepage is
+            // the default search engine rather than an "Unsupported scheme"
+            // error on every cold start. Revert this the moment the new tab
+            // page can actually be served.
+            #[cfg(target_os = "android")]
+            homepage: "https://duckduckgo.com/".into(),
+            #[cfg(not(target_os = "android"))]
             homepage: "smb:newtab".into(),
             initial_window_size: Size2D::new(1024, 740),
             no_native_titlebar: true,
@@ -180,9 +195,9 @@ pub fn default_config_dir() -> Option<PathBuf> {
 }
 
 /// Overrides the default preference dir
-#[cfg(any(target_os = "android", target_env = "ohos"))]
+#[cfg(any(target_os = "android", target_os = "ios", target_env = "ohos"))]
 pub(crate) static DEFAULT_CONFIG_DIR: OnceLock<PathBuf> = OnceLock::new();
-#[cfg(any(target_os = "android", target_env = "ohos"))]
+#[cfg(any(target_os = "android", target_os = "ios", target_env = "ohos"))]
 pub fn default_config_dir() -> Option<PathBuf> {
     DEFAULT_CONFIG_DIR.get().cloned()
 }
@@ -947,10 +962,7 @@ fn test_servoshell_cmd() {
     assert!(daily_preferences.dom_intersection_observer_enabled);
     assert!(daily_preferences.layout_container_queries_enabled);
 
-    assert_eq!(
-        test_parse("").2.url.as_deref(),
-        Some("smb:newtab"),
-    );
+    assert_eq!(test_parse("").2.url.as_deref(), Some("smb:newtab"),);
 
     assert_eq!(
         test_parse("--screen-size=1000x1000")

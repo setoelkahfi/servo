@@ -2,8 +2,8 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
-use std::cell::RefCell;
-use std::ffi::{CStr, c_char, c_void};
+use std::cell::{Cell, RefCell};
+use std::ffi::{CStr, CString, c_char, c_void};
 use std::ptr::NonNull;
 use std::rc::Rc;
 
@@ -21,6 +21,9 @@ use crate::prefs::ServoShellPreferences;
 use crate::{init_crypto, init_tracing};
 
 type WakeCallback = extern "C" fn(*mut c_void);
+/// Context first, then the address, matching ServoBridge.h. The string is
+/// borrowed for the duration of the call.
+type UrlCallback = extern "C" fn(*mut c_void, *const c_char);
 
 #[cfg(feature = "bundled")]
 unsafe extern "C" {
@@ -29,6 +32,13 @@ unsafe extern "C" {
 
 thread_local! {
     static APP: RefCell<Option<Rc<App>>> = const { RefCell::new(None) };
+    static URL_LISTENER: Cell<Option<UrlListener>> = const { Cell::new(None) };
+}
+
+#[derive(Clone, Copy)]
+struct UrlListener {
+    callback: UrlCallback,
+    context: usize,
 }
 
 #[derive(Clone, Copy)]
@@ -58,7 +68,18 @@ impl HostTrait for HostCallbacks {
 
     fn notify_load_status_changed(&self, _load_status: LoadStatus) {}
     fn on_title_changed(&self, _title: Option<String>) {}
-    fn on_url_changed(&self, _url: String) {}
+    fn on_url_changed(&self, url: String) {
+        let Some(listener) = URL_LISTENER.with(Cell::get) else {
+            return;
+        };
+        // A URL cannot legitimately contain an interior NUL. Drop the update
+        // rather than truncating the address the host would then display.
+        let Ok(url) = CString::new(url) else {
+            error!("Ignoring URL change containing an interior NUL byte");
+            return;
+        };
+        (listener.callback)(listener.context as *mut c_void, url.as_ptr());
+    }
     fn on_history_changed(&self, _can_go_back: bool, _can_go_forward: bool) {}
     fn on_shutdown_complete(&self) {}
     fn on_ime_show(&self, _input_method_control: InputMethodControl) {}
@@ -190,6 +211,23 @@ pub extern "C" fn servoshell_ios_resize(width: i32, height: i32, _scale: f32) {
         if let Some(app) = slot.borrow().as_ref() {
             app.resize(viewport_rect(width, height));
         }
+    });
+}
+
+/// Registers the callback the engine reports address changes to. Passing a
+/// null callback clears it, which the host does on teardown: it hands over an
+/// unretained pointer to itself, so leaving a stale one registered would let a
+/// later navigation call into a deallocated object.
+#[unsafe(no_mangle)]
+pub extern "C" fn servoshell_ios_set_url_callback(
+    callback: Option<UrlCallback>,
+    context: *mut c_void,
+) {
+    URL_LISTENER.with(|listener| {
+        listener.set(callback.map(|callback| UrlListener {
+            callback,
+            context: context as usize,
+        }))
     });
 }
 

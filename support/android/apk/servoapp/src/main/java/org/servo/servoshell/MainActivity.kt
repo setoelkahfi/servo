@@ -16,7 +16,10 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.statusBars
+import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.text.input.TextFieldState
 import androidx.compose.foundation.text.input.selectAll
@@ -85,6 +88,12 @@ class MainActivity : ComponentActivity(), Servo.Client {
                 topBar = {
                     Row(
                         verticalAlignment = Alignment.CenterVertically,
+                        // Material3's TopAppBar consumes the status bar inset
+                        // for you; a bare Row does not. From API 35 an app
+                        // cannot opt out of edge-to-edge, so without this the
+                        // omnibox draws underneath the clock and the status
+                        // icons.
+                        modifier = Modifier.windowInsetsPadding(WindowInsets.statusBars),
                     ) {
                         if (isWindowWidthAtLeastMedium) {
                             IconButton(onClick = ::onHistoryBackMenuItemClicked, enabled = canGoBackState.value) {

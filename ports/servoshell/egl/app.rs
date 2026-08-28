@@ -20,11 +20,8 @@ use servo::{
 };
 use url::Url;
 
-use servo::protocol_handler::ProtocolRegistry;
-
 use crate::egl::host_trait::HostTrait;
 use crate::prefs::ServoShellPreferences;
-use crate::protocols;
 use crate::running_app_state::{RunningAppState, UserInterfaceCommand};
 use crate::window::{PlatformWindow, ServoShellWindow, ServoShellWindowId};
 
@@ -311,28 +308,9 @@ impl App {
     pub(super) fn new(init: AppInitOptions) -> Rc<Self> {
         // Read before the builder takes ownership of `init.opts` below.
         let config_dir = init.opts.config_dir.clone();
-
-        // The same set the desktop port registers. Without these the default
-        // homepage -- `smb:newtab` on every platform -- resolves to nothing and
-        // the first thing a user sees is "Unsupported scheme".
-        let mut protocol_registry = ProtocolRegistry::default();
-        let _ = protocol_registry.register(
-            "urlinfo",
-            protocols::urlinfo::UrlInfoProtocolHander::default(),
-        );
-        let _ =
-            protocol_registry.register("smb", protocols::servo::ServoProtocolHandler::default());
-        let _ =
-            protocol_registry.register("servo", protocols::servo::ServoProtocolHandler::default());
-        let _ = protocol_registry.register(
-            "resource",
-            protocols::resource::ResourceProtocolHandler::default(),
-        );
-
         let mut servo_builder = ServoBuilder::default()
             .opts(init.opts)
             .preferences(init.preferences.clone())
-            .protocol_registry(protocol_registry)
             .event_loop_waker(init.event_loop_waker.clone());
         let servo = servo_builder.build();
         #[cfg(feature = "webxr")]

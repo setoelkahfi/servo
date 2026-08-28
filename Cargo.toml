@@ -165,6 +165,7 @@ nom-rfc8288 = "0.4.0"
 num-complex = "0.4.6"
 num-derive = "0.4.2"
 num-traits = "0.2"
+onde = "1.2.2"
 num_cpus = "1.17.0"
 num_enum = "0.7"
 objc2 = "0.6.4"
@@ -445,7 +446,7 @@ codegen-units = 1
 # emits an undefined symbol regardless of whether the call is reachable, and
 # Apple scans the import table. Neither feature is used by this browser.
 #
-# scripts/patch-crates.sh unpacks these two crates into .build/crates/ and
+# scripts/patch-crates.sh unpacks these crates into .build/crates/ and
 # applies patches/crates/*.patch. Paths are relative to this workspace root, so
 # they must stay in lockstep with that script's output directory.
 winit = { path = "../crates/winit-0.30.13" }

@@ -1,7 +1,7 @@
 {
   "app": {
-    "bundleName": "org.servo.servo",
-    "vendor": "example",
+    "bundleName": "xyz.smbcloud.browser",
+    "vendor": "Splitfire AB",
     "versionCode": 1000000,
     "versionName": "1.0.0",
     "icon": "$media:servo_64",

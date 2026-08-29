@@ -2,19 +2,19 @@
   "string": [
     {
       "name": "module_desc",
-      "value": "module description"
+      "value": "smbCloud Browser"
     },
     {
       "name": "EntryAbility_desc",
-      "value": "description"
+      "value": "smbCloud Browser, built on the Servo engine"
     },
     {
       "name": "EntryAbility_label",
-      "value": "label"
+      "value": "smbCloud Browser"
     },
     {
       "name": "perm_reason",
-      "value": "This is a demo app, and we need permissions"
+      "value": "Network access to load web pages you navigate to"
     }
   ]
 }

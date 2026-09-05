@@ -44,6 +44,7 @@ use style::applicable_declarations::ApplicableDeclarationBlock;
 use style::attr::{AttrIdentifier, AttrValue, LengthOrPercentageOrAuto};
 use style::context::QuirksMode;
 use style::invalidation::element::restyle_hints::RestyleHint;
+use style::properties::longhands::visibility::computed_value::T as Visibility;
 use style::properties::longhands::{
     self, background_image, border_spacing, color, font_family, font_size,
 };
@@ -78,7 +79,8 @@ use crate::dom::attr::{Attr, is_relevant_attribute};
 use crate::dom::bindings::codegen::Bindings::AttrBinding::AttrMethods;
 use crate::dom::bindings::codegen::Bindings::DocumentBinding::DocumentMethods;
 use crate::dom::bindings::codegen::Bindings::ElementBinding::{
-    ElementMethods, GetHTMLOptions, ScrollIntoViewContainer, ScrollLogicalPosition, ShadowRootInit,
+    CheckVisibilityOptions, ElementMethods, GetHTMLOptions, ScrollIntoViewContainer,
+    ScrollLogicalPosition, ShadowRootInit,
 };
 use crate::dom::bindings::codegen::Bindings::EventHandlerBinding::EventHandlerNonNull;
 use crate::dom::bindings::codegen::Bindings::FunctionBinding::Function;
@@ -1074,6 +1076,13 @@ impl Element {
 
     pub(crate) fn style(&self) -> Option<ServoArc<ComputedValues>> {
         self.owner_window().layout_reflow(QueryMsg::StyleQuery);
+        self.computed_style_without_reflow()
+    }
+
+    /// The element's primary computed style as it currently stands, without asking for a
+    /// reflow first. Callers that walk a subtree or an ancestor chain should reflow once and
+    /// then use this, rather than paying for a reflow query per element.
+    pub(crate) fn computed_style_without_reflow(&self) -> Option<ServoArc<ComputedValues>> {
         self.style_data
             .borrow()
             .as_ref()
@@ -3625,6 +3634,59 @@ impl ElementMethods<crate::DomTypeHolder> for Element {
     fn CurrentCSSZoom(&self) -> Finite<f64> {
         let window = self.owner_window();
         Finite::wrap(window.current_css_zoom_query(self.upcast::<Node>()) as f64)
+    }
+
+    /// <https://drafts.csswg.org/cssom-view/#dom-element-checkvisibility>
+    fn CheckVisibility(&self, options: &CheckVisibilityOptions) -> bool {
+        // Step 1. If this does not have an associated box, return false.
+        //
+        // `style` reflows, so every style read below can go straight to the cached style data
+        // instead of asking for a reflow per element. An unstyled element is one inside a
+        // `display: none` subtree, which has no box either.
+        //
+        // `has_css_layout_box` is not quite the test wanted here: it only rules out
+        // `display: none`, and a `display: contents` element generates no box of its own.
+        let Some(style) = self.style() else {
+            return false;
+        };
+        let display = style.get_box().display;
+        if display.is_none() || display.is_contents() {
+            return false;
+        }
+
+        // Steps 2 and 3 reject elements hidden or skipped by `content-visibility`. This
+        // engine does not implement that property, so nothing is ever hidden by it and both
+        // steps are vacuously false.
+
+        // Step 4. If the checkOpacity or opacityProperty option is true, and this or an
+        // ancestor has an opacity of zero, return false. Opacity does not inherit, so this
+        // has to walk the ancestors rather than read the element's own style.
+        if options.checkOpacity || options.opacityProperty {
+            let transparent = self
+                .upcast::<Node>()
+                .inclusive_ancestors(ShadowIncluding::Yes)
+                .filter_map(DomRoot::downcast::<Element>)
+                .any(|element| {
+                    element
+                        .computed_style_without_reflow()
+                        .is_some_and(|style| style.get_effects().opacity == 0.0)
+                });
+            if transparent {
+                return false;
+            }
+        }
+
+        // Step 5. If the checkVisibilityCSS or visibilityProperty option is true, and this
+        // is invisible, return false. `visibility` inherits, so the element's own computed
+        // value already accounts for its ancestors.
+        if (options.checkVisibilityCSS || options.visibilityProperty) &&
+            style.get_inherited_box().visibility != Visibility::Visible
+        {
+            return false;
+        }
+
+        // Step 6. Return true.
+        true
     }
 
     /// <https://html.spec.whatwg.org/multipage/#dom-element-sethtmlunsafe>

@@ -29,6 +29,7 @@ use crate::fragment_tree::{
 use crate::geom::LogicalSides1D;
 use crate::positioned::{PositioningContext, relative_adjustement};
 use crate::sizing::{ComputeInlineContentSizes, InlineContentSizesResult, SizeConstraint};
+use crate::style_ext::AspectRatio;
 use crate::traversal::ElementDamageSet;
 use crate::{ConstraintSpace, ContainingBlock, ContainingBlockSize};
 
@@ -42,8 +43,9 @@ use crate::{ConstraintSpace, ContainingBlock, ContainingBlockSize};
 pub(crate) struct LayoutBoxBase {
     pub base_fragment_info: BaseFragmentInfo,
     pub style: ServoArc<ComputedValues>,
-    pub cached_inline_content_size:
-        AtomicRefCell<Option<Box<(SizeConstraint, InlineContentSizesResult)>>>,
+    pub cached_inline_content_size: AtomicRefCell<
+        Option<Box<(SizeConstraint, Option<AspectRatio>, InlineContentSizesResult)>>,
+    >,
     pub outer_inline_content_sizes_depend_on_content: AtomicBool,
 
     /// The cached layout results for this [`LayoutBoxBase`]. These are either cached
@@ -102,9 +104,12 @@ impl LayoutBoxBase {
     ) -> InlineContentSizesResult {
         let mut cache = self.cached_inline_content_size.borrow_mut();
         if let Some(cached_inline_content_size) = cache.as_ref() {
-            let (previous_cb_block_size, result) = **cached_inline_content_size;
-            if !result.depends_on_block_constraints ||
-                previous_cb_block_size == constraint_space.block_size
+            let (previous_cb_block_size, previous_ratio, result) = **cached_inline_content_size;
+            // The preferred aspect ratio can transfer the block size into the inline axis,
+            // so results computed with a different ratio can't be reused.
+            if previous_ratio == constraint_space.preferred_aspect_ratio &&
+                (!result.depends_on_block_constraints ||
+                    previous_cb_block_size == constraint_space.block_size)
             {
                 return result;
             }
@@ -113,7 +118,11 @@ impl LayoutBoxBase {
 
         let result =
             layout_box.compute_inline_content_sizes_with_fixup(layout_context, constraint_space);
-        *cache = Some(Box::new((constraint_space.block_size, result)));
+        *cache = Some(Box::new((
+            constraint_space.block_size,
+            constraint_space.preferred_aspect_ratio,
+            result,
+        )));
         result
     }
 

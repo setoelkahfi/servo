@@ -287,6 +287,8 @@ pub enum ScriptThreadMessage {
     ReportCSSError(PipelineId, String, u32, u32, String),
     /// Reload the given page.
     Reload(PipelineId),
+    /// Stop loading the given page, aborting any in-flight document load.
+    StopLoading(PipelineId),
     /// Notifies the script thread about a new recorded paint metric.
     PaintMetric(
         PipelineId,

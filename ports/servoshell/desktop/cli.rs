@@ -34,6 +34,12 @@ pub fn main() {
 
     crate::init_tracing(servoshell_preferences.tracing_filter.as_deref());
 
+    // Before the first thread starts: onde reads the model cache location out
+    // of the environment, and Settings lists what is downloaded long before
+    // anything is downloaded through this app.
+    #[cfg(target_os = "macos")]
+    crate::desktop::inference::seed_model_cache_env();
+
     let clean_shutdown = servoshell_preferences.clean_shutdown;
     let event_loop = match servoshell_preferences.headless {
         true => ServoShellEventLoop::headless(),

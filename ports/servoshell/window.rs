@@ -20,14 +20,23 @@ use crate::parser::location_bar_input_to_url;
 use crate::running_app_state::{RunningAppState, UserInterfaceCommand, WebViewCollection};
 
 // This should vary by zoom level and maybe actual text size (focused or under cursor)
-#[cfg_attr(any(target_os = "android", target_env = "ohos"), expect(dead_code))]
+#[cfg_attr(
+    any(target_os = "android", target_os = "ios", target_env = "ohos"),
+    expect(dead_code)
+)]
 pub(crate) const LINE_HEIGHT: f32 = 76.0;
-#[cfg_attr(any(target_os = "android", target_env = "ohos"), expect(dead_code))]
+#[cfg_attr(
+    any(target_os = "android", target_os = "ios", target_env = "ohos"),
+    expect(dead_code)
+)]
 pub(crate) const LINE_WIDTH: f32 = 76.0;
 
 /// <https://github.com/web-platform-tests/wpt/blob/9320b1f724632c52929a3fdb11bdaf65eafc7611/webdriver/tests/classic/set_window_rect/set.py#L287-L290>
 /// "A window size of 10x10px shouldn't be supported by any browser."
-#[cfg_attr(any(target_os = "android", target_env = "ohos"), expect(dead_code))]
+#[cfg_attr(
+    any(target_os = "android", target_os = "ios", target_env = "ohos"),
+    expect(dead_code)
+)]
 pub(crate) const MIN_WINDOW_INNER_SIZE: DeviceIntSize = DeviceIntSize::new(100, 100);
 
 static SERVOSHELL_WINDOW_ID: AtomicU64 = AtomicU64::new(0);
@@ -42,7 +51,10 @@ impl From<u64> for ServoShellWindowId {
 }
 
 impl ServoShellWindowId {
-    #[cfg_attr(not(any(target_os = "android", target_env = "ohos")), expect(unused))]
+    #[cfg_attr(
+        not(any(target_os = "android", target_os = "ios", target_env = "ohos")),
+        expect(unused)
+    )]
     pub(crate) fn next() -> ServoShellWindowId {
         ServoShellWindowId(SERVOSHELL_WINDOW_ID.fetch_add(1, std::sync::atomic::Ordering::SeqCst))
     }
@@ -65,6 +77,8 @@ pub(crate) struct ServoShellWindow {
     pending_favicon_loads: RefCell<Vec<WebViewId>>,
     /// Pending [`UserInterfaceCommand`] that have yet to be processed by the main loop.
     pending_commands: RefCell<Vec<UserInterfaceCommand>>,
+    /// The most recently closed page, used by the familiar Reopen Closed Tab command.
+    recently_closed_webview: RefCell<Option<Url>>,
 }
 
 impl ServoShellWindow {
@@ -77,6 +91,7 @@ impl ServoShellWindow {
             needs_repaint: Default::default(),
             pending_favicon_loads: Default::default(),
             pending_commands: Default::default(),
+            recently_closed_webview: Default::default(),
         }
     }
 
@@ -102,7 +117,10 @@ impl ServoShellWindow {
         state: Rc<RunningAppState>,
         url: Url,
     ) -> WebView {
-        #[cfg_attr(any(target_os = "android", target_env = "ohos"), expect(unused_mut))]
+        #[cfg_attr(
+            any(target_os = "android", target_os = "ios", target_env = "ohos"),
+            expect(unused_mut)
+        )]
         let mut webview_builder =
             WebViewBuilder::new(state.servo(), self.platform_window.rendering_context())
                 .url(url)
@@ -112,7 +130,7 @@ impl ServoShellWindow {
 
         #[cfg(all(
             feature = "gamepad",
-            not(any(target_os = "android", target_env = "ohos"))
+            not(any(target_os = "android", target_os = "ios", target_env = "ohos"))
         ))]
         if let Some(gamepad_delegate) = state.gamepad_delegate() {
             webview_builder = webview_builder.gamepad_delegate(gamepad_delegate);
@@ -201,7 +219,10 @@ impl ServoShellWindow {
         self.set_needs_update();
     }
 
-    #[cfg_attr(any(target_os = "android", target_env = "ohos"), expect(dead_code))]
+    #[cfg_attr(
+        any(target_os = "android", target_os = "ios", target_env = "ohos"),
+        expect(dead_code)
+    )]
     pub(crate) fn activate_webview_by_index(&self, index_to_activate: usize) {
         self.webview_collection
             .borrow_mut()
@@ -209,7 +230,10 @@ impl ServoShellWindow {
         self.set_needs_update();
     }
 
-    #[cfg_attr(any(target_os = "android", target_env = "ohos"), expect(dead_code))]
+    #[cfg_attr(
+        any(target_os = "android", target_os = "ios", target_env = "ohos"),
+        expect(dead_code)
+    )]
     pub(crate) fn get_active_webview_index(&self) -> Option<usize> {
         let active_id = self.webview_collection.borrow().active_id()?;
         self.webviews()
@@ -218,8 +242,9 @@ impl ServoShellWindow {
     }
 
     pub(crate) fn update_and_request_repaint_if_necessary(&self, state: &RunningAppState) {
-        let updated_user_interface = self.needs_update.take() &&
-            self.platform_window
+        let updated_user_interface = self.needs_update.take()
+            && self
+                .platform_window
                 .update_user_interface_state(state, self);
 
         // Delegate handlers may have asked us to present or update painted WebView contents.
@@ -236,6 +261,9 @@ impl ServoShellWindow {
     /// the close notification via the [`WebViewDelegate`] later.
     pub(crate) fn close_webview(&self, webview_id: WebViewId) {
         let mut webview_collection = self.webview_collection.borrow_mut();
+        if let Some(webview) = webview_collection.get(webview_id) {
+            *self.recently_closed_webview.borrow_mut() = webview.url();
+        }
         if webview_collection.remove(webview_id).is_none() {
             return;
         }
@@ -246,12 +274,22 @@ impl ServoShellWindow {
         self.set_needs_repaint();
     }
 
+    pub(crate) fn reopen_closed_webview(self: &Rc<Self>, state: Rc<RunningAppState>) {
+        let Some(url) = self.recently_closed_webview.borrow_mut().take() else {
+            return;
+        };
+        self.create_and_activate_toplevel_webview(state, url);
+    }
+
     pub(crate) fn notify_favicon_changed(&self, webview: WebView) {
         self.pending_favicon_loads.borrow_mut().push(webview.id());
         self.set_needs_repaint();
     }
 
-    #[cfg_attr(any(target_os = "android", target_env = "ohos"), expect(dead_code))]
+    #[cfg_attr(
+        any(target_os = "android", target_os = "ios", target_env = "ohos"),
+        expect(dead_code)
+    )]
     pub(crate) fn hidpi_scale_factor_changed(&self) {
         let new_scale_factor = self.platform_window.hidpi_scale_factor();
         for webview in self.webview_collection.borrow().values() {
@@ -264,7 +302,7 @@ impl ServoShellWindow {
     }
 
     #[cfg_attr(
-        not(any(target_os = "android", target_env = "ohos")),
+        not(any(target_os = "android", target_os = "ios", target_env = "ohos")),
         expect(dead_code)
     )]
     pub(crate) fn active_or_newest_webview(&self) -> Option<WebView> {
@@ -276,7 +314,10 @@ impl ServoShellWindow {
     }
 
     /// Return a list of all webviews that have favicons that have not yet been loaded by egui.
-    #[cfg_attr(any(target_os = "android", target_env = "ohos"), expect(dead_code))]
+    #[cfg_attr(
+        any(target_os = "android", target_os = "ios", target_env = "ohos"),
+        expect(dead_code)
+    )]
     pub(crate) fn take_pending_favicon_loads(&self) -> Vec<WebViewId> {
         std::mem::take(&mut *self.pending_favicon_loads.borrow_mut())
     }
@@ -329,6 +370,15 @@ impl ServoShellWindow {
                         active_webview.load(url.into_url());
                     }
                 },
+                UserInterfaceCommand::GoHome => {
+                    let Ok(url) = Url::parse(&state.servoshell_preferences.homepage) else {
+                        warn!("failed to parse homepage URL");
+                        continue;
+                    };
+                    if let Some(active_webview) = self.active_webview() {
+                        active_webview.load(url);
+                    }
+                },
                 UserInterfaceCommand::Back => {
                     if let Some(active_webview) = self.active_webview() {
                         active_webview.go_back(1);
@@ -345,6 +395,12 @@ impl ServoShellWindow {
                         active_webview.reload();
                     }
                 },
+                UserInterfaceCommand::Stop => {
+                    self.set_needs_update();
+                    if let Some(active_webview) = self.active_webview() {
+                        active_webview.stop();
+                    }
+                },
                 UserInterfaceCommand::ReloadAll => {
                     for window in state.windows().values() {
                         window.set_needs_update();
@@ -355,8 +411,19 @@ impl ServoShellWindow {
                 },
                 UserInterfaceCommand::NewWebView => {
                     self.set_needs_update();
-                    let url = Url::parse("servo:newtab").expect("Should always be able to parse");
+                    let url = Url::parse("smb:newtab").expect("Should always be able to parse");
                     self.create_and_activate_toplevel_webview(state.clone(), url);
+                },
+                UserInterfaceCommand::ReopenClosedWebView => {
+                    self.reopen_closed_webview(state.clone());
+                },
+                UserInterfaceCommand::ToggleBookmark => {
+                    if let Some(url) = self.active_webview().and_then(|webview| webview.url())
+                        && matches!(url.scheme(), "http" | "https")
+                    {
+                        state.toggle_bookmark(url);
+                        self.set_needs_update();
+                    }
                 },
                 UserInterfaceCommand::CloseWebView(id) => {
                     self.set_needs_update();
@@ -364,7 +431,7 @@ impl ServoShellWindow {
                 },
                 UserInterfaceCommand::NewWindow => {
                     if let Some(create_platform_window) = create_platform_window {
-                        let url = Url::parse("servo:newtab").unwrap();
+                        let url = Url::parse("smb:newtab").unwrap();
                         let platform_window = create_platform_window(url.clone());
                         state.open_window(platform_window, url);
                     }
@@ -380,10 +447,16 @@ impl ServoShellWindow {
 pub(crate) trait PlatformWindow {
     fn id(&self) -> ServoShellWindowId;
     fn screen_geometry(&self) -> ScreenGeometry;
-    #[cfg_attr(any(target_os = "android", target_env = "ohos"), expect(dead_code))]
+    #[cfg_attr(
+        any(target_os = "android", target_os = "ios", target_env = "ohos"),
+        expect(dead_code)
+    )]
     fn device_hidpi_scale_factor(&self) -> Scale<f32, DeviceIndependentPixel, DevicePixel>;
     fn hidpi_scale_factor(&self) -> Scale<f32, DeviceIndependentPixel, DevicePixel>;
-    #[cfg_attr(any(target_os = "android", target_env = "ohos"), expect(dead_code))]
+    #[cfg_attr(
+        any(target_os = "android", target_os = "ios", target_env = "ohos"),
+        expect(dead_code)
+    )]
     fn get_fullscreen(&self) -> bool;
     /// Inform the `Window` that the state of a `WebView` has changed and that it should
     /// do an incremental update of user interface state. Returns `true` if the user
@@ -404,7 +477,7 @@ pub(crate) trait PlatformWindow {
     fn set_cursor(&self, _cursor: Cursor) {}
     #[cfg(all(
         feature = "webxr",
-        not(any(target_os = "android", target_env = "ohos"))
+        not(any(target_os = "android", target_os = "ios", target_env = "ohos"))
     ))]
     fn new_glwindow(
         &self,
@@ -446,13 +519,13 @@ pub(crate) trait PlatformWindow {
     fn notify_crashed(&self, _: WebView, _reason: String, _backtrace: Option<String>) {}
     fn show_console_message(&self, _level: ConsoleLogLevel, _message: &str) {}
 
-    #[cfg(not(any(target_os = "android", target_env = "ohos")))]
+    #[cfg(not(any(target_os = "android", target_os = "ios", target_env = "ohos")))]
     /// If this window is a headed window, access the concrete type.
     fn as_headed_window(&self) -> Option<&crate::desktop::headed_window::HeadedWindow> {
         None
     }
 
-    #[cfg(any(target_os = "android", target_env = "ohos"))]
+    #[cfg(any(target_os = "android", target_os = "ios", target_env = "ohos"))]
     /// If this window is a headed window, access the concrete type.
     fn as_headed_window(&self) -> Option<&crate::egl::app::EmbeddedPlatformWindow> {
         None

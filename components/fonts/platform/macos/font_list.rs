@@ -5,7 +5,7 @@
 use std::ffi::c_void;
 
 use fonts_traits::LocalFontIdentifier;
-use icu_locid::subtags::language;
+use icu_locale_core::subtags::language;
 use log::debug;
 use objc2_core_foundation::{CFDictionary, CFRetained, CFSet, CFString, CFType, CFURL};
 use objc2_core_text::{
@@ -237,7 +237,10 @@ pub(crate) fn default_system_generic_font_family(
         GenericFontFamily::Monospace => "Menlo",
         GenericFontFamily::Cursive => "Apple Chancery",
         GenericFontFamily::Fantasy => "Papyrus",
-        GenericFontFamily::SystemUi => "Helvetica",
+        // This should be the San Francisco system font, but Servo can't select it by
+        // name yet. Helvetica Neue is the closest match that is always installed, and
+        // unlike Helvetica its accented capitals are not clipped when rasterized.
+        GenericFontFamily::SystemUi => "Helvetica Neue",
     }
     .into()
 }

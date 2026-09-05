@@ -651,7 +651,34 @@ impl IndependentFormattingContext {
         let inline_size = inline_axis_solver.computed_sizes.resolve(
             Direction::Inline,
             inline_axis_solver.automatic_size(),
-            Au::zero,
+            || {
+                // Unless the box is a scroll container, the automatic minimum size of a box
+                // with a preferred aspect ratio is its content-based minimum size, so that
+                // the contents don't overflow.
+                // <https://drafts.csswg.org/css-sizing-4/#aspect-ratio-minimum>
+                if preferred_aspect_ratio.is_none() ||
+                    self.is_replaced() ||
+                    style.establishes_scroll_container_in_axis(
+                        self.base_fragment_info().flags,
+                        Direction::Inline,
+                    )
+                {
+                    return Au::zero();
+                }
+                let constraint_space = ConstraintSpace::new(tentative_block_size, &style, None);
+                let content_size_suggestion = self
+                    .inline_content_sizes(layout_context, &constraint_space)
+                    .sizes
+                    .min_content;
+                match inline_axis_solver
+                    .computed_sizes
+                    .preferred
+                    .maybe_resolve_extrinsic(Some(inline_stretch_size))
+                {
+                    Some(specified) => specified.min(content_size_suggestion),
+                    None => content_size_suggestion,
+                }
+            },
             Some(inline_stretch_size),
             get_inline_content_size,
             is_table,

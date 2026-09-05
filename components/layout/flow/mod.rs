@@ -41,7 +41,9 @@ use crate::sizing::{
     self, ComputeInlineContentSizes, ContentSizes, InlineContentSizesResult, LazySize, Size,
     SizeConstraint, Sizes,
 };
-use crate::style_ext::{AspectRatio, ContentBoxSizesAndPBM, LayoutStyle, PaddingBorderMargin};
+use crate::style_ext::{
+    AspectRatio, ComputedValuesExt, ContentBoxSizesAndPBM, LayoutStyle, PaddingBorderMargin,
+};
 use crate::{ConstraintSpace, ContainingBlock, ContainingBlockSize, IndefiniteContainingBlock};
 
 mod construct;
@@ -1531,7 +1533,7 @@ struct ResolvedMargins {
 fn solve_containing_block_padding_and_border_for_in_flow_box<'a>(
     containing_block: &ContainingBlock<'_>,
     layout_style: &'a LayoutStyle,
-    get_inline_content_sizes: impl FnOnce(&ConstraintSpace) -> ContentSizes,
+    get_inline_content_sizes: impl Fn(&ConstraintSpace) -> ContentSizes,
     ignore_block_margins_for_stretch: LogicalSides1D<bool>,
     context: Option<&IndependentFormattingContext>,
     has_inline_parent: bool,
@@ -1610,7 +1612,7 @@ fn solve_containing_block_padding_and_border_for_in_flow_box<'a>(
 
     // https://drafts.csswg.org/css2/#the-width-property
     // https://drafts.csswg.org/css2/visudet.html#min-max-widths
-    let get_inline_content_sizes = || {
+    let get_inline_content_sizes_with_ratio = || {
         get_inline_content_sizes(&ConstraintSpace::new(
             tentative_block_size,
             style,
@@ -1621,9 +1623,37 @@ fn solve_containing_block_padding_and_border_for_in_flow_box<'a>(
     let inline_size = content_box_sizes.inline.resolve(
         Direction::Inline,
         automatic_inline_size(justify_self, context),
-        Au::zero,
+        || {
+            // Unless the box is a scroll container, the automatic minimum size of a box with
+            // a preferred aspect ratio is its content-based minimum size, so that the
+            // contents don't overflow.
+            // <https://drafts.csswg.org/css-sizing-4/#aspect-ratio-minimum>
+            let scroll_container_flags = context
+                .map(|context| context.base_fragment_info().flags)
+                .unwrap_or(FragmentFlags::empty());
+            if preferred_aspect_ratio.is_none() ||
+                context.is_some_and(IndependentFormattingContext::is_replaced) ||
+                style.establishes_scroll_container_in_axis(
+                    scroll_container_flags,
+                    Direction::Inline,
+                )
+            {
+                return Au::zero();
+            }
+            let content_size_suggestion =
+                get_inline_content_sizes(&ConstraintSpace::new(tentative_block_size, style, None))
+                    .min_content;
+            match content_box_sizes
+                .inline
+                .preferred
+                .maybe_resolve_extrinsic(Some(available_inline_size))
+            {
+                Some(specified) => specified.min(content_size_suggestion),
+                None => content_size_suggestion,
+            }
+        },
         Some(available_inline_size),
-        get_inline_content_sizes,
+        get_inline_content_sizes_with_ratio,
         is_table,
     );
 

@@ -9,7 +9,7 @@ use std::collections::HashSet;
 use dom_struct::dom_struct;
 use js::context::JSContext;
 use script_bindings::cell::{DomRefCell, Ref};
-use script_bindings::reflector::reflect_dom_object_with_cx;
+use script_bindings::reflector::reflect_dom_object;
 use script_bindings::weakref::WeakRef;
 use servo_canvas_traits::webgl::{
     ActiveAttribInfo, ActiveUniformBlockInfo, ActiveUniformInfo, WebGLCommand, WebGLError,
@@ -109,18 +109,30 @@ impl DroppableWebGLProgram {
         Ok(shader)
     }
 
-    fn detach_shaders(&mut self) {
+    /// The fallibility has to be carried in from the caller rather than assumed here. This runs
+    /// from `Drop`, which for a `WebGLProgram` means from a SpiderMonkey finalizer, and the
+    /// finalizer that runs during `JSRuntime::destroyRuntime` is on the far side of the WebGL
+    /// thread's own shutdown. Sending to a channel nobody is reading is expected there, and an
+    /// `expect` on it does not merely panic: a panic cannot cross the `extern "C"` finalizer
+    /// frame, so it aborts the whole process on the way out.
+    fn detach_shaders(&mut self, operation_fallibility: Operation) {
         if let Some(ref mut shader) = self.fragment_shader {
             if let Some(root) = shader.root() {
                 root.decrement_attached_counter();
-                self.send_command(WebGLCommand::DetachShader(self.id, root.id()));
+                self.send_with_fallibility(
+                    WebGLCommand::DetachShader(self.id, root.id()),
+                    operation_fallibility,
+                );
             }
             self.fragment_shader = None;
         }
         if let Some(ref mut shader) = self.vertex_shader {
             if let Some(root) = shader.root() {
                 root.decrement_attached_counter();
-                self.send_command(WebGLCommand::DetachShader(self.id, root.id()));
+                self.send_with_fallibility(
+                    WebGLCommand::DetachShader(self.id, root.id()),
+                    operation_fallibility,
+                );
             }
             self.vertex_shader = None;
         }
@@ -150,24 +162,24 @@ impl DroppableWebGLProgram {
         self.marked_for_deletion = true;
         self.send_with_fallibility(WebGLCommand::DeleteProgram(self.id), operation_fallibility);
         if self.is_deleted() {
-            self.detach_shaders();
+            self.detach_shaders(operation_fallibility);
         }
     }
 
-    fn in_use(&mut self, value: bool) {
+    fn in_use(&mut self, value: bool, operation_fallibility: Operation) {
         if self.is_in_use == value {
             return;
         }
         self.is_in_use = value;
         if self.is_deleted() {
-            self.detach_shaders();
+            self.detach_shaders(operation_fallibility);
         }
     }
 }
 
 impl Drop for DroppableWebGLProgram {
     fn drop(&mut self) {
-        self.in_use(false);
+        self.in_use(false, Operation::Fallible);
         self.mark_for_deletion(Operation::Fallible);
     }
 }
@@ -226,10 +238,10 @@ impl WebGLProgram {
         context: &WebGLRenderingContext,
         id: WebGLProgramId,
     ) -> DomRoot<Self> {
-        reflect_dom_object_with_cx(
+        reflect_dom_object(
+            cx,
             Box::new(WebGLProgram::new_inherited(context, id)),
             &*context.global(),
-            cx,
         )
     }
 }
@@ -250,7 +262,7 @@ impl WebGLProgram {
             operation_fallibility,
         );
         if self.is_deleted() {
-            self.detach_shaders();
+            self.detach_shaders(operation_fallibility);
         }
     }
 
@@ -260,13 +272,17 @@ impl WebGLProgram {
         }
         self.set_is_in_use(value);
         if self.is_deleted() {
-            self.detach_shaders();
+            // Reached from script, where the WebGL thread is still running and a failed send is
+            // a real bug worth hearing about.
+            self.detach_shaders(Operation::Infallible);
         }
     }
 
-    fn detach_shaders(&self) {
+    fn detach_shaders(&self, operation_fallibility: Operation) {
         assert!(self.is_deleted());
-        self.droppable.borrow_mut().detach_shaders();
+        self.droppable
+            .borrow_mut()
+            .detach_shaders(operation_fallibility);
         if self.fragment_shader.get().is_some() {
             self.fragment_shader.set(None);
         }

@@ -24,8 +24,11 @@ use crate::positioned::{LayoutRootLayoutInputs, PositioningContext};
 use crate::replaced::ReplacedContents;
 use crate::sizing::{
     self, ComputeInlineContentSizes, ContentSizes, InlineContentSizesResult, LazySize,
+    SizeConstraint,
 };
-use crate::style_ext::{AspectRatio, Display, DisplayInside, LayoutStyle};
+use crate::style_ext::{
+    AspectRatio, Clamp, ComputedValuesExt, Display, DisplayInside, LayoutStyle,
+};
 use crate::table::Table;
 use crate::taffy::TaffyContainer;
 use crate::{
@@ -441,7 +444,7 @@ impl IndependentFormattingContext {
         preferred_aspect_ratio: Option<AspectRatio>,
         lazy_block_size: &LazySize,
     ) -> IndependentFormattingContextLayoutResult {
-        match &self.contents {
+        let mut result = match &self.contents {
             IndependentFormattingContextContents::Replaced(replaced, widget) => {
                 let mut replaced_layout = replaced.layout(
                     layout_context,
@@ -463,7 +466,8 @@ impl IndependentFormattingContext {
                         .fragments
                         .append(&mut widget_layout.fragments);
                 }
-                replaced_layout
+                // Replaced contents already size themselves through the ratio.
+                return replaced_layout;
             },
             IndependentFormattingContextContents::Flow(bfc) => bfc.layout(
                 layout_context,
@@ -484,13 +488,37 @@ impl IndependentFormattingContext {
                 containing_block_for_children,
                 containing_block,
             ),
-            IndependentFormattingContextContents::Table(table) => table.layout(
-                layout_context,
-                positioning_context,
-                containing_block_for_children,
-                containing_block,
-            ),
+            IndependentFormattingContextContents::Table(table) => {
+                // Table boxes size through their own algorithm.
+                return table.layout(
+                    layout_context,
+                    positioning_context,
+                    containing_block_for_children,
+                    containing_block,
+                );
+            },
+        };
+
+        // The automatic block size of a box with a preferred aspect ratio comes from
+        // transferring its inline size through that ratio, not from its contents.
+        // <https://drafts.csswg.org/css-sizing-4/#aspect-ratio>
+        // However, unless the box is a scroll container, its automatic minimum size is
+        // the size of its contents, so that they don't overflow.
+        // <https://drafts.csswg.org/css-sizing-4/#aspect-ratio-minimum>
+        if let Some(ratio) = preferred_aspect_ratio {
+            let transferred_block_size = ratio
+                .compute_dependent_size(Direction::Block, containing_block_for_children.size.inline);
+            result.content_block_size = if self.style().establishes_scroll_container_in_axis(
+                self.base_fragment_info().flags,
+                Direction::Block,
+            ) {
+                transferred_block_size
+            } else {
+                transferred_block_size.max(result.content_block_size)
+            };
         }
+
+        result
     }
 
     pub(crate) fn layout_and_is_cached(
@@ -577,8 +605,10 @@ impl IndependentFormattingContext {
             IndependentFormattingContextContents::Replaced(replaced, _) => {
                 replaced.preferred_aspect_ratio(self.style(), padding_border_sums)
             },
-            // TODO: support preferred aspect ratios on non-replaced boxes.
-            _ => None,
+            // `aspect-ratio` does not apply to table boxes, which size themselves
+            // through their own algorithm.
+            IndependentFormattingContextContents::Table(_) => None,
+            _ => self.style().preferred_aspect_ratio(None, padding_border_sums),
         }
     }
 
@@ -615,9 +645,10 @@ impl ComputeInlineContentSizes for IndependentFormattingContextContents {
         layout_context: &LayoutContext,
         constraint_space: &ConstraintSpace,
     ) -> InlineContentSizesResult {
-        match self {
+        let mut result = match self {
             Self::Replaced(inner, _) => {
-                inner.compute_inline_content_sizes(layout_context, constraint_space)
+                // Replaced content already transfers the block size through the ratio.
+                return inner.compute_inline_content_sizes(layout_context, constraint_space);
             },
             Self::Flow(inner) => inner
                 .contents
@@ -629,8 +660,37 @@ impl ComputeInlineContentSizes for IndependentFormattingContextContents {
                 inner.compute_inline_content_sizes(layout_context, constraint_space)
             },
             Self::Table(inner) => {
-                inner.compute_inline_content_sizes(layout_context, constraint_space)
+                // Table boxes size through their own algorithm, and `aspect-ratio` does
+                // not apply to internal table boxes.
+                return inner.compute_inline_content_sizes(layout_context, constraint_space);
             },
+        };
+
+        // A box with a preferred aspect ratio and a definite block size contributes the
+        // size transferred through that ratio, rather than the size of its contents.
+        // <https://drafts.csswg.org/css-sizing-4/#aspect-ratio>
+        if let Some(ratio) = constraint_space.preferred_aspect_ratio {
+            let transfer = |size| ratio.compute_dependent_size(Direction::Inline, size);
+            match constraint_space.block_size {
+                SizeConstraint::Definite(block_size) => {
+                    result.sizes = transfer(block_size).into();
+                },
+                SizeConstraint::MinMax(min_block_size, max_block_size) => {
+                    let min_inline_size = transfer(min_block_size);
+                    let max_inline_size = max_block_size.map(transfer);
+                    result.sizes.min_content = result
+                        .sizes
+                        .min_content
+                        .clamp_between_extremums(min_inline_size, max_inline_size);
+                    result.sizes.max_content = result
+                        .sizes
+                        .max_content
+                        .clamp_between_extremums(min_inline_size, max_inline_size);
+                },
+            }
+            result.depends_on_block_constraints = true;
         }
+
+        result
     }
 }

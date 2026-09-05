@@ -24,6 +24,7 @@ use fonts::SystemFontService;
 ))]
 use gaol::sandbox::{ChildSandbox, ChildSandboxMethods};
 use ipc_channel::ipc::{self, IpcSender};
+use keyboard_types::Modifiers;
 use layout::LayoutFactoryImpl;
 use layout_api::ScriptThreadFactory;
 use log::{Log, Metadata, Record, debug, warn};
@@ -1092,6 +1093,23 @@ impl Servo {
         self.0
             .constellation_proxy
             .send(EmbedderToConstellationMessage::CreateMemoryReport(snd));
+    }
+
+    /// Tell Servo which keyboard modifiers the user is currently holding down.
+    ///
+    /// Servo otherwise infers this from the keyboard events it is given, which is only as
+    /// complete as the embedder's forwarding. Anything the embedder handles itself -- a menu
+    /// accelerator, a shortcut in the browser chrome, a key pressed while another window is
+    /// focused -- leaves a gap, and a `Meta` whose release fell into one makes every later click
+    /// on a link behave as a `Cmd`-click. Embedders that can observe the platform's real modifier
+    /// state should call this whenever it changes, and pass [`Modifiers::empty`] when the window
+    /// loses focus.
+    pub fn notify_keyboard_modifiers_changed(&self, modifiers: Modifiers) {
+        self.0
+            .constellation_proxy
+            .send(EmbedderToConstellationMessage::SetKeyboardModifiers(
+                modifiers,
+            ));
     }
 
     pub fn execute_webdriver_command(&self, command: WebDriverCommandMsg) {

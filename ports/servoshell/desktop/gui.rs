@@ -3,29 +3,49 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 use std::collections::HashMap;
-#[cfg(any(target_os = "windows", target_os = "linux", target_os = "freebsd"))]
+#[cfg(any(
+    target_os = "windows",
+    target_os = "linux",
+    target_os = "freebsd",
+    target_os = "macos"
+))]
 use std::fs;
-#[cfg(any(target_os = "windows", target_os = "linux", target_os = "freebsd"))]
+#[cfg(any(
+    target_os = "windows",
+    target_os = "linux",
+    target_os = "freebsd",
+    target_os = "macos"
+))]
 use std::path::Path;
 use std::rc::Rc;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use accesskit::Affine;
 use dpi::PhysicalSize;
 use egui::text::{CCursor, CCursorRange};
 use egui::text_edit::TextEditState;
 use egui::{
-    Button, FontDefinitions, Id, Key, Label, LayerId, Modifiers, Order, PaintCallback, Panel, Vec2,
-    WidgetInfo, WidgetType, pos2,
+    Button, Color32, FontDefinitions, Id, Key, Label, LayerId, Modifiers, Order, PaintCallback,
+    Panel, Pos2, Rect as EguiRect, Vec2, WidgetInfo, WidgetType, pos2,
 };
-#[cfg(any(target_os = "windows", target_os = "linux", target_os = "freebsd"))]
+#[cfg(any(
+    target_os = "windows",
+    target_os = "linux",
+    target_os = "freebsd",
+    target_os = "macos"
+))]
 use egui::{FontData, FontFamily};
 use egui_glow::{CallbackFn, EguiGlow};
 use egui_winit::EventResponse;
 use euclid::{Length, Point2D, Rect, Scale, Size2D};
-#[cfg(any(target_os = "windows", target_os = "linux", target_os = "freebsd"))]
+#[cfg(any(
+    target_os = "windows",
+    target_os = "linux",
+    target_os = "freebsd",
+    target_os = "macos"
+))]
 use log::info;
-use log::warn;
 use servo::{
     DeviceIndependentPixel, DevicePixel, Image, LoadStatus, OffscreenRenderingContext, PixelFormat,
     RenderingContext, WebView, WebViewId,
@@ -39,6 +59,10 @@ use crate::desktop::event_loop::AppEvent;
 use crate::desktop::headed_window;
 use crate::running_app_state::{RunningAppState, UserInterfaceCommand};
 use crate::window::ServoShellWindow;
+
+/// How long the chrome keeps calling a load a load after the engine last said anything about
+/// it. See [`Gui::is_loading`].
+const LOAD_STALL_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// The user interface of a headed servoshell. Currently this is implemented via
 /// egui.
@@ -54,6 +78,10 @@ pub struct Gui {
 
     /// The [`LoadStatus`] of the active `WebView`.
     load_status: LoadStatus,
+
+    /// When [`Self::load_status`] last changed, which is what [`Self::is_loading`] measures a
+    /// stalled load against.
+    load_status_changed_at: Instant,
 
     /// The text to display in the status bar on the bottom of the window.
     status_text: Option<String>,
@@ -72,6 +100,18 @@ pub struct Gui {
     /// AccessKit tree updates pending the next egui tick.
     /// This allows us to ensure that graft nodes are sent before the subtrees they graft.
     pending_accesskit_updates: Vec<accesskit::TreeUpdate>,
+
+    /// On-device chat. Constructed eagerly because it is cheap until a model
+    /// is requested, so the panel can be opened without a startup cost.
+    #[cfg(target_os = "macos")]
+    inference: crate::desktop::inference::Inference,
+
+    /// Whether the chat panel is open.
+    #[cfg(target_os = "macos")]
+    chat_open: bool,
+
+    /// The Settings window, opened from the application menu.
+    settings: crate::desktop::settings::Settings,
 }
 
 fn truncate_with_ellipsis(input: &str, max_length: usize) -> String {
@@ -83,8 +123,21 @@ fn truncate_with_ellipsis(input: &str, max_length: usize) -> String {
     }
 }
 
-#[cfg(any(target_os = "windows", target_os = "linux", target_os = "freebsd"))]
-fn load_cjk_fonts(font_candidates: &[(&str, &str)]) -> FontDefinitions {
+/// Load whichever of `font_candidates` exist and add them to the proportional
+/// family.
+///
+/// `prefer` decides whether they go in front of egui's bundled faces or behind
+/// them. In front means they also render Latin text, which is what the CJK
+/// faces on Windows and Linux have always done. Behind means they are consulted
+/// only for glyphs the bundled faces lack, which is what macOS wants: the
+/// chrome should keep looking like the rest of the system.
+#[cfg(any(
+    target_os = "windows",
+    target_os = "linux",
+    target_os = "freebsd",
+    target_os = "macos"
+))]
+fn load_cjk_fonts(font_candidates: &[(&str, &str)], prefer: bool) -> FontDefinitions {
     let mut fonts = FontDefinitions::default();
     let mut loaded_font_names = Vec::new();
 
@@ -111,7 +164,11 @@ fn load_cjk_fonts(font_candidates: &[(&str, &str)]) -> FontDefinitions {
     if !loaded_font_names.is_empty() {
         let proportional = fonts.families.get_mut(&FontFamily::Proportional).unwrap();
         for font_name in loaded_font_names.iter() {
-            proportional.insert(0, font_name.clone());
+            if prefer {
+                proportional.insert(0, font_name.clone());
+            } else {
+                proportional.push(font_name.clone());
+            }
         }
     }
 
@@ -120,10 +177,13 @@ fn load_cjk_fonts(font_candidates: &[(&str, &str)]) -> FontDefinitions {
 
 #[cfg(target_os = "windows")]
 fn configure_fonts() -> FontDefinitions {
-    load_cjk_fonts(&[
-        (r"C:\Windows\Fonts\malgun.ttf", "Malgun Gothic"), // Korean
-        (r"C:\Windows\Fonts\msyh.ttc", "Microsoft YaHei"), // Chinese + Japanese
-    ])
+    load_cjk_fonts(
+        &[
+            (r"C:\Windows\Fonts\malgun.ttf", "Malgun Gothic"), // Korean
+            (r"C:\Windows\Fonts\msyh.ttc", "Microsoft YaHei"), // Chinese + Japanese
+        ],
+        true,
+    )
 }
 
 #[cfg(any(target_os = "linux", target_os = "freebsd"))]
@@ -166,14 +226,43 @@ fn configure_fonts() -> FontDefinitions {
             "/usr/local/share/fonts/wqy/wqy-microhei.ttc",
             "WenQuanYi Micro Hei",
         ), // FreeBSD
-    ])
+    ], true)
 }
 
 #[cfg(target_os = "macos")]
 fn configure_fonts() -> FontDefinitions {
-    // TODO: Default proportional fonts: ["Ubuntu-Light", "NotoEmoji-Regular", "emoji-icon-font"]
-    // does not support CJK. Add them for Mac.
-    FontDefinitions::default()
+    // egui's bundled faces cover Latin and little else, so any chrome that
+    // shows page-supplied text renders tofu outside that range. The select
+    // element popup is drawn here rather than by the engine, so a language
+    // picker on a site like about.google turns into a column of boxes.
+    //
+    // These are fallbacks, not preferences: the toolbar keeps egui's own face
+    // and only unmapped glyphs reach them. Arial Unicode comes first because it
+    // covers most of the BMP on its own; the rest fill in scripts it renders
+    // poorly, and any that a given macOS release has moved or dropped are
+    // skipped.
+    load_cjk_fonts(
+        &[
+            (
+                "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
+                "Arial Unicode MS",
+            ),
+            ("/System/Library/Fonts/Hiragino Sans GB.ttc", "Hiragino Sans GB"), // Chinese
+            (
+                "/System/Library/Fonts/ヒラギノ角ゴシック W3.ttc",
+                "Hiragino Kaku Gothic", // Japanese
+            ),
+            ("/System/Library/Fonts/AppleSDGothicNeo.ttc", "Apple SD Gothic Neo"), // Korean
+            ("/System/Library/Fonts/GeezaPro.ttc", "Geeza Pro"),                   // Arabic
+            ("/System/Library/Fonts/Supplemental/Thonburi.ttc", "Thonburi"),       // Thai
+            (
+                "/System/Library/Fonts/Supplemental/DevanagariMT.ttc",
+                "Devanagari MT",
+            ),
+            ("/System/Library/Fonts/Apple Symbols.ttf", "Apple Symbols"),
+        ],
+        false,
+    )
 }
 
 impl Drop for Gui {
@@ -186,6 +275,37 @@ impl Drop for Gui {
 }
 
 impl Gui {
+    /// Draws an indeterminate, animated loading bar in `color`. It has no real percentage to
+    /// report (Servo does not surface byte progress here), so it sweeps a segment across the
+    /// strip to signal that work is ongoing, then requests a repaint to keep animating.
+    fn show_loading_progress_bar(ui: &mut egui::Ui, color: Color32) {
+        let bar_height = 3.0;
+        let width = ui.available_width().max(1.0);
+        let (rect, _) = ui.allocate_exact_size(Vec2::new(width, bar_height), egui::Sense::hover());
+        let painter = ui.painter();
+
+        // Faint track behind the moving segment, in the same hue so that the strip reads as one
+        // thing rather than a coloured bar on an unrelated grey one.
+        painter.rect_filled(rect, 0.0, color.gamma_multiply(0.15));
+
+        let time = ui.input(|input| input.time) as f32;
+        let full_width = rect.width();
+        let segment_width = (full_width * 0.3).max(60.0);
+        let travel = full_width + segment_width;
+        // Two-second sweep, looping.
+        let offset = (time * (travel / 2.0)) % travel;
+        let left = (rect.left() - segment_width + offset).max(rect.left());
+        let right = (rect.left() - segment_width + offset + segment_width).min(rect.right());
+        if right > left {
+            let segment =
+                EguiRect::from_min_max(Pos2::new(left, rect.top()), Pos2::new(right, rect.bottom()));
+            painter.rect_filled(segment, 0.0, color);
+        }
+
+        // Keep the animation going while the page loads.
+        ui.ctx().request_repaint();
+    }
+
     pub(crate) fn new(
         winit_window: &Window,
         event_loop: &ActiveEventLoop,
@@ -229,12 +349,144 @@ impl Gui {
             location: initial_url.to_string(),
             location_dirty: false,
             load_status: LoadStatus::Complete,
+            load_status_changed_at: Instant::now(),
             status_text: None,
             can_go_back: false,
             can_go_forward: false,
             favicon_textures: Default::default(),
             pending_accesskit_updates: vec![],
+            #[cfg(target_os = "macos")]
+            inference: crate::desktop::inference::Inference::new(),
+            #[cfg(target_os = "macos")]
+            chat_open: false,
+            settings: Default::default(),
         }
+    }
+
+    /// Draw the on-device chat panel.
+    ///
+    /// Reads engine state every frame rather than subscribing to it. The
+    /// engine publishes through mutexes that are only ever held for a field
+    /// read or write, so polling here costs less than routing events back
+    /// through the winit loop would.
+    #[cfg(target_os = "macos")]
+    fn chat_panel(
+        ui: &mut egui::Ui,
+        inference: &mut crate::desktop::inference::Inference,
+        settings: &mut crate::desktop::settings::Settings,
+    ) {
+        use crate::desktop::inference::Status;
+
+        ui.horizontal(|ui| {
+            ui.heading("Chat");
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.button("Clear").clicked() {
+                    inference.clear();
+                }
+                if ui.button("Models…").on_hover_text("Manage on-device models").clicked() {
+                    settings.open(inference);
+                }
+            });
+        });
+        ui.label(
+            egui::RichText::new("Runs on this Mac. Nothing is sent to a server.")
+                .small()
+                .weak(),
+        );
+        ui.separator();
+
+        // Status line, and the only place a model load can be started.
+        let ready = {
+            let status = inference.status();
+            match &*status {
+                Status::Idle => {
+                    drop(status);
+                    let model = inference.selected_model_name();
+                    if ui.button(format!("Load {model}")).clicked() {
+                        inference.ensure_model();
+                    }
+                    ui.label(
+                        egui::RichText::new(
+                            "Downloads a few gigabytes the first time. Choose a different \
+                             model in Settings.",
+                        )
+                        .small()
+                        .weak(),
+                    );
+                    false
+                },
+                Status::Downloading { fraction, detail } => {
+                    ui.add(egui::ProgressBar::new(*fraction).text(detail.clone()));
+                    false
+                },
+                Status::Loading { model } => {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label(format!("Loading {model}…"));
+                    });
+                    false
+                },
+                Status::Ready { model } => {
+                    ui.label(egui::RichText::new(model.clone()).small().weak());
+                    true
+                },
+                Status::Failed(error) => {
+                    ui.colored_label(ui.visuals().error_fg_color, error.clone());
+                    drop(status);
+                    if ui.button("Try again").clicked() {
+                        inference.ensure_model();
+                    }
+                    false
+                },
+            }
+        };
+
+        ui.separator();
+
+        // Transcript. Reserve room for the input row so a long conversation
+        // does not push it off the bottom of the panel.
+        let input_height = 64.0;
+        let transcript_height = (ui.available_height() - input_height).max(0.0);
+        egui::ScrollArea::vertical()
+            .max_height(transcript_height)
+            .stick_to_bottom(true)
+            .show(ui, |ui| {
+                for turn in inference.transcript().iter() {
+                    let (name, color) = match turn.role {
+                        onde::inference::ChatRole::User => ("You", ui.visuals().strong_text_color()),
+                        _ => ("Assistant", ui.visuals().text_color()),
+                    };
+                    ui.label(egui::RichText::new(name).small().strong());
+                    ui.add(egui::Label::new(egui::RichText::new(&turn.text).color(color)).wrap());
+                    ui.add_space(6.0);
+                }
+                if inference.is_generating() {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label(egui::RichText::new("Thinking…").small().weak());
+                    });
+                }
+            });
+
+        // Input row, pinned to the bottom.
+        ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
+            let busy = inference.is_generating();
+            ui.horizontal(|ui| {
+                let send = ui.add_enabled(ready && !busy, egui::Button::new("Send"));
+                let field = ui.add_enabled(
+                    ready && !busy,
+                    egui::TextEdit::singleline(&mut inference.draft)
+                        .desired_width(ui.available_width())
+                        .hint_text(if ready { "Ask something" } else { "Load a model to start" }),
+                );
+                let submitted = field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                if send.clicked() || submitted {
+                    let message = std::mem::take(&mut inference.draft);
+                    inference.send(message);
+                    field.request_focus();
+                }
+            });
+        });
     }
 
     pub(crate) fn has_keyboard_focus(&self) -> bool {
@@ -249,6 +501,12 @@ impl Gui {
                 memory.surrender_focus(focused);
             }
         });
+
+        // Clicking web content also dismisses any open toolbar menu, the way it would in any
+        // other browser. egui never sees that click, because it was routed to the page, so it
+        // cannot close the menu itself. The menu would otherwise hang over the content until
+        // the user found something else to click.
+        egui::Popup::close_all(&self.context.egui_ctx);
     }
 
     pub(crate) fn on_window_event(
@@ -271,6 +529,22 @@ impl Gui {
         position: Point2D<f32, DeviceIndependentPixel>,
     ) -> bool {
         position.y < self.toolbar_height.get()
+    }
+
+    /// Return true iff the given position is over an egui menu or popup floating above the
+    /// web content. Toolbar menus open *below* the toolbar, so the toolbar rect alone does
+    /// not describe everything the user can click on: without this, a click on a bookmark in
+    /// the toolbar menu never reaches egui, and lands on the page behind the menu instead.
+    /// Panels and the WebView itself both live in egui's background layer, so anything above
+    /// that layer is browser chrome.
+    pub(crate) fn is_over_egui_popup(
+        &self,
+        position: Point2D<f32, DeviceIndependentPixel>,
+    ) -> bool {
+        self.context
+            .egui_ctx
+            .layer_id_at(pos2(position.x, position.y))
+            .is_some_and(|layer_id| layer_id.order != Order::Background)
     }
 
     /// Create a frameless button with square sizing, as used in the toolbar.
@@ -376,6 +650,11 @@ impl Gui {
         self.rendering_context
             .make_current()
             .expect("Could not make RenderingContext current");
+
+        // Read before `self` is taken apart below, so the closure can borrow the fields it needs
+        // without also holding a borrow of the whole `Gui`.
+        let is_loading = self.is_loading();
+
         let Self {
             rendering_context,
             context,
@@ -383,6 +662,11 @@ impl Gui {
             location,
             location_dirty,
             favicon_textures,
+            #[cfg(target_os = "macos")]
+            inference,
+            #[cfg(target_os = "macos")]
+            chat_open,
+            settings,
             ..
         } = self;
 
@@ -402,6 +686,31 @@ impl Gui {
                         ui.available_size(),
                         egui::Layout::left_to_right(egui::Align::Center),
                         |ui| {
+                            if ui.input(|input| {
+                                input
+                                    .clone()
+                                    .consume_key(Modifiers::COMMAND | Modifiers::SHIFT, Key::H)
+                            }) {
+                                *location_dirty = false;
+                                window.queue_user_interface_command(UserInterfaceCommand::GoHome);
+                            }
+                            if ui.input(|input| {
+                                input.clone().consume_key(Modifiers::COMMAND, Key::D)
+                            }) {
+                                window.queue_user_interface_command(
+                                    UserInterfaceCommand::ToggleBookmark,
+                                );
+                            }
+                            if ui.input(|input| {
+                                input
+                                    .clone()
+                                    .consume_key(Modifiers::COMMAND | Modifiers::SHIFT, Key::T)
+                            }) {
+                                window.queue_user_interface_command(
+                                    UserInterfaceCommand::ReopenClosedWebView,
+                                );
+                            }
+
                             let back_button =
                                 ui.add_enabled(self.can_go_back, Gui::toolbar_button("⏴"));
                             back_button.widget_info(|| {
@@ -426,34 +735,108 @@ impl Gui {
                                 window.queue_user_interface_command(UserInterfaceCommand::Forward);
                             }
 
-                            match self.load_status {
-                                LoadStatus::Started | LoadStatus::HeadParsed => {
-                                    let stop_button = ui.add(Gui::toolbar_button("X"));
-                                    stop_button.widget_info(|| {
-                                        let mut info = WidgetInfo::new(WidgetType::Button);
-                                        info.label = Some("Stop".into());
-                                        info
-                                    });
-                                    if stop_button.clicked() {
-                                        warn!("Do not support stop yet.");
-                                    }
-                                },
-                                LoadStatus::Complete => {
-                                    let reload_button = ui.add(Gui::toolbar_button("↻"));
-                                    reload_button.widget_info(|| {
-                                        let mut info = WidgetInfo::new(WidgetType::Button);
-                                        info.label = Some("Reload".into());
-                                        info
-                                    });
-                                    if reload_button.clicked() {
-                                        *location_dirty = false;
-                                        window.queue_user_interface_command(
-                                            UserInterfaceCommand::Reload,
-                                        );
-                                    }
-                                },
+                            let home_button = ui.add(Gui::toolbar_button("⌂"));
+                            home_button.widget_info(|| {
+                                let mut info = WidgetInfo::new(WidgetType::Button);
+                                info.label = Some("Home".into());
+                                info
+                            });
+                            if home_button.clicked() {
+                                *location_dirty = false;
+                                window.queue_user_interface_command(UserInterfaceCommand::GoHome);
+                            }
+
+                            #[cfg(target_os = "macos")]
+                            {
+                                let chat_button = ui.add(Gui::toolbar_button("✦"));
+                                chat_button.widget_info(|| {
+                                    let mut info = WidgetInfo::new(WidgetType::Button);
+                                    info.label = Some("Chat".into());
+                                    info
+                                });
+                                if chat_button.clicked() ||
+                                    ui.input(|input| {
+                                        input.clone().consume_key(
+                                            Modifiers::COMMAND | Modifiers::SHIFT,
+                                            Key::A,
+                                        )
+                                    })
+                                {
+                                    *chat_open = !*chat_open;
+                                }
+                            }
+
+                            // Stop is only offered while the load is still moving:
+                            // `is_loading` treats a stalled load as finished, so a page
+                            // that reports loading forever still leaves Reload reachable
+                            // from the toolbar.
+                            let loading = is_loading;
+                            let (reload_glyph, reload_label, reload_command) = if loading {
+                                ("✕", "Stop", UserInterfaceCommand::Stop)
+                            } else {
+                                ("↻", "Reload", UserInterfaceCommand::Reload)
+                            };
+                            let reload_button = ui.add(Gui::toolbar_button(reload_glyph));
+                            reload_button.widget_info(|| {
+                                let mut info = WidgetInfo::new(WidgetType::Button);
+                                info.label = Some(reload_label.into());
+                                info
+                            });
+                            if reload_button.clicked() {
+                                *location_dirty = false;
+                                window.queue_user_interface_command(reload_command);
                             }
                             ui.add_space(2.0);
+
+                            let active_url =
+                                window.active_webview().and_then(|webview| webview.url());
+                            let bookmarkable = active_url
+                                .as_ref()
+                                .is_some_and(|url| matches!(url.scheme(), "http" | "https"));
+                            let is_bookmarked = active_url
+                                .as_ref()
+                                .is_some_and(|url| state.is_bookmarked(url));
+                            let bookmark_button = ui.add_enabled(
+                                bookmarkable,
+                                Gui::toolbar_button(if is_bookmarked { "★" } else { "☆" }),
+                            );
+                            bookmark_button.widget_info(|| {
+                                let mut info = WidgetInfo::new(WidgetType::Button);
+                                info.label = Some(if is_bookmarked {
+                                    "Remove bookmark".into()
+                                } else {
+                                    "Add bookmark".into()
+                                });
+
+                                info
+                            });
+                            if bookmark_button.clicked() {
+                                window.queue_user_interface_command(
+                                    UserInterfaceCommand::ToggleBookmark,
+                                );
+                            }
+
+                            ui.menu_button("☰", |ui| {
+                                ui.strong("Bookmarks");
+                                let bookmarks = state.bookmarks();
+                                if bookmarks.is_empty() {
+                                    ui.label("No bookmarks yet");
+                                }
+                                for bookmark in bookmarks {
+                                    let label = bookmark
+                                        .host_str()
+                                        .map(|host| truncate_with_ellipsis(host, 28))
+                                        .unwrap_or_else(|| {
+                                            truncate_with_ellipsis(bookmark.as_str(), 28)
+                                        });
+                                    if ui.button(label).on_hover_text(bookmark.as_str()).clicked() {
+                                        window.queue_user_interface_command(
+                                            UserInterfaceCommand::Go(bookmark.to_string()),
+                                        );
+                                        ui.close();
+                                    }
+                                }
+                            });
 
                             ui.allocate_ui_with_layout(
                                 ui.available_size(),
@@ -462,11 +845,11 @@ impl Gui {
                                     let mut experimental_preferences_enabled =
                                         state.experimental_preferences_enabled();
                                     let prefs_toggle = ui
-                                        .toggle_value(&mut experimental_preferences_enabled, "☢")
-                                        .on_hover_text("Enable experimental prefs");
+                                        .toggle_value(&mut experimental_preferences_enabled, "⚙")
+                                        .on_hover_text("Experimental web features");
                                     prefs_toggle.widget_info(|| {
                                         let mut info = WidgetInfo::new(WidgetType::Button);
-                                        info.label = Some("Enable experimental preferences".into());
+                                        info.label = Some("Experimental web features".into());
                                         info.selected = Some(experimental_preferences_enabled);
                                         info
                                     });
@@ -553,6 +936,7 @@ impl Gui {
                                         info.label = Some("New tab".into());
                                         info
                                     });
+
                                     if new_tab_button.clicked() {
                                         window.queue_user_interface_command(
                                             UserInterfaceCommand::NewWebView,
@@ -575,10 +959,55 @@ impl Gui {
                         })
                 });
 
-                *toolbar_height = Length::new(outer.response.rect.max.y);
+                // A thin colorful progress strip shown below the tab bar while the active
+                // WebView is still loading. It sits in its own top panel so that it spans the
+                // full window width and pushes the WebView down without overlapping the tabs.
+                let mut toolbar_bottom = outer.response.rect.max.y;
+                if is_loading {
+                    let progress_bar_color = settings.progress_bar_color();
+                    let progress = Panel::top("loading_progress").show_inside(ctx, |ui| {
+                        Self::show_loading_progress_bar(ui, progress_bar_color);
+                    });
+                    toolbar_bottom = progress.response.rect.max.y;
+                }
+
+                *toolbar_height = Length::new(toolbar_bottom);
             } else {
                 *toolbar_height = Length::default();
             }
+
+            // Drawn before `available_rect_before_wrap` is read below, so the
+            // WebView is resized around the panel instead of being covered by
+            // it. Opening the panel narrows the page rather than hiding part
+            // of it.
+            #[cfg(target_os = "macos")]
+            if *chat_open {
+                let frame = egui::Frame::default()
+                    .fill(ctx.style().visuals.window_fill)
+                    .inner_margin(8.0);
+                Panel::right("chat")
+                    .frame(frame)
+                    .default_size(320.0)
+                    .min_size(240.0)
+                    .resizable(true)
+                    .show_inside(ctx, |ui| Gui::chat_panel(ui, inference, settings));
+            }
+
+            // The application menu can only raise a flag: AppKit delivers the
+            // click while winit owns the run loop. Only the focused window
+            // claims it, so Settings opens once instead of once per window.
+            #[cfg(target_os = "macos")]
+            #[cfg(target_os = "macos")]
+            {
+                if headed_window.winit_window().has_focus() &&
+                    crate::platform::macos::menu::take_settings_request()
+                {
+                    settings.open(inference);
+                }
+                settings.show(ctx, inference);
+            }
+            #[cfg(not(target_os = "macos"))]
+            settings.show(ctx);
 
             let scale =
                 Scale::<_, DeviceIndependentPixel, DevicePixel>::new(ctx.pixels_per_point());
@@ -697,6 +1126,19 @@ impl Gui {
         }
     }
 
+    /// Whether the chrome should still be presenting the active `WebView` as loading.
+    ///
+    /// This is not simply `load_status != Complete`. `Complete` means `document.readyState` is
+    /// `"complete"`, so a single subresource that never resolves -- a hanging XHR, a script the
+    /// engine cannot finish -- leaves a fully rendered, perfectly usable page marked as loading
+    /// forever, and the bar under the tab strip animates until the tab is closed. A load that
+    /// has not moved in [`LOAD_STALL_TIMEOUT`] is treated as finished, because from the user's
+    /// side it is: whatever is outstanding is no longer producing anything to wait for.
+    fn is_loading(&self) -> bool {
+        self.load_status != LoadStatus::Complete &&
+            self.load_status_changed_at.elapsed() < LOAD_STALL_TIMEOUT
+    }
+
     fn update_load_status(&mut self, window: &ServoShellWindow) -> bool {
         let state_status = window
             .active_webview()
@@ -704,6 +1146,9 @@ impl Gui {
             .unwrap_or(LoadStatus::Complete);
         let old_status = std::mem::replace(&mut self.load_status, state_status);
         let status_changed = old_status != self.load_status;
+        if status_changed {
+            self.load_status_changed_at = Instant::now();
+        }
 
         // When the load status changes, we want the new changes to the URL to start
         // being reflected in the location bar.

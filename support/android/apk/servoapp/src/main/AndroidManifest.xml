@@ -2,15 +2,47 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android" android:installLocation="auto">
 
     <uses-feature android:glEsVersion="0x00030000" android:required="true" />
-    <uses-feature android:name="android.hardware.bluetooth_le" android:required="true"/>
-    <uses-permission android:name="android.permission.INTERNET" />
-    <uses-permission android:name="android.permission.BLUETOOTH" />
-    <uses-permission android:name="android.permission.BLUETOOTH_ADMIN"/>
-    <uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>
-    <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" />
-    <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" />
 
-    <application android:label="@string/app_name" android:icon="@mipmap/servo">
+    <!-- Servo's own manifest also declares android.hardware.bluetooth_le with
+         required="true", plus BLUETOOTH, BLUETOOTH_ADMIN, READ_EXTERNAL_STORAGE
+         and WRITE_EXTERNAL_STORAGE. All four are dropped here.
+
+         The bluetooth_le feature is the one that actually breaks a release: a
+         required="true" uses-feature is a Play Store *device filter*, so every
+         phone and tablet without BLE silently disappears from the app's
+         eligible device list, and the listing shows "not compatible" with no
+         explanation. WebBluetooth needs the native-bluetooth cargo feature,
+         which this build does not enable, so nothing is given up by removing
+         it. The two BLUETOOTH permissions go with it, and Play's data safety
+         form would otherwise have to account for them.
+
+         The storage permissions are unused by any code in this app. Nothing
+         under servoapp/ or ports/servoshell/egl/ ever reads them, and
+         WRITE_EXTERNAL_STORAGE has no effect at all above API 29 while still
+         drawing a Play policy declaration. -->
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
+    <!-- allowNativeHeapPointerTagging is not cosmetic: without it no page
+         renders at all. Android tags native heap pointers for apps targeting
+         API 30+, so malloc returns addresses with a non-zero top byte
+         (0xb4...). SpiderMonkey's NaN boxing packs a pointer into a 64-bit
+         value and asserts the high 16 bits are clear, so the first allocation
+         the script thread boxes trips `assert_eq!(ptrBits &
+         0xFFFF000000000000, 0)` in mozjs_sys jsval.rs and the thread dies.
+         The app stays up and the toolbar works, which makes this look like a
+         rendering failure rather than a crash. The page is simply blank
+         forever.
+
+         This is an upstream Servo bug, not something specific to this
+         product: nothing in Servo sets this attribute, and its own Android
+         build has targeted API 34 for some time, which is well past the 30
+         where tagging begins. Worth proposing on feature/smb-browser. -->
+    <application
+        android:label="@string/app_name"
+        android:icon="@mipmap/ic_launcher"
+        android:roundIcon="@mipmap/ic_launcher_round"
+        android:allowNativeHeapPointerTagging="false">
         <activity android:name=".MainActivity"
             android:configChanges="density|keyboardHidden|navigation|orientation|screenSize|uiMode"
             android:exported="true"

@@ -7,25 +7,27 @@
 use std::cell::{Cell, Ref, RefCell};
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
+use std::fs;
+use std::path::PathBuf;
 use std::rc::Rc;
 
 use crossbeam_channel::{Receiver, Sender, unbounded};
 use euclid::Rect;
 #[cfg(all(
     feature = "gamepad",
-    not(any(target_os = "android", target_env = "ohos"))
+    not(any(target_os = "android", target_os = "ios", target_env = "ohos"))
 ))]
 use gilrs::Event;
 use image::{DynamicImage, ImageFormat, RgbaImage};
 #[cfg(all(
     any(coverage, llvm_pgo),
-    any(target_os = "android", target_env = "ohos")
+    any(target_os = "android", target_os = "ios", target_env = "ohos")
 ))]
 use libc::c_char;
 use log::{error, info, warn};
 #[cfg(all(
     feature = "gamepad",
-    not(any(target_os = "android", target_env = "ohos"))
+    not(any(target_os = "android", target_os = "ios", target_env = "ohos"))
 ))]
 use servo::GamepadIndex;
 use servo::{
@@ -41,7 +43,7 @@ use url::Url;
 
 #[cfg(all(
     feature = "gamepad",
-    not(any(target_os = "android", target_env = "ohos"))
+    not(any(target_os = "android", target_os = "ios", target_env = "ohos"))
 ))]
 pub(crate) use crate::desktop::gamepad::ServoshellGamepadDelegate;
 use crate::prefs::{EXPERIMENTAL_PREFS, ServoShellPreferences};
@@ -50,7 +52,7 @@ use crate::window::{PlatformWindow, ServoShellWindow, ServoShellWindowId};
 
 #[cfg(all(
     any(coverage, llvm_pgo),
-    any(target_os = "android", target_env = "ohos")
+    any(target_os = "android", target_os = "ios", target_env = "ohos")
 ))]
 unsafe extern "C" {
     fn __llvm_profile_set_filename(file: *const c_char);
@@ -156,24 +158,90 @@ impl WebViewCollection {
 }
 
 /// A command received via the user interacting with the user interface.
-#[cfg_attr(any(target_os = "android", target_env = "ohos"), expect(dead_code))]
+#[cfg_attr(
+    any(target_os = "android", target_os = "ios", target_env = "ohos"),
+    expect(dead_code)
+)]
 pub(crate) enum UserInterfaceCommand {
     Go(String),
+    GoHome,
     Back,
     Forward,
     Reload,
+    Stop,
     ReloadAll,
     NewWebView,
+    ReopenClosedWebView,
+    ToggleBookmark,
     CloseWebView(WebViewId),
     NewWindow,
 }
 
+/// A deliberately small bookmark store. Keeping this in the embedder makes the
+/// feature dependable without adding another service or database to the browser.
+#[derive(Default)]
+pub(crate) struct BookmarkStore {
+    path: Option<PathBuf>,
+    entries: Vec<Url>,
+}
+
+impl BookmarkStore {
+    fn new(config_dir: Option<PathBuf>) -> Self {
+        let path = config_dir.map(|directory| directory.join("bookmarks.txt"));
+        let entries = path
+            .as_ref()
+            .and_then(|path| fs::read_to_string(path).ok())
+            .map(|contents| {
+                contents
+                    .lines()
+                    .filter_map(|line| Url::parse(line).ok())
+                    .collect()
+            })
+            .unwrap_or_default();
+        Self { path, entries }
+    }
+
+    fn contains(&self, url: &Url) -> bool {
+        self.entries.iter().any(|entry| entry == url)
+    }
+
+    fn entries(&self) -> Vec<Url> {
+        self.entries.clone()
+    }
+
+    fn toggle(&mut self, url: Url) {
+        if let Some(index) = self.entries.iter().position(|entry| entry == &url) {
+            self.entries.remove(index);
+        } else {
+            self.entries.push(url);
+        }
+        self.persist();
+    }
+
+    fn persist(&self) {
+        let Some(path) = &self.path else {
+            return;
+        };
+        let contents = self
+            .entries
+            .iter()
+            .map(Url::as_str)
+            .collect::<Vec<_>>()
+            .join("\n");
+        if let Err(error) = fs::write(path, contents) {
+            warn!("failed to save bookmarks to {}: {error}", path.display());
+        }
+    }
+}
+
 pub(crate) struct RunningAppState {
+    /// User bookmarks shared by every window in this browser session.
+    bookmarks: RefCell<BookmarkStore>,
     /// The gamepad provider, used for handling gamepad events and set on each WebView.
     /// May be `None` if gamepad support is disabled or failed to initialize.
     #[cfg(all(
         feature = "gamepad",
-        not(any(target_os = "android", target_env = "ohos"))
+        not(any(target_os = "android", target_os = "ios", target_env = "ohos"))
     ))]
     gamepad_delegate: Option<Rc<ServoshellGamepadDelegate>>,
 
@@ -235,12 +303,13 @@ impl RunningAppState {
     pub(crate) fn new(
         servo: Servo,
         servoshell_preferences: ServoShellPreferences,
+        config_dir: Option<PathBuf>,
         event_loop_waker: Box<dyn EventLoopWaker>,
         user_content_manager: Rc<UserContentManager>,
         default_preferences: Preferences,
         #[cfg(all(
             feature = "gamepad",
-            not(any(target_os = "android", target_env = "ohos"))
+            not(any(target_os = "android", target_os = "ios", target_env = "ohos"))
         ))]
         gamepad_delegate: Option<Rc<ServoshellGamepadDelegate>>,
     ) -> Self {
@@ -261,11 +330,12 @@ impl RunningAppState {
             Cell::new(servoshell_preferences.experimental_preferences_enabled);
 
         Self {
+            bookmarks: RefCell::new(BookmarkStore::new(config_dir)),
             windows: Default::default(),
             focused_window: Default::default(),
             #[cfg(all(
                 feature = "gamepad",
-                not(any(target_os = "android", target_env = "ohos"))
+                not(any(target_os = "android", target_os = "ios", target_env = "ohos"))
             ))]
             gamepad_delegate,
             webdriver_senders: RefCell::default(),
@@ -280,6 +350,18 @@ impl RunningAppState {
             experimental_preferences_enabled,
             accessibility_active: Cell::new(false),
         }
+    }
+
+    pub(crate) fn bookmarks(&self) -> Vec<Url> {
+        self.bookmarks.borrow().entries()
+    }
+
+    pub(crate) fn is_bookmarked(&self, url: &Url) -> bool {
+        self.bookmarks.borrow().contains(url)
+    }
+
+    pub(crate) fn toggle_bookmark(&self, url: Url) {
+        self.bookmarks.borrow_mut().toggle(url)
     }
 
     pub(crate) fn open_window(
@@ -316,7 +398,10 @@ impl RunningAppState {
         *self.focused_window.borrow_mut() = Some(window);
     }
 
-    #[cfg_attr(any(target_os = "android", target_env = "ohos"), expect(dead_code))]
+    #[cfg_attr(
+        any(target_os = "android", target_os = "ios", target_env = "ohos"),
+        expect(dead_code)
+    )]
     pub(crate) fn window(&self, id: ServoShellWindowId) -> Option<Rc<ServoShellWindow>> {
         self.windows.borrow().get(&id).cloned()
     }
@@ -337,7 +422,7 @@ impl RunningAppState {
 
     #[cfg(all(
         feature = "gamepad",
-        not(any(target_os = "android", target_env = "ohos"))
+        not(any(target_os = "android", target_os = "ios", target_env = "ohos"))
     ))]
     pub(crate) fn gamepad_delegate(&self) -> Option<Rc<ServoshellGamepadDelegate>> {
         self.gamepad_delegate.clone()
@@ -354,7 +439,7 @@ impl RunningAppState {
 
         #[cfg(all(
             any(coverage, llvm_pgo),
-            any(target_os = "android", target_env = "ohos")
+            any(target_os = "android", target_os = "ios", target_env = "ohos")
         ))]
         {
             use std::ffi::CString;
@@ -375,12 +460,18 @@ impl RunningAppState {
         }
     }
 
-    #[cfg_attr(any(target_os = "android", target_env = "ohos"), expect(dead_code))]
+    #[cfg_attr(
+        any(target_os = "android", target_os = "ios", target_env = "ohos"),
+        expect(dead_code)
+    )]
     pub(crate) fn experimental_preferences_enabled(&self) -> bool {
         self.experimental_preferences_enabled.get()
     }
 
-    #[cfg_attr(any(target_os = "android", target_env = "ohos"), expect(dead_code))]
+    #[cfg_attr(
+        any(target_os = "android", target_os = "ios", target_env = "ohos"),
+        expect(dead_code)
+    )]
     pub(crate) fn set_experimental_preferences_enabled(&self, new_value: bool) {
         let old_value = self.experimental_preferences_enabled.replace(new_value);
         if old_value == new_value {
@@ -398,8 +489,8 @@ impl RunningAppState {
                 return true;
             }
 
-            if let Some(focused_window) = self.focused_window() &&
-                Rc::ptr_eq(window, &focused_window)
+            if let Some(focused_window) = self.focused_window()
+                && Rc::ptr_eq(window, &focused_window)
             {
                 *self.focused_window.borrow_mut() = None;
             }
@@ -428,7 +519,7 @@ impl RunningAppState {
 
         /* #[cfg(all(
             feature = "gamepad",
-            not(any(target_os = "android", target_env = "ohos"))
+            not(any(target_os = "android", target_os = "ios", target_env = "ohos"))
         ))]
         if servo::pref!(dom_gamepad_enabled) {
             self.handle_gamepad_events();
@@ -448,8 +539,8 @@ impl RunningAppState {
 
         // When no more windows are open, exit the application. Do not do this when
         // running WebDriver, which expects to keep running with no WebView open.
-        if self.servoshell_preferences.webdriver_port.get().is_none() &&
-            self.windows.borrow().is_empty()
+        if self.servoshell_preferences.webdriver_port.get().is_none()
+            && self.windows.borrow().is_empty()
         {
             self.schedule_exit()
         }
@@ -636,7 +727,7 @@ impl RunningAppState {
 
     #[cfg(all(
         feature = "gamepad",
-        not(any(target_os = "android", target_env = "ohos"))
+        not(any(target_os = "android", target_os = "ios", target_env = "ohos"))
     ))]
     pub(crate) fn handle_gamepad_events(
         &self,
@@ -656,7 +747,7 @@ impl RunningAppState {
         gamepad_delegate.handle_gamepad_events(event, gamepad_name, gamepad_index, active_webview);
     }
 
-    #[cfg(not(any(target_os = "android", target_env = "ohos")))]
+    #[cfg(not(any(target_os = "android", target_os = "ios", target_env = "ohos")))]
     pub(crate) fn handle_focused(&self, window: Rc<ServoShellWindow>) {
         *self.focused_window.borrow_mut() = Some(window);
     }
@@ -684,7 +775,7 @@ impl RunningAppState {
         }
     }
 
-    #[cfg(not(any(target_os = "android", target_env = "ohos")))]
+    #[cfg(not(any(target_os = "android", target_os = "ios", target_env = "ohos")))]
     pub(crate) fn set_accessibility_active(&self, active: bool) {
         let was_active = self.accessibility_active.replace(active);
         if active == was_active {
@@ -916,8 +1007,29 @@ impl ServoDelegate for ServoShellServoDelegate {
 
     fn show_console_message(&self, level: ConsoleLogLevel, message: String) {
         // For messages without a WebView context, apply platform-specific behavior
-        #[cfg(not(any(target_os = "android", target_env = "ohos")))]
+        #[cfg(not(any(target_os = "android", target_os = "ios", target_env = "ohos")))]
         println!("{message}");
         log::log!(level.into(), "{message}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use url::Url;
+
+    use super::BookmarkStore;
+
+    #[test]
+    fn bookmarks_toggle_without_duplicate_entries() {
+        let url = Url::parse("https://example.com/work").unwrap();
+        let mut bookmarks = BookmarkStore::default();
+
+        bookmarks.toggle(url.clone());
+        assert!(bookmarks.contains(&url));
+        assert_eq!(bookmarks.entries(), vec![url.clone()]);
+
+        bookmarks.toggle(url.clone());
+        assert!(!bookmarks.contains(&url));
+        assert!(bookmarks.entries().is_empty());
     }
 }

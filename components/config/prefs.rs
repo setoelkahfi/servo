@@ -338,6 +338,18 @@ pub struct Preferences {
     /// The goal of these two values is to allow tuning Servo's parallelism for both wide
     /// and deep trees.
     pub layout_parallelism_job_size_minimum: u64,
+    /// Gates a grab-bag of CSS properties (mask-image, contain, appearance, and
+    /// others) that stylo/Gecko implement but that have no consumer anywhere in
+    /// Servo's layout or paint code. Defaulting this off (upstream's choice)
+    /// means an author declaration like `mask-image` is dropped at parse time —
+    /// not merely "unpainted" — so authors relying on `@supports (mask-image: …)`
+    /// or a masked, dark-background icon pattern (which App Store product pages
+    /// use) get the *unmasked* background box rendered solid, not a graceful
+    /// fallback. smbCloud Browser turns this on so `mask-image` at least parses and
+    /// is visible to layout, which is what lets `build_background_for_painter`
+    /// (see display_list/mod.rs) suppress that background paint instead of
+    /// drawing a wrong opaque box. None of this bucket's other properties have
+    /// any Servo-side consumer, so enabling it is otherwise a no-op.
     pub layout_unimplemented: bool,
     // feature: Variable fonts | #38800 | Web/CSS/Guides/Fonts/Variable_fonts
     pub layout_variable_fonts_enabled: bool,
@@ -569,7 +581,7 @@ impl Preferences {
             layout_threads: 3,
             layout_parallelism_job_count_minimum: 4,
             layout_parallelism_job_size_minimum: 16,
-            layout_unimplemented: false,
+            layout_unimplemented: true,
             layout_variable_fonts_enabled: false,
             layout_writing_mode_enabled: false,
             media_glvideo_enabled: false,
@@ -671,29 +683,29 @@ impl UserAgentPlatform {
                 if cfg!(all(target_os = "windows", target_arch = "x86_64")) =>
             {
                 format!(
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; {ARCH}rv:140.0) Servo/{SERVO_VERSION} Firefox/140.0"
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; {ARCH}; rv:153.0) Servo/{SERVO_VERSION} Firefox/153.0"
                 )
             },
             UserAgentPlatform::Desktop if cfg!(target_os = "macos") => {
                 format!(
-                    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:140.0) Servo/{SERVO_VERSION} Firefox/140.0"
+                    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:153.0) Servo/{SERVO_VERSION} Firefox/153.0"
                 )
             },
             UserAgentPlatform::Desktop => {
                 format!(
-                    "Mozilla/5.0 (X11; Linux {ARCH}; rv:140.0) Servo/{SERVO_VERSION} Firefox/140.0"
+                    "Mozilla/5.0 (X11; Linux {ARCH}; rv:153.0) Servo/{SERVO_VERSION} Firefox/153.0"
                 )
             },
             UserAgentPlatform::Android => {
                 format!(
-                    "Mozilla/5.0 (Android 10; Mobile; rv:140.0) Servo/{SERVO_VERSION} Firefox/140.0"
+                    "Mozilla/5.0 (Android 10; Mobile; rv:153.0) Servo/{SERVO_VERSION} Firefox/153.0"
                 )
             },
             UserAgentPlatform::OpenHarmony => format!(
-                "Mozilla/5.0 (OpenHarmony; Mobile; rv:140.0) Servo/{SERVO_VERSION} Firefox/140.0"
+                "Mozilla/5.0 (OpenHarmony; Mobile; rv:153.0) Servo/{SERVO_VERSION} Firefox/153.0"
             ),
             UserAgentPlatform::Ios => format!(
-                "Mozilla/5.0 (iPhone; CPU iPhone OS 18_6 like Mac OS X; rv:140.0) Servo/{SERVO_VERSION} Firefox/140.0"
+                "Mozilla/5.0 (iPhone; CPU iPhone OS 18_6 like Mac OS X; rv:153.0) Servo/{SERVO_VERSION} Firefox/153.0"
             ),
         }
     }

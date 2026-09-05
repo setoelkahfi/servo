@@ -12,7 +12,6 @@ use euclid::{Box2D, Point2D, Rect, Scale, SideOffsets2D, Size2D, UnknownUnit, Ve
 use fonts::ShapedTextSlice;
 use gradient::WebRenderGradient;
 use layout_api::ReflowStatistics;
-use net_traits::image_cache::Image as CachedImage;
 use paint_api::display_list::{PaintDisplayListInfo, SpatialTreeNodeInfo};
 use servo_arc::Arc as ServoArc;
 use servo_base::id::{PipelineId, ScrollTreeNodeId};
@@ -36,8 +35,8 @@ use style::properties::longhands::visibility::computed_value::T as Visibility;
 use style::properties::style_structs::Border;
 use style::values::computed::basic_shape::ClipPath as ComputedClipPath;
 use style::values::computed::{
-    BorderImageSideWidth, BorderImageWidth, BorderStyle, LengthPercentage,
-    NonNegativeLengthOrNumber, NumberOrPercentage, OutlineStyle,
+    BorderImageSideWidth, BorderImageWidth, BorderStyle, Image as ComputedImage,
+    LengthPercentage, NonNegativeLengthOrNumber, NumberOrPercentage, OutlineStyle,
 };
 use style::values::generics::NonNegative;
 use style::values::generics::color::ColorOrAuto;
@@ -1046,7 +1045,7 @@ impl Fragment {
         let mut baseline_origin = rect.origin;
         baseline_origin.y += fragment.font_metrics.ascent;
 
-        let include_whitespace = fragment.run_data.selection.is_some() ||
+        let include_whitespace = fragment.run_data.selection.borrow().is_some() ||
             state
                 .text_decorations
                 .iter()
@@ -1311,22 +1310,14 @@ impl Fragment {
         justification_adjustment: Au,
     ) {
         let run_data = &fragment.run_data;
-        let Some(shared_selection) = &run_data.selection else {
+        let Some(selection) = *run_data.selection.borrow() else {
             return;
         };
-
-        let shared_selection = shared_selection.borrow();
-        if !shared_selection.enabled {
-            return;
-        }
 
         // The selection character range is in pre-transformed character offsets, so use the
         // OffsetMap contained within `run_data` to convert it to post-transformed character
         // offsets. This allows updating this selection directly from the DOM (skipping layout).
-        let dom_selection_range = &shared_selection.character_range;
-        let selection_character_range = run_data.map_dom_range_to_transformed_range(
-            Utf32CodeUnits(dom_selection_range.start)..Utf32CodeUnits(dom_selection_range.end),
-        );
+        let selection_character_range = run_data.map_dom_range_to_transformed_range(selection);
 
         if fragment.character_range_in_dom_node.start > selection_character_range.end ||
             fragment.character_range_in_dom_node.end < selection_character_range.start
@@ -1405,6 +1396,10 @@ impl Fragment {
                     .wr()
                     .push_rect(&selection_common, selection_rect, rgba(*selection_color));
             }
+            return;
+        }
+
+        if !fragment.run_data.paint_caret {
             return;
         }
 
@@ -1644,6 +1639,28 @@ impl<'a> BuilderForBoxFragment<'a> {
         state: &TraversalState,
         painter: &BackgroundPainter,
     ) {
+        // `mask-image` (and its `-webkit-` alias) has no rendering implementation:
+        // nothing here or in `build_background_image` clips the background to the
+        // mask shape. Painting the background regardless would draw the full,
+        // unmasked box — usually an opaque, wrong-looking rectangle, since this
+        // pattern (a solid-colored box masked to an icon shape) is how sites
+        // commonly draw monochrome icons. Skipping the background paint entirely
+        // is closer to the author's intent than an incorrect solid box: the
+        // element still takes up its layout box, it just isn't painted.
+        //
+        // TODO: implement real `mask-image` support (resolve the mask image and
+        // apply it as a WebRender clip) and remove this fallback.
+        let is_masked = painter
+            .style
+            .get_svg()
+            .mask_image
+            .0
+            .iter()
+            .any(|image| *image != ComputedImage::None);
+        if is_masked {
+            return;
+        }
+
         let b = painter.style.get_background();
         let background_color = painter.style.resolve_color(&b.background_color);
         if background_color.alpha > 0.0 {
@@ -1844,34 +1861,22 @@ impl<'a> BuilderForBoxFragment<'a> {
                     let layer =
                         background::layout_layer(self, painter, builder, state, index, intrinsic);
 
-                    let image_wr_key = match image {
-                        CachedImage::Raster(raster_image) => raster_image.id,
-                        CachedImage::Vector(vector_image) => {
-                            let scale = builder.device_pixel_ratio.get();
-                            let default_size: DeviceIntSize =
-                                Size2D::new(size.width * scale, size.height * scale).to_i32();
-                            let layer_size = layer.as_ref().map(|layer| {
-                                Size2D::new(
-                                    layer.tile_size.width * scale,
-                                    layer.tile_size.height * scale,
-                                )
-                                .to_i32()
-                            });
+                    let scale = builder.device_pixel_ratio.get();
+                    let default_size: DeviceIntSize =
+                        Size2D::new(size.width * scale, size.height * scale).to_i32();
+                    let preferred_size = layer.as_ref().map(|layer| {
+                        Size2D::new(
+                            layer.tile_size.width * scale,
+                            layer.tile_size.height * scale,
+                        )
+                        .to_i32()
+                    });
 
-                            node.and_then(|node| {
-                                let size = layer_size.unwrap_or(default_size);
-                                builder.image_resolver.rasterize_vector_image(
-                                    vector_image.id,
-                                    size,
-                                    node,
-                                    vector_image.svg_id,
-                                )
-                            })
-                            .and_then(|rasterized_image| rasterized_image.id)
-                        },
-                    };
-
-                    let Some(image_key) = image_wr_key else {
+                    let Some(image_key) = builder.image_resolver.image_key_from_cached_image(
+                        &image,
+                        preferred_size.unwrap_or(default_size),
+                        node,
+                    ) else {
                         continue;
                     };
 
@@ -2106,24 +2111,13 @@ impl<'a> BuilderForBoxFragment<'a> {
         {
             Err(_) => return false,
             Ok(ResolvedImage::Image { image, size }) => {
-                let image_key = match image {
-                    CachedImage::Raster(raster_image) => raster_image.id,
-                    CachedImage::Vector(vector_image) => {
-                        let scale = builder.device_pixel_ratio.get();
-                        let size = Size2D::new(size.width * scale, size.height * scale).to_i32();
-                        node.and_then(|node| {
-                            builder.image_resolver.rasterize_vector_image(
-                                vector_image.id,
-                                size,
-                                node,
-                                vector_image.svg_id,
-                            )
-                        })
-                        .and_then(|rasterized_image| rasterized_image.id)
-                    },
-                };
-
-                let Some(key) = image_key else {
+                let scale = builder.device_pixel_ratio.get();
+                let raster_size = Size2D::new(size.width * scale, size.height * scale).to_i32();
+                let Some(key) =
+                    builder
+                        .image_resolver
+                        .image_key_from_cached_image(&image, raster_size, node)
+                else {
                     return false;
                 };
 

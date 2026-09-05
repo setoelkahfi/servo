@@ -5,5 +5,25 @@
 "gstosxaudio",
 "gstosxvideo",
 // gst-plugins-bad
-"gstapplemedia",
+//
+// smbCloud Browser: "gstapplemedia" is deliberately absent, and is not upstreamable
+// -- it is a distribution constraint of this product, not a Servo bug.
+//
+// That plugin's avfvideosrc imports the AVFoundation capture classes
+// (AVCaptureDevice, AVCaptureSession, AVCaptureDeviceInput). Mac App Store
+// review scans the bundle for those references and reads them as the app
+// providing camera functionality, then rejects the submission unless it
+// declares com.apple.security.device.camera. smbCloud Browser has no camera feature
+// to back that entitlement with: navigator.mediaDevices and getUserMedia are
+// both gated on dom_webrtc_enabled, which defaults to false and stays off in
+// this build, so web content cannot reach a capture device at all.
+//
+// The cost is VideoToolbox hardware decode (vtdec) and AudioToolbox atdec.
+// gstlibav still decodes H.264 and AAC in software, at higher CPU and energy.
+//
+// This file is the only place the entry can go. It feeds both mach's dylib
+// collection (servo/gstreamer.py) and the runtime plugin list
+// (components/servo/gstreamer_plugins.rs), and Servo exits at startup when a
+// listed plugin is missing from the bundle -- so deleting only the dylib would
+// trade a rejection for a launch crash.
 ]

@@ -15,8 +15,11 @@ pub mod geometry;
 mod gui;
 pub(crate) mod headed_window;
 mod headless_window;
+#[cfg(target_os = "macos")]
+pub(crate) mod inference;
 mod keyutils;
 mod protocols;
+pub(crate) mod settings;
 mod tracing;
 #[cfg(feature = "webxr")]
 mod webxr;

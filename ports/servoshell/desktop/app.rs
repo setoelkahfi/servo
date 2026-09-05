@@ -86,6 +86,8 @@ impl App {
             protocols::urlinfo::UrlInfoProtocolHander::default(),
         );
         let _ =
+            protocol_registry.register("smb", protocols::servo::ServoProtocolHandler::default());
+        let _ =
             protocol_registry.register("servo", protocols::servo::ServoProtocolHandler::default());
         let _ = protocol_registry.register(
             "resource",
@@ -126,6 +128,7 @@ impl App {
         let running_state = Rc::new(RunningAppState::new(
             servo,
             self.servoshell_preferences.clone(),
+            self.opts.config_dir.clone(),
             self.waker.clone(),
             user_content_manager,
             self.preferences.clone(),
@@ -181,6 +184,12 @@ impl App {
 
 impl ApplicationHandler<AppEvent> for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
+        // winit builds the default macOS menubar during launch, which is over
+        // by the time the first `Resumed` arrives, so the menu is there to
+        // extend.
+        #[cfg(target_os = "macos")]
+        crate::platform::macos::menu::install_settings_item();
+
         self.init(Some(event_loop));
     }
 
@@ -231,6 +240,7 @@ impl ApplicationHandler<AppEvent> for App {
                     headed_window.handle_winit_app_event(state.clone(), app_event);
                 }
             },
+            #[cfg(feature = "gamepad")]
             AppEvent::Gamepad(event, gamepad_name, gamepad_index) => {
                 state.handle_gamepad_events(event, gamepad_name, gamepad_index);
             },

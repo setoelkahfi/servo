@@ -32,6 +32,7 @@ use background_hang_monitor_api::{
     BackgroundHangMonitor, BackgroundHangMonitorExitSignal, BackgroundHangMonitorRegister,
     HangAnnotation, MonitoredComponentId, MonitoredComponentType,
 };
+use bytes::Bytes;
 use chrono::{DateTime, Local};
 use crossbeam_channel::unbounded;
 use data_url::mime::Mime;
@@ -147,7 +148,7 @@ use crate::event_loop::script_window_proxies::ScriptWindowProxies;
 use crate::event_loop::svg_font::SvgFontResolver;
 use crate::event_loop::webdriver_handlers::{self, jsval_to_webdriver};
 use crate::fetch::fetch::FetchCanceller;
-use crate::fetch::network_listener::{FetchResponseListener, submit_timing};
+use crate::fetch::network_listener::submit_timing;
 use crate::messaging::{
     CommonScriptMsg, MainThreadScriptMsg, MixedMessage, ScriptEventLoopSender,
     ScriptThreadReceivers, ScriptThreadSenders,
@@ -546,24 +547,6 @@ impl ScriptThread {
 
     pub(crate) fn shared_style_locks(&self) -> &SharedRwLocks {
         &self.shared_style_locks
-    }
-
-    pub(crate) fn page_headers_available(
-        webview_id: WebViewId,
-        pipeline_id: PipelineId,
-        metadata: Option<&Metadata>,
-        origin: MutableOrigin,
-        cx: &mut js::context::JSContext,
-    ) -> Option<DomRoot<Document>> {
-        with_script_thread(|script_thread| {
-            script_thread.handle_page_headers_available(
-                webview_id,
-                pipeline_id,
-                metadata,
-                origin,
-                cx,
-            )
-        })
     }
 
     /// Process a single event as if it were the next event
@@ -2235,9 +2218,16 @@ impl ScriptThread {
                     node_id.as_deref(),
                 )
             },
-            DevtoolScriptControlMsg::Eval(code, id, frame_actor_id, reply) => {
-                self.debugger_global
-                    .fire_eval(cx, code.into(), id, None, frame_actor_id, reply);
+            DevtoolScriptControlMsg::Eval(code, id, frame_actor_id, eager, reply) => {
+                self.debugger_global.fire_eval(
+                    cx,
+                    code.into(),
+                    id,
+                    None,
+                    frame_actor_id,
+                    eager,
+                    reply,
+                );
             },
             DevtoolScriptControlMsg::GetPossibleBreakpoints(spidermonkey_id, result_sender) => {
                 self.debugger_global.fire_get_possible_breakpoints(
@@ -3109,7 +3099,7 @@ impl ScriptThread {
 
     /// We have received notification that the response associated with a load has completed.
     /// Kick off the document and frame tree creation process using the result.
-    fn handle_page_headers_available(
+    pub(crate) fn handle_page_headers_available(
         &self,
         webview_id: WebViewId,
         pipeline_id: PipelineId,
@@ -3955,7 +3945,7 @@ impl ScriptThread {
             return false;
         }
         let Ok(ConversionResult::Success(body)) =
-            DOMString::safe_from_jsval(cx, return_value.handle(), StringificationBehavior::Empty)
+            DOMString::from_jsval(cx, return_value.handle(), StringificationBehavior::Empty)
         else {
             return false;
         };
@@ -4062,14 +4052,14 @@ impl ScriptThread {
         };
 
         match message {
-            FetchResponseMsg::ProcessResponse(request_id, metadata) => {
-                self.handle_fetch_metadata(cx, pipeline_id, request_id, metadata)
+            FetchResponseMsg::ProcessResponse(_request_id, metadata) => {
+                self.handle_fetch_metadata(cx, pipeline_id, metadata)
             },
-            FetchResponseMsg::ProcessResponseChunk(request_id, chunk) => {
-                self.handle_fetch_chunk(cx, pipeline_id, request_id, chunk.0)
+            FetchResponseMsg::ProcessResponseChunk(_request_id, chunk) => {
+                self.handle_fetch_chunk(cx, pipeline_id, chunk)
             },
-            FetchResponseMsg::ProcessResponseEOF(request_id, eof, timing) => {
-                self.handle_fetch_eof(cx, pipeline_id, request_id, eof, timing)
+            FetchResponseMsg::ProcessResponseEOF(_request_id, eof, timing) => {
+                self.handle_fetch_eof(cx, pipeline_id, eof, timing)
             },
             FetchResponseMsg::ProcessCspViolations(request_id, violations) => {
                 self.handle_csp_violations(cx, pipeline_id, request_id, violations)
@@ -4083,7 +4073,6 @@ impl ScriptThread {
         &self,
         cx: &mut js::context::JSContext,
         id: PipelineId,
-        request_id: RequestId,
         fetch_metadata: Result<FetchMetadata, NetworkError>,
     ) {
         match fetch_metadata {
@@ -4099,7 +4088,7 @@ impl ScriptThread {
             .iter_mut()
             .find(|&&mut (pipeline_id, _)| pipeline_id == id);
         if let Some(&mut (_, ref mut ctxt)) = parser {
-            ctxt.process_response(cx, request_id, fetch_metadata);
+            ctxt.process_response(self, cx, fetch_metadata);
         }
     }
 
@@ -4107,15 +4096,14 @@ impl ScriptThread {
         &self,
         cx: &mut js::context::JSContext,
         pipeline_id: PipelineId,
-        request_id: RequestId,
-        chunk: Vec<u8>,
+        chunk: Bytes,
     ) {
         let mut incomplete_parser_contexts = self.incomplete_parser_contexts.0.borrow_mut();
         let parser = incomplete_parser_contexts
             .iter_mut()
             .find(|&&mut (parser_pipeline_id, _)| parser_pipeline_id == pipeline_id);
         if let Some(&mut (_, ref mut ctxt)) = parser {
-            ctxt.process_response_chunk(cx, request_id, chunk);
+            ctxt.process_response_chunk(cx, chunk);
         }
     }
 
@@ -4124,7 +4112,6 @@ impl ScriptThread {
         &self,
         cx: &mut js::context::JSContext,
         id: PipelineId,
-        request_id: RequestId,
         eof: Result<(), NetworkError>,
         timing: ResourceFetchTiming,
     ) {
@@ -4156,7 +4143,7 @@ impl ScriptThread {
                 submit_timing(cx, &iframe_ctx, &eof, &resource_timing);
             }
 
-            context.process_response_eof(cx, request_id, eof, timing);
+            context.process_response_eof(cx, eof, timing);
         }
     }
 
@@ -4272,14 +4259,12 @@ impl ScriptThread {
         let about_base_url = incomplete.load_data.about_base_url.clone();
         self.incomplete_loads.borrow_mut().push(incomplete);
 
-        let dummy_request_id = RequestId::default();
-        context.process_response(cx, dummy_request_id, Ok(FetchMetadata::Unfiltered(meta)));
+        context.process_response(self, cx, Ok(FetchMetadata::Unfiltered(meta)));
         context.set_policy_container(policy_container.as_ref());
         context.set_about_base_url(about_base_url);
-        context.process_response_chunk(cx, dummy_request_id, chunk.into());
+        context.process_response_chunk(cx, chunk.into());
         context.process_response_eof(
             cx,
-            dummy_request_id,
             Ok(()),
             ResourceFetchTiming::new(ResourceTimingType::None),
         );
@@ -4319,15 +4304,12 @@ impl ScriptThread {
             target_snapshot_params,
             load_origin,
         );
-        let dummy_request_id = RequestId::default();
-
-        context.process_response(cx, dummy_request_id, Ok(FetchMetadata::Unfiltered(meta)));
+        context.process_response(self, cx, Ok(FetchMetadata::Unfiltered(meta)));
         context.set_policy_container(policy_container.as_ref());
         context.set_about_base_url(about_base_url);
-        context.process_response_chunk(cx, dummy_request_id, chunk);
+        context.process_response_chunk(cx, Bytes::copy_from_slice(&chunk));
         context.process_response_eof(
             cx,
-            dummy_request_id,
             Ok(()),
             ResourceFetchTiming::new(ResourceTimingType::None),
         );

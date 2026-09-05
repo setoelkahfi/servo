@@ -1349,7 +1349,7 @@ impl RemoteWebFontDownloader {
         );
 
         let font_data = match fontsan::process(&font_data) {
-            Ok(bytes) => FontData::from_bytes(&bytes),
+            Ok(bytes) => FontData::from_vec(bytes),
             Err(error) => {
                 debug!(
                     "Sanitiser rejected web font url={:?} with {error:?}",
@@ -1393,7 +1393,7 @@ impl RemoteWebFontDownloader {
                     self.web_font_family_name, new_bytes
                 );
                 if self.response_valid {
-                    self.response_data.extend(new_bytes.0)
+                    self.response_data.extend(new_bytes)
                 }
                 DownloaderResponseResult::InProcess
             },

@@ -1,4 +1,5 @@
 import promptAction from '@ohos.promptAction';
+import { BusinessError } from '@kit.BasicServicesKit';
 import servoshell from 'libservoshell.so';
 
 function prompt_toast(msg: string) {
@@ -14,43 +15,47 @@ let storage = LocalStorage.getShared()
 @Entry(storage)
 @Component
 struct Index {
-  xComponentAttrs: XComponentAttrs = {
-    id: 'ServoDemo',
-    type: XComponentType.SURFACE,
-    libraryname: 'servoshell',
-  }
-
   // The state seem to be required to be on the top.
   @State urlToLoad: string = ""
   @State tablist: Array<number> = [0];
   @State currentIndex: number = 0;
+  private nextTabId: number = 1;
 
-  @Builder tabBuilder(title: string, index: number) {
+  reportCommandError(error: BusinessError): void {
+    console.error(`Browser command failed: ${error.message}`);
+    prompt_toast(this.getUIContext().getHostContext()!.resourceManager.getStringSync(
+      $r('app.string.browser_unavailable').id));
+  }
+
+  @Builder tabBuilder(id: number) {
     Row() {
-      Text(String(index))
-        .padding('10pt')
+      Text(String(id + 1))
+        .layoutWeight(1)
+        .maxLines(1)
       Button('X')
       .backgroundColor('#00000000')
-      .visibility(this.tablist.length>1 && index != 0 ? Visibility.Visible: Visibility.Hidden)
+      .width(40)
+      .height(40)
+      .visibility(id != 0 ? Visibility.Visible: Visibility.Hidden)
       .fontColor(Color.Black)
       .fontWeight(FontWeight.Bolder)
       .onClick((event) => {
-          this.currentIndex = 0;
-          servoshell.deleteWebview(index, this.tablist);
-          this.tablist.splice(index,1);
+          try {
+            const index = this.tablist.indexOf(id);
+            servoshell.deleteWebview(index, this.tablist);
+            this.currentIndex = 0;
+            this.tablist.splice(index,1);
+          } catch (error) {
+            this.reportCommandError(error as BusinessError);
+          }
         })
     }
-    .width(65)
-    .height(40)
+    .width(96)
+    .height(48)
+    .padding({ left: 8, right: 4 })
     .justifyContent(FlexAlign.Center)
-    .backgroundColor(this.currentIndex === index ? '#1B8381': Color.White)
+    .backgroundColor(this.tablist[this.currentIndex] === id ? '#1B8381': Color.White)
     .borderRadius(10)
-    .shadow({
-          radius: 10,
-          color: Color.Gray,
-          offsetX: 10,
-          offsetY: 10
-        })
   }
 
   aboutToAppear(): void {
@@ -65,24 +70,26 @@ struct Index {
   // Called when the user swipes from the right or left edge to the middle
   // Default behavior is bringing the app to the background.
   onBackPress(): boolean {
-    servoshell.goBack();
-    return true;
+    try {
+      return servoshell.goBack();
+    } catch (error) {
+      this.reportCommandError(error as BusinessError);
+      return false;
+    }
   }
 
   build() {
-    // We originally use `Column()` here, but for some reason the column
-    // extends beyond the edge of the screen. This does not happen with
-    // Flex.
-    Flex({ direction: FlexDirection.Column}) {
+    Column() {
       Row() {
         Button('+')
           .backgroundColor(Color.White)
           .fontColor(Color.Black)
           .fontWeight(FontWeight.Bolder)
           .fontSize(22)
-          .width('12%')
+          .width(40)
+          .height(48)
           .onClick((event) => {
-            const new_id = this.tablist[this.tablist.length-1]+1;
+            const new_id = this.nextTabId++;
             // the order is important as setting the new index will automatically create a new surface.
             servoshell.nextWindowId(new_id);
             this.currentIndex = this.tablist.push(new_id) - 1;
@@ -91,7 +98,8 @@ struct Index {
           .backgroundColor(Color.White)
           .fontColor(Color.Black)
           .fontWeight(FontWeight.Bolder)
-          .width('12%')
+          .width(40)
+          .height(48)
           .fontSize(12)
           .onClick(() => {
             this.onBackPress()
@@ -101,44 +109,63 @@ struct Index {
           .fontColor(Color.Black)
           .fontWeight(FontWeight.Bolder)
           .fontSize(12)
-          .width('12%')
+          .width(40)
+          .height(48)
           .onClick(() => {
-            servoshell.goForward()
+            try {
+              servoshell.goForward()
+            } catch (error) {
+              this.reportCommandError(error as BusinessError);
+            }
           })
         TextInput({ placeholder: 'URL', text: $$this.urlToLoad })
           .type(InputType.URL)
-          .width('76%')
+          .layoutWeight(1)
+          .height(48)
           .onChange((value) => {
             this.urlToLoad = value
           })
           .onSubmit((EnterKeyType) => {
-            servoshell.loadURL(this.urlToLoad)
-            console.info('Load URL: ', this.urlToLoad)
+            try {
+              servoshell.loadURL(this.urlToLoad)
+            } catch (error) {
+              this.reportCommandError(error as BusinessError);
+            }
           })
       }
+      .width('100%')
+      .height(48)
+      .flexShrink(0)
 
       Tabs({ barPosition: BarPosition.Start, index: this.currentIndex}) {
-        ForEach(this.tablist, (item: number, index: number) => {
+        ForEach(this.tablist, (item: number) => {
           TabContent() {
-            XComponent(this.xComponentAttrs)
+            XComponent({
+              id: `Servo${item}`,
+              type: XComponentType.SURFACE,
+              libraryname: 'servoshell'
+            })
+              .width('100%')
+              .height('100%')
               .focusable(true)
               .focusOnTouch(true)
-          }.tabBar(this.tabBuilder(String(item), index))
-        })
-      }.barHeight(40)
+          }.tabBar(this.tabBuilder(item))
+        }, (item: number) => String(item))
+      }.barHeight(48)
+      .barMode(BarMode.Scrollable)
+      .layoutWeight(1)
       .scrollable(false)
       .onChange((index: number) => {
         this.currentIndex = index;
-        servoshell.focusWebview(index, this.tablist);
+        try {
+          servoshell.focusWebview(index, this.tablist);
+        } catch (error) {
+          this.reportCommandError(error as BusinessError);
+        }
       })
       .backgroundColor('#e1e1e1')
     }
     .width('100%')
+    .height('100%')
   }
-}
-
-interface XComponentAttrs {
-  id: string;
-  type: number;
-  libraryname: string;
 }

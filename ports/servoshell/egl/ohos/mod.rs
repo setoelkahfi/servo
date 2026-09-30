@@ -131,6 +131,7 @@ static NEXT_WINDOW_ID: AtomicU64 = AtomicU64::new(0);
 static KEY_EVENT_CONVERTER: Mutex<KeyEventConverter> = Mutex::new(KeyEventConverter::new());
 
 static SERVO_CHANNEL: OnceLock<Sender<ServoAction>> = OnceLock::new();
+static CAN_GO_BACK: AtomicBool = AtomicBool::new(false);
 
 /// set special mode for graphics operation, see [https://developer.huawei.com/consumer/en/doc/harmonyos-faqs/faqs-arkgraphics-2d-14]
 fn set_efficient_window_method(window: *mut c_void) {
@@ -347,6 +348,13 @@ fn call(action: ServoAction) -> Result<(), CallError> {
     Ok(())
 }
 
+fn call_from_arkts(action: ServoAction) -> napi_ohos::Result<()> {
+    call(action).map_err(|error| {
+        error!("Could not dispatch browser command: {error:?}");
+        napi_ohos::Error::from_reason(format!("Browser engine unavailable: {error:?}"))
+    })
+}
+
 #[repr(transparent)]
 #[derive(Clone)]
 pub(crate) struct XComponentWrapper(*mut OH_NativeXComponent);
@@ -388,7 +396,7 @@ pub(super) enum ServoAction {
         height: i32,
     },
     FocusWindow(u32, Vec<u32>),
-    CreatePlatformWindow(XComponentWrapper, WindowWrapper),
+    CreatePlatformWindow(XComponentWrapper, WindowWrapper, u64),
     RemovePlatformWindow(u32, Vec<u32>),
 }
 
@@ -462,7 +470,16 @@ impl ServoAction {
                 servo.spin_event_loop();
             },
             LoadUrl(url) => servo.load_uri(url.as_str()),
-            GoBack => servo.go_back(),
+            GoBack => {
+                if servo
+                    .state
+                    .focused_window()
+                    .and_then(|window| window.active_webview())
+                    .is_some_and(|webview| webview.can_go_back())
+                {
+                    servo.go_back();
+                }
+            },
             GoForward => servo.go_forward(),
             TouchEvent {
                 kind,
@@ -525,7 +542,7 @@ impl ServoAction {
                     );
                 }
             },
-            CreatePlatformWindow(xcomponent, native_window) => {
+            CreatePlatformWindow(xcomponent, native_window, window_id) => {
                 let (window_handle, viewport_rect) =
                     get_raw_window_handle(xcomponent.0, native_window.0);
                 let display_handle = RawDisplayHandle::Ohos(OhosDisplayHandle::new());
@@ -543,9 +560,7 @@ impl ServoAction {
                     window_handle,
                     viewport_rect,
                     hidpi_factor,
-                    Some(ServoShellWindowId::from(
-                        NEXT_WINDOW_ID.load(std::sync::atomic::Ordering::SeqCst),
-                    )),
+                    Some(ServoShellWindowId::from(*window_id)),
                 );
             },
             RemovePlatformWindow(arkts_index, arkts_ids) => {
@@ -565,6 +580,16 @@ impl ServoAction {
                 }
             },
         };
+        // Publish the focused tab's state after every engine turn, including tab
+        // switches. Background-tab history must not capture the system Back gesture.
+        CAN_GO_BACK.store(
+            servo
+                .state
+                .focused_window()
+                .and_then(|window| window.active_webview())
+                .is_some_and(|webview| webview.can_go_back()),
+            Ordering::SeqCst,
+        );
     }
 }
 
@@ -593,15 +618,7 @@ unsafe extern "C" fn on_vsync_cb(
     }
 }
 
-fn main_thread(init_opts: InitOpts) {
-    let (tx, rx): (Sender<ServoAction>, Receiver<ServoAction>) = mpsc::channel();
-
-    SERVO_CHANNEL
-        .set(tx.clone())
-        .expect("Servo channel already initialized");
-
-    log::info!("Servo main-thread channel initialized");
-
+fn main_thread(init_opts: InitOpts, tx: Sender<ServoAction>, rx: Receiver<ServoAction>) {
     let wakeup = Box::new(WakeupCallback::new(tx));
 
     let servo = init_app(init_opts, wakeup).expect("Servo initialization failed");
@@ -616,7 +633,6 @@ fn main_thread(init_opts: InitOpts) {
 
 #[unsafe(no_mangle)]
 extern "C" fn on_surface_created_cb(xcomponent: *mut OH_NativeXComponent, window: *mut c_void) {
-    static FIRST_WINDOW: AtomicBool = AtomicBool::new(true);
     info!("on_surface_created_cb");
     #[cfg(feature = "tracing-hitrace")]
     let _ = hitrace::ScopedTrace::start_trace(&c"on_surface_created_cb");
@@ -624,23 +640,12 @@ extern "C" fn on_surface_created_cb(xcomponent: *mut OH_NativeXComponent, window
     let xc_wrapper = XComponentWrapper(xcomponent);
     let window_wrapper = WindowWrapper(window);
 
-    // TODO: This if will be removed once we add multi-window support in a follow-up PR.
-    // This function will always be invoked on the UI thread, so there is no concurrency.
-    if FIRST_WINDOW.load(Ordering::Relaxed) {
-        FIRST_WINDOW.store(false, Ordering::Relaxed);
-        // The servo event loop is initialized before the native window / xcomponent is created,
-        // so if this fails, servo has crashed and we don't have a way to recover.
-        call(ServoAction::CreatePlatformWindow(
-            xc_wrapper,
-            window_wrapper,
-        ))
-        .expect("Servo main thread channel not initialized");
-    } else {
-        call(ServoAction::CreatePlatformWindow(
-            xc_wrapper,
-            window_wrapper,
-        ))
-        .expect("Servo main thread channel not initialized");
+    if let Err(error) = call(ServoAction::CreatePlatformWindow(
+        xc_wrapper,
+        window_wrapper,
+        NEXT_WINDOW_ID.load(Ordering::SeqCst),
+    )) {
+        error!("Could not create browser surface: {error:?}");
     }
     info!("Returning from on_surface_created_cb");
 }
@@ -708,11 +713,12 @@ extern "C" fn on_surface_changed_cb(
     // SAFETY: We just obtained these pointers from the callback, so we can assume them to be valid.
     if let Ok(size) = unsafe { get_xcomponent_size(xcomponent, native_window) } {
         info!("on_surface_changed_cb: Resizing to {size:?}");
-        call(ServoAction::Resize {
+        if let Err(error) = call(ServoAction::Resize {
             width: size.width,
             height: size.height,
-        })
-        .unwrap();
+        }) {
+            error!("Could not resize browser surface: {error:?}");
+        }
     } else {
         error!("on_surface_changed_cb: Surface changed, but failed to obtain new size")
     }
@@ -805,7 +811,9 @@ extern "C" fn on_dispatch_key_event(xc: *mut OH_NativeXComponent, _window: *mut 
     match converted {
         Some(key_event) => {
             debug!("Dispatching key event {key_event:?}");
-            call(ServoAction::KeyEvent(key_event)).expect("Call failed")
+            if let Err(error) = call(ServoAction::KeyEvent(key_event)) {
+                error!("Could not dispatch key event: {error:?}");
+            }
         },
         None => error!("Unknown key action {:?}", action),
     }
@@ -969,19 +977,23 @@ fn init(exports: Object, env: Env) -> napi_ohos::Result<()> {
 }
 
 #[napi(js_name = "loadURL")]
-pub fn load_url(url: String) {
+pub fn load_url(url: String) -> napi_ohos::Result<()> {
     debug!("load url");
-    call(ServoAction::LoadUrl(url)).expect("Failed to load url");
+    call_from_arkts(ServoAction::LoadUrl(url))
 }
 
 #[napi]
-pub fn go_back() {
-    call(ServoAction::GoBack).expect("Failed to call servo");
+pub fn go_back() -> napi_ohos::Result<bool> {
+    if !CAN_GO_BACK.load(Ordering::SeqCst) {
+        return Ok(false);
+    }
+    call_from_arkts(ServoAction::GoBack)?;
+    Ok(true)
 }
 
 #[napi]
-pub fn go_forward() {
-    call(ServoAction::GoForward).expect("Failed to call servo");
+pub fn go_forward() -> napi_ohos::Result<()> {
+    call_from_arkts(ServoAction::GoForward)
 }
 
 #[napi(js_name = "registerURLcallback")]
@@ -1022,21 +1034,28 @@ pub fn register_prompt_toast_callback(callback: Function<String, ()>) -> napi_oh
 #[napi]
 pub fn init_servo(init_opts: InitOpts) -> napi_ohos::Result<()> {
     info!("Servo is being initialised with the following Options: {init_opts:?}");
+    // Surface and navigation callbacks can arrive before the new thread runs.
+    let (tx, rx) = mpsc::channel();
+    SERVO_CHANNEL
+        .set(tx.clone())
+        .map_err(|_| napi_ohos::Error::from_reason("Browser engine is already initialized"))?;
     let _main_surface_thread = thread::spawn(move || {
-        main_thread(init_opts);
+        main_thread(init_opts, tx, rx);
     });
     Ok(())
 }
 
 #[napi]
-fn focus_webview(index: u32, arkts_ids: Vec<u32>) {
+fn focus_webview(index: u32, arkts_ids: Vec<u32>) -> napi_ohos::Result<()> {
     debug!("Focusing webview {index} from napi");
-    call(ServoAction::FocusWindow(index, arkts_ids)).expect("Could not focus webview");
+    CAN_GO_BACK.store(false, Ordering::SeqCst);
+    call_from_arkts(ServoAction::FocusWindow(index, arkts_ids))
 }
 
 #[napi]
-fn delete_webview(index: u32, arkts_ids: Vec<u32>) {
-    call(ServoAction::RemovePlatformWindow(index, arkts_ids)).expect("Could not delete webview");
+fn delete_webview(index: u32, arkts_ids: Vec<u32>) -> napi_ohos::Result<()> {
+    CAN_GO_BACK.store(false, Ordering::SeqCst);
+    call_from_arkts(ServoAction::RemovePlatformWindow(index, arkts_ids))
 }
 
 #[napi]

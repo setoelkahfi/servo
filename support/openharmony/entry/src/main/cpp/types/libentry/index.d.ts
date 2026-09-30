@@ -5,7 +5,8 @@ export interface InitOpts {
 }
 
 export const loadURL: (url: string) => void;
-export const goBack: () => void;
+// False lets HarmonyOS handle Back when the focused tab has no previous page.
+export const goBack: () => boolean;
 export const goForward: () => void;
 export const registerURLcallback: (callback: (url: string) => void) => void;
 export const registerTerminateCallback: (callback: () => void) => void;

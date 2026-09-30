@@ -1,6 +1,10 @@
 {
   "string": [
     {
+      "name": "browser_unavailable",
+      "value": "The browser engine is unavailable. Close and reopen the app."
+    },
+    {
       "name": "module_desc",
       "value": "module description"
     },

@@ -309,7 +309,7 @@ impl Settings {
             "dom_fontface_enabled" => "FontFace",
             "dom_indexeddb_enabled" => "IndexedDB",
             "dom_intersection_observer_enabled" => "IntersectionObserver",
-            "layout_container_queries_enabled" => "CSS container queries",
+            "layout_css_container_queries_enabled" => "CSS container queries",
             other => other,
         }
     }

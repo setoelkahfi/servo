@@ -151,6 +151,10 @@ fn selected_model_path() -> Option<PathBuf> {
 pub(crate) struct Turn {
     pub(crate) role: ChatRole,
     pub(crate) text: String,
+    /// Which brain wrote (or was asked) this line.
+    pub(crate) brain: crate::desktop::assistant::Brain,
+    /// A failure shown in the transcript, not part of the conversation.
+    pub(crate) is_error: bool,
 }
 
 /// What the engine is doing, as far as the UI is concerned.
@@ -227,9 +231,6 @@ pub(crate) struct Inference {
     /// The last failed management action, shown in Settings until the next one
     /// succeeds. Load failures live in [`Status`] instead.
     last_error: Arc<Mutex<Option<String>>>,
-    /// Draft text in the input box. UI-only state, kept here so the panel
-    /// stays a pure function of `Inference`.
-    pub(crate) draft: String,
 }
 
 impl Inference {
@@ -261,7 +262,6 @@ impl Inference {
             loaded: Arc::new(Mutex::new(None)),
             catalog: Arc::new(Mutex::new(Catalog::default())),
             last_error: Arc::new(Mutex::new(None)),
-            draft: String::new(),
         }
     }
 
@@ -271,6 +271,11 @@ impl Inference {
 
     pub(crate) fn transcript(&self) -> std::sync::MutexGuard<'_, Vec<Turn>> {
         self.transcript.lock().unwrap()
+    }
+
+    /// The conversation, shared with the cloud brain so one chat holds both.
+    pub(crate) fn transcript_handle(&self) -> Arc<Mutex<Vec<Turn>>> {
+        Arc::clone(&self.transcript)
     }
 
     pub(crate) fn catalog(&self) -> std::sync::MutexGuard<'_, Catalog> {
@@ -475,7 +480,14 @@ impl Inference {
     /// Dropped silently when no model is loaded or a reply is already in
     /// flight, so the panel does not have to guard every send path.
     pub(crate) fn send(&self, message: String) {
-        if message.trim().is_empty() || self.is_generating() {
+        self.send_with_context(message.clone(), message);
+    }
+
+    /// Send `content` to the model while the transcript shows `display`, so a
+    /// page block attached to a message is not echoed back into the panel.
+    pub(crate) fn send_with_context(&self, display: String, content: String) {
+        let message = content;
+        if display.trim().is_empty() || self.is_generating() {
             return;
         }
         if !self.status.lock().unwrap().is_ready() {
@@ -484,7 +496,9 @@ impl Inference {
 
         self.transcript.lock().unwrap().push(Turn {
             role: ChatRole::User,
-            text: message.clone(),
+            text: display,
+            brain: crate::desktop::assistant::Brain::Device,
+            is_error: false,
         });
 
         let engine = Arc::clone(&self.engine);
@@ -493,13 +507,15 @@ impl Inference {
 
         generating.store(true, Ordering::Relaxed);
         self.runtime.spawn(async move {
-            let text = match engine.send_message(message).await {
-                Ok(result) => result.text,
-                Err(error) => format!("Inference failed: {error}"),
+            let (text, is_error) = match engine.send_message(message).await {
+                Ok(result) => (result.text, false),
+                Err(error) => (format!("Inference failed: {error}"), true),
             };
             transcript.lock().unwrap().push(Turn {
                 role: ChatRole::Assistant,
                 text,
+                brain: crate::desktop::assistant::Brain::Device,
+                is_error,
             });
             generating.store(false, Ordering::Relaxed);
         });

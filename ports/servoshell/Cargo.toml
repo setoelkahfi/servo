@@ -174,6 +174,8 @@ windows-sys = { workspace = true, features = ["Win32_Graphics_Gdi", "Win32_Syste
 
 [target.'cfg(target_os = "macos")'.dependencies]
 onde = { workspace = true }
+reqwest = { workspace = true }
+security-framework = { workspace = true }
 # Defining the target that answers the Settings menu item.
 objc2 = { workspace = true }
 mach2 = { workspace = true }

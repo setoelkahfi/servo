@@ -111,6 +111,11 @@ pub struct Gui {
     #[cfg(target_os = "macos")]
     inference: crate::desktop::inference::Inference,
 
+    /// The cloud half of the assistant. Shares the conversation with
+    /// `inference`, so one chat holds both brains.
+    #[cfg(target_os = "macos")]
+    cloud: crate::desktop::assistant::Cloud,
+
     /// Whether the chat panel is open.
     #[cfg(target_os = "macos")]
     chat_open: bool,
@@ -339,6 +344,9 @@ impl Gui {
         let font_definitions = configure_fonts();
         context.egui_ctx.set_fonts(font_definitions);
 
+        #[cfg(target_os = "macos")]
+        let inference = crate::desktop::inference::Inference::new();
+
         context
             .egui_winit
             .init_accesskit(event_loop, winit_window, event_loop_proxy);
@@ -373,138 +381,14 @@ impl Gui {
             sent_webview_accesskit_trees: Default::default(),
             pending_accesskit_updates: vec![],
             #[cfg(target_os = "macos")]
-            inference: crate::desktop::inference::Inference::new(),
+            cloud: crate::desktop::assistant::Cloud::new(inference.transcript_handle()),
+            #[cfg(target_os = "macos")]
+            inference,
             #[cfg(target_os = "macos")]
             chat_open: false,
             settings: Default::default(),
             webview_widget_focused: false,
         }
-    }
-
-    /// Draw the on-device chat panel.
-    ///
-    /// Reads engine state every frame rather than subscribing to it. The
-    /// engine publishes through mutexes that are only ever held for a field
-    /// read or write, so polling here costs less than routing events back
-    /// through the winit loop would.
-    #[cfg(target_os = "macos")]
-    fn chat_panel(
-        ui: &mut egui::Ui,
-        inference: &mut crate::desktop::inference::Inference,
-        settings: &mut crate::desktop::settings::Settings,
-    ) {
-        use crate::desktop::inference::Status;
-
-        ui.horizontal(|ui| {
-            ui.heading("Chat");
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.button("Clear").clicked() {
-                    inference.clear();
-                }
-                if ui.button("Models…").on_hover_text("Manage on-device models").clicked() {
-                    settings.open(inference);
-                }
-            });
-        });
-        ui.label(
-            egui::RichText::new("Runs on this Mac. Nothing is sent to a server.")
-                .small()
-                .weak(),
-        );
-        ui.separator();
-
-        // Status line, and the only place a model load can be started.
-        let ready = {
-            let status = inference.status();
-            match &*status {
-                Status::Idle => {
-                    drop(status);
-                    let model = inference.selected_model_name();
-                    if ui.button(format!("Load {model}")).clicked() {
-                        inference.ensure_model();
-                    }
-                    ui.label(
-                        egui::RichText::new(
-                            "Downloads a few gigabytes the first time. Choose a different \
-                             model in Settings.",
-                        )
-                        .small()
-                        .weak(),
-                    );
-                    false
-                },
-                Status::Downloading { fraction, detail } => {
-                    ui.add(egui::ProgressBar::new(*fraction).text(detail.clone()));
-                    false
-                },
-                Status::Loading { model } => {
-                    ui.horizontal(|ui| {
-                        ui.spinner();
-                        ui.label(format!("Loading {model}…"));
-                    });
-                    false
-                },
-                Status::Ready { model } => {
-                    ui.label(egui::RichText::new(model.clone()).small().weak());
-                    true
-                },
-                Status::Failed(error) => {
-                    ui.colored_label(ui.visuals().error_fg_color, error.clone());
-                    drop(status);
-                    if ui.button("Try again").clicked() {
-                        inference.ensure_model();
-                    }
-                    false
-                },
-            }
-        };
-
-        ui.separator();
-
-        // Transcript. Reserve room for the input row so a long conversation
-        // does not push it off the bottom of the panel.
-        let input_height = 64.0;
-        let transcript_height = (ui.available_height() - input_height).max(0.0);
-        egui::ScrollArea::vertical()
-            .max_height(transcript_height)
-            .stick_to_bottom(true)
-            .show(ui, |ui| {
-                for turn in inference.transcript().iter() {
-                    let (name, color) = match turn.role {
-                        onde::inference::ChatRole::User => ("You", ui.visuals().strong_text_color()),
-                        _ => ("Assistant", ui.visuals().text_color()),
-                    };
-                    ui.label(egui::RichText::new(name).small().strong());
-                    ui.add(egui::Label::new(egui::RichText::new(&turn.text).color(color)).wrap());
-                    ui.add_space(6.0);
-                }
-                if inference.is_generating() {
-                    ui.horizontal(|ui| {
-                        ui.spinner();
-                        ui.label(egui::RichText::new("Thinking…").small().weak());
-                    });
-                }
-            });
-
-        // Input row, pinned to the bottom.
-        ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
-            let busy = inference.is_generating();
-            ui.horizontal(|ui| {
-                let send = ui.add_enabled(ready && !busy, egui::Button::new("Send"));
-                let field = ui.add_enabled(
-                    ready && !busy,
-                    egui::TextEdit::singleline(&mut inference.draft)
-                        .desired_width(ui.available_width())
-                        .hint_text(if ready { "Ask something" } else { "Load a model to start" }),
-                );
-                let submitted = field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-                if send.clicked() || submitted {
-                    let message = std::mem::take(&mut inference.draft);
-                    inference.send(message);
-                    field.request_focus();
-                }
-            });
-        });
     }
 
     pub(crate) fn surrender_focus(&self) {
@@ -684,6 +568,8 @@ impl Gui {
             favicon_textures,
             #[cfg(target_os = "macos")]
             inference,
+            #[cfg(target_os = "macos")]
+            cloud,
             #[cfg(target_os = "macos")]
             chat_open,
             settings,
@@ -1014,13 +900,20 @@ impl Gui {
                     .default_size(320.0)
                     .min_size(240.0)
                     .resizable(true)
-                    .show_inside(ctx, |ui| Gui::chat_panel(ui, inference, settings));
+                    .show_inside(ctx, |ui| {
+                        crate::desktop::assistant_panel::show(
+                            ui,
+                            inference,
+                            cloud,
+                            settings,
+                            window.active_webview(),
+                        )
+                    });
             }
 
             // The application menu can only raise a flag: AppKit delivers the
             // click while winit owns the run loop. Only the focused window
             // claims it, so Settings opens once instead of once per window.
-            #[cfg(target_os = "macos")]
             #[cfg(target_os = "macos")]
             {
                 if headed_window.winit_window().has_focus() &&

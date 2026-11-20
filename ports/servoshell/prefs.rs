@@ -61,7 +61,7 @@ pub(crate) const SMB_DAILY_WEB_PREFS: &[&str] = &[
     "dom_fontface_enabled",
     "dom_indexeddb_enabled",
     "dom_intersection_observer_enabled",
-    "layout_container_queries_enabled",
+    "layout_css_container_queries_enabled",
 ];
 
 // GitHub's marketing RiverAccordion animates a grid between 0fr and 1fr. In
@@ -979,7 +979,7 @@ fn test_servoshell_cmd() {
     assert!(daily_preferences.dom_fontface_enabled);
     assert!(daily_preferences.dom_indexeddb_enabled);
     assert!(daily_preferences.dom_intersection_observer_enabled);
-    assert!(daily_preferences.layout_container_queries_enabled);
+    assert!(daily_preferences.layout_css_container_queries_enabled);
 
     assert_eq!(test_parse("").2.url.as_deref(), Some("smb:newtab"),);
 

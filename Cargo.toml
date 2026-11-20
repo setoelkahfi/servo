@@ -168,6 +168,9 @@ num-complex = "0.4.6"
 num-derive = "0.4.2"
 num-traits = "0.2"
 onde = "1.4.0"
+# smbCloud Browser: the hybrid assistant talks to smbCloud over HTTPS and keeps its sign-in in the Keychain.
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+security-framework = "3.7"
 num_cpus = "1.17.0"
 num_enum = "0.7"
 objc2 = "0.6.4"

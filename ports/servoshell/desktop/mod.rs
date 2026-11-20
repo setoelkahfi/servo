@@ -16,6 +16,10 @@ mod gui;
 pub(crate) mod headed_window;
 mod headless_window;
 #[cfg(target_os = "macos")]
+pub(crate) mod assistant;
+#[cfg(target_os = "macos")]
+mod assistant_panel;
+#[cfg(target_os = "macos")]
 pub(crate) mod inference;
 mod keyutils;
 mod protocols;

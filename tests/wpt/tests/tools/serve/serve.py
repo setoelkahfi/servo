@@ -16,7 +16,7 @@ import time
 import traceback
 import urllib
 import uuid
-from collections import defaultdict, OrderedDict
+from collections import defaultdict
 from io import IOBase
 from itertools import chain, product
 from html5lib import html5parser
@@ -57,6 +57,16 @@ def domains_are_distinct(a, b):
     slice_index = -1 * min_length
 
     return a_parts[slice_index:] != b_parts[slice_index:]
+
+
+class WebSocketH3HttpsHandler(wptserve.Http1WebTestRequestHandler):
+    def finish_handling(self, request, response, handler):
+        params = urllib.parse.parse_qs(request.url_parts.query)
+        if "websocket-h3" in params.get("wpt_flags", []):
+            # A wss: URL does not select H3 by itself. Advertise the paired
+            # UDP server so the browser can discover H3 for this HTTPS origin.
+            response.headers.set("Alt-Svc", f'h3=":{self.server.server_port}"; ma=60')
+        return super().finish_handling(request, response, handler)
 
 
 def inject_script(html, script_tag):
@@ -900,7 +910,7 @@ class RoutesBuilder:
             with open(inject_script, "rb") as f:
                 self.inject_script_data = f.read()
 
-        self.mountpoint_routes = OrderedDict()
+        self.mountpoint_routes = {}
 
         self.add_mount_point("/", None)
 
@@ -970,6 +980,7 @@ class RoutesBuilder:
             ("GET", "/.well-known/web-app-origin-association", handlers.PythonScriptHandler),
             ("*", "/.well-known/web-identity", handlers.PythonScriptHandler),
             ("*", "/.well-known/device-bound-sessions", handlers.PythonScriptHandler),
+            ("*", "/.well-known/email-verification", handlers.PythonScriptHandler),
             ("*", "*.py", handlers.PythonScriptHandler),
             ("GET", "*", handlers.FileHandler)
         ]
@@ -1005,6 +1016,24 @@ def get_route_builder(logger, aliases, config):
     return builder
 
 
+def raise_open_file_limit():
+    if sys.platform != "darwin":
+        return
+
+    # on Darwin, NOFILE starts with a very low limit (256), so bump it up a little
+    # by way of comparison, Debian starts with a limit of 1024, Windows 512
+    import resource  # local, as it only exists on Unix-like systems
+    maxfilesperproc = int(subprocess.check_output(
+        ["sysctl", "-n", "kern.maxfilesperproc"]
+    ).strip())
+    soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    # 2048 is somewhat arbitrary, but gives us some headroom for wptrunner --parallel
+    # note that it's expected that 2048 will be the min here
+    new_soft = min(2048, maxfilesperproc, hard)
+    if soft < new_soft:
+        resource.setrlimit(resource.RLIMIT_NOFILE, (new_soft, hard))
+
+
 class ServerProc:
     def __init__(self, mp_context, scheme=None):
         self.proc = None
@@ -1030,19 +1059,7 @@ class ServerProc:
         os.environ = env
         logger = get_logger(config.logging["level"], log_handlers)
 
-        if sys.platform == "darwin":
-            # on Darwin, NOFILE starts with a very low limit (256), so bump it up a little
-            # by way of comparison, Debian starts with a limit of 1024, Windows 512
-            import resource  # local, as it only exists on Unix-like systems
-            maxfilesperproc = int(subprocess.check_output(
-                ["sysctl", "-n", "kern.maxfilesperproc"]
-            ).strip())
-            soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
-            # 2048 is somewhat arbitrary, but gives us some headroom for wptrunner --parallel
-            # note that it's expected that 2048 will be the min here
-            new_soft = min(2048, maxfilesperproc, hard)
-            if soft < new_soft:
-                resource.setrlimit(resource.RLIMIT_NOFILE, (new_soft, hard))
+        raise_open_file_limit()
         try:
             self.daemon = init_func(logger, host, port, paths, routes, bind_address, config, **kwargs)
         except OSError:
@@ -1150,18 +1167,31 @@ def start_servers(logger, host, ports, paths, routes, bind_address, config,
     for scheme, ports in ports.items():
         assert len(ports) == {"http": 2, "https": 2}.get(scheme, 1)
 
-        # If trying to start HTTP/2.0 server, check compatibility
-        if scheme == 'h2' and not http2_compatible():
-            logger.error('Cannot start HTTP/2.0 server as the environment is not compatible. ' +
-                         'Requires OpenSSL 1.0.2+')
-            continue
+        # Skip HTTP/2 server if it is disabled or if incompatible.
+        if scheme == "h2":
+            if not kwargs.get("h2", True):
+                logging.warning("HTTP/2 server disabled")
+                continue
+
+            if not http2_compatible():
+                logger.error("Cannot start HTTP/2 server as the environment is not compatible. " +
+                             "Requires OpenSSL 1.0.2+")
+                continue
 
         # Skip WebTransport over HTTP/3 server unless it is enabled explicitly.
         if scheme == "webtransport-h3" and not kwargs.get("webtransport_h3"):
+            logging.warning("WebTransport over HTTP/3 server disabled")
+            continue
+
+        if scheme == "websocket-h3" and not kwargs.get("websocket_h3"):
+            logging.warning("WebSocket over HTTP/3 server disabled")
+            continue
+        if scheme == "websocket-h3-https" and not kwargs.get("websocket_h3"):
             continue
 
         # Skip over DNS unless it is enabled explicitly.
         if scheme == "dns" and not kwargs.get("dns"):
+            logging.info("DNS server disabled")
             continue
 
         for port in ports:
@@ -1179,6 +1209,8 @@ def start_servers(logger, host, ports, paths, routes, bind_address, config,
                 "ws": start_ws_server,
                 "wss": start_wss_server,
                 "webtransport-h3": start_webtransport_h3_server,
+                "websocket-h3": start_websocket_h3_server,
+                "websocket-h3-https": start_websocket_h3_https_server,
                 "dns": start_dns_server,
             }[scheme]
 
@@ -1196,6 +1228,9 @@ def startup_failed(logger):
 
 
 def start_http_server(logger, host, port, paths, routes, bind_address, config, **kwargs):
+    # If SSL is available, allow upgrading to TLS after a CONNECT request so
+    # that the HTTP server can also act as an HTTPS proxy.
+    ssl_config = config.ssl_config
     try:
         return wptserve.WebTestHttpd(host=host,
                                      port=port,
@@ -1204,9 +1239,10 @@ def start_http_server(logger, host, port, paths, routes, bind_address, config, *
                                      rewrites=rewrites,
                                      bind_address=bind_address,
                                      config=config,
-                                     use_ssl=False,
-                                     key_file=None,
-                                     certificate=None,
+                                     use_ssl=ssl_config is not None,
+                                     key_file=ssl_config["key_path"] if ssl_config else None,
+                                     certificate=ssl_config["cert_path"] if ssl_config else None,
+                                     encrypt_after_connect=ssl_config is not None,
                                      latency=kwargs.get("latency"))
     except Exception as error:
         logger.critical(f"start_http_server: Caught exception from wptserve.WebTestHttpd: {error}")
@@ -1229,6 +1265,20 @@ def start_https_server(logger, host, port, paths, routes, bind_address, config, 
                                      latency=kwargs.get("latency"))
     except Exception as error:
         logger.critical(f"start_https_server: Caught exception from wptserve.WebTestHttpd: {error}")
+        startup_failed(logger)
+
+
+def start_websocket_h3_https_server(logger, host, port, paths, routes, bind_address, config, **kwargs):
+    try:
+        return wptserve.WebTestHttpd(
+            host=host, port=port, doc_root=paths["doc_root"],
+            routes=routes, rewrites=rewrites, bind_address=bind_address,
+            config=config, use_ssl=True,
+            key_file=config.ssl_config["key_path"],
+            certificate=config.ssl_config["cert_path"],
+            handler_cls=WebSocketH3HttpsHandler)
+    except Exception as error:
+        logger.critical(f"Failed to start WebSocket/H3 HTTPS server: {error}")
         startup_failed(logger)
 
 
@@ -1358,6 +1408,25 @@ def start_webtransport_h3_server(logger, host, port, paths, routes, bind_address
         sys.exit(0)
 
 
+def start_websocket_h3_server(logger, host, port, paths, routes, bind_address, config, **kwargs):
+    try:
+        from websocket.h3.websocket_h3_server import WebSocketH3Server  # type: ignore[import-not-found]
+        return WebSocketH3Server(host=host,
+                                 port=port,
+                                 ws_doc_root=paths["ws_doc_root"],
+                                 cert_path=config.ssl_config["cert_path"],
+                                 key_path=config.ssl_config["key_path"],
+                                 doc_root=paths["doc_root"],
+                                 routes=routes,
+                                 rewrites=rewrites,
+                                 config=config,
+                                 extra_handler_paths=paths["ws_extra"],
+                                 logger=logger)
+    except Exception as error:
+        logger.critical(f"Failed to start WebSocket over HTTP/3 server: {error}")
+        startup_failed(logger)
+
+
 def start_dns_server(logger, host, port, paths, routes, bind_address, config, **kwargs):
     try:
         from .dns import DNSServerDaemon
@@ -1430,9 +1499,11 @@ class ConfigBuilder(config.ConfigBuilder):
             "https": [8443, 8444],
             "https-local": ["auto"],
             "https-public": ["auto"],
+            "h2": [9000],
             "ws": ["auto"],
             "wss": ["auto"],
             "webtransport-h3": ["auto"],
+            "websocket-h3": ["auto"],
             "dns": [8053],
         },
         "check_subdomains": True,
@@ -1450,7 +1521,8 @@ class ConfigBuilder(config.ConfigBuilder):
             },
             "pregenerated": {
                 "host_key_path": os.path.join(repo_root, "tools", "certs", "web-platform.test.key"),
-                "host_cert_path": os.path.join(repo_root, "tools", "certs", "web-platform.test.pem")
+                "host_cert_path": os.path.join(repo_root, "tools", "certs", "web-platform.test.pem"),
+                "ca_cert_path": os.path.join(repo_root, "tools", "certs", "cacert.pem")
             },
             "none": {}
         },
@@ -1494,15 +1566,18 @@ class ConfigBuilder(config.ConfigBuilder):
         rv["ws_extra"] = data["ws_extra"]
         return rv
 
+    def _get_ports(self, data):
+        ports = super()._get_ports(data)
+        if data["ssl"]["type"] == "none":
+            ports.pop("websocket-h3", None)
+            ports.pop("websocket-h3-https", None)
+        elif ports.get("websocket-h3"):
+            ports["websocket-h3-https"] = list(ports["websocket-h3"])
+        return ports
+
 
 def build_config(logger, override_path=None, config_cls=ConfigBuilder, **kwargs):
     rv = config_cls(logger)
-
-    enable_http2 = kwargs.get("h2")
-    if enable_http2 is None:
-        enable_http2 = True
-    if enable_http2:
-        rv._default["ports"]["h2"] = [9000]
 
     if override_path and os.path.exists(override_path):
         with open(override_path) as f:
@@ -1552,12 +1627,16 @@ def get_parser():
                         help="Path to script file to inject, useful for testing polyfills.")
     parser.add_argument("--alias_file",
                         help="File with entries for aliases/multiple doc roots. In form of `/ALIAS_NAME/, DOC_ROOT\\n`")
-    parser.add_argument("--h2", action="store_true", default=None,
+    parser.add_argument("--h2", action="store_true", default=True,
                         help=argparse.SUPPRESS)
-    parser.add_argument("--no-h2", action="store_false", dest="h2", default=None,
-                        help="Disable the HTTP/2.0 server")
+    parser.add_argument("--no-h2", action="store_false", dest="h2",
+                        help="Disable the HTTP/2 server")
     parser.add_argument("--webtransport-h3", action="store_true",
                         help="Enable WebTransport over HTTP/3 server")
+    parser.add_argument("--websocket-h3", action="store_true",
+                        help="Enable WebSocket over HTTP/3 server")
+    parser.add_argument("--no-websocket-h3", action="store_false", dest="websocket_h3",
+                        help="Disable WebSocket over HTTP/3 server")
     parser.add_argument("--dns", action="store_true",
                         help="Enable DNS server")
     parser.add_argument("--dns-wildcards", type=int, metavar="N",
@@ -1636,10 +1715,9 @@ def run(venv=None, config_cls=ConfigBuilder, route_builder=None,
 
         stash_address = None
         if bind_address:
-            stash_address = (config.server_host, get_port(""))
-            logger.debug("Going to use port %d for stash" % stash_address[1])
+            stash_address = (config.server_host, 0)
 
-        with stash.StashServer(stash_address, authkey=str(uuid.uuid4())):
+        with stash.StashServer(stash_address, authkey=str(uuid.uuid4()), mp_context=mp_context):
             servers = start(logger, config, routes, mp_context, log_handlers, **kwargs)
 
             if not kwargs.get("exit_after_start"):

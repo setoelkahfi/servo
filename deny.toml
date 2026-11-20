@@ -29,10 +29,6 @@ ignore = [
     "RUSTSEC-2025-0098",
     # The crate `unic-ucd-ident` is unmaintained.
     "RUSTSEC-2025-0100",
-    # The crate `rsa` is vulnerable to Marvin Attack that leaks
-    # cryptographic secret via side channel. Wait for a patch in stable
-    # release version from upstream.
-    "RUSTSEC-2023-0071",
     # The crate `bincode` is unmaintained. This crate is now pinned in Servo.
     # See the comment above `bincode` entry in Cargo.toml.
     "RUSTSEC-2025-0141",
@@ -40,6 +36,19 @@ ignore = [
     # This is a dependency of `usvg`, `rustybuzz`, `fontdb`.
     # We will need to wait for upstream actions.
     "RUSTSEC-2026-0192",
+    # The crate `zvariant` is unmaintained. Wait for `atspi-common` to start
+    # using `zbus`.
+    "RUSTSEC-2026-0370",
+    # The crate `zbus_names` is unmaintained. Wait for `atspi-common` to start
+    # using `zbus`.
+    "RUSTSEC-2026-0371",
+    # The crate `zvariant_derive` is unmaintained. Wait for `atspi-common` to start
+    # using `zbus`.
+    "RUSTSEC-2026-0372",
+    # rusqlite can not be independently updated as sea-query-rusqlite needs update.
+    "RUSTSEC-2026-0459",
+    # The crate `chrono` is unmaintained. This is used by `tracing-perfetto`
+    "RUSTSEC-2026-0543",
 ]
 
 # This section is considered when running `cargo deny check licenses`
@@ -185,23 +194,8 @@ skip = [
     "digest",
     "block-buffer",
 
-    # Duplicated by ml-kem. This should be gone in next version (>0.3.2)
-    # of ml-kem.
-    "sha3",
-
     # Duplicated by bindgen
     "shlex",
-
-    # Duplicated by vello (disabled by default) which uses old wgpu.
-    "bit-set",
-    "naga",
-    "wgpu-core",
-    "wgpu-core-deps-apple",
-    "wgpu-core-deps-emscripten",
-    "wgpu-core-deps-windows-linux-android",
-    "wgpu-hal",
-    "wgpu-naga-bridge",
-    "wgpu-types",
 
     # duplicated by mozjs which brings in new versions
     "anstream",
@@ -210,6 +204,21 @@ skip = [
     "toml",
     "toml_datetime",
     "winnow",
+
+    # Duplicated by cssparser which brings in new versions
+    "phf",
+    "phf_generator",
+    "phf_macros",
+    "phf_shared",
+
+    # Duplicated by serde_with crate (proc macro helpers, so no binary size increase)
+    "darling",
+    "darling_core",
+    "darling_macro",
+
+    # env_logger still uses jiff 0.2
+    "jiff",
+    "jiff-core",
 ]
 
 # github.com organizations to allow git sources for
@@ -217,3 +226,8 @@ skip = [
 github = [
     "servo",
 ]
+
+# On our releases we switch to crates.io dependencies,
+# so explicitly allow unused allow-org entries to avoid errors.
+[sources]
+unused-allowed-org = "allow"

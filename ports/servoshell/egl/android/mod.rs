@@ -24,15 +24,14 @@ use raw_window_handle::{
     AndroidDisplayHandle, AndroidNdkWindowHandle, DisplayHandle, RawDisplayHandle, RawWindowHandle,
     WindowHandle,
 };
-pub use servo::MediaSessionPlaybackState;
 use servo::{
-    self, DevicePixel, EventLoopWaker, InputMethodControl, LoadStatus, MediaSessionActionType,
-    MouseButton, SelectElement, WebViewId,
+    self, DevicePixel, EventLoopWaker, InputMethodControl, LoadStatus, SelectElement, WebViewId,
 };
 
 use super::app::{App, AppInitOptions};
 use super::host_trait::HostTrait;
 use crate::prefs::{ArgumentParsingResult, parse_command_line_arguments};
+use crate::window::ServoShellWindowId;
 
 thread_local! {
     pub static APP: RefCell<Option<Rc<App>>> = const { RefCell::new(None) };
@@ -71,16 +70,6 @@ where
     });
 }
 
-#[unsafe(no_mangle)]
-pub extern "C" fn Java_org_servo_servoview_JNIServo_version<'local>(
-    mut env: EnvUnowned<'local>,
-    _class: JClass<'local>,
-) -> JString<'local> {
-    let version = crate::VERSION;
-    env.with_env(|env| -> jni::errors::Result<_> { env.new_string(version) })
-        .resolve::<ThrowRuntimeExAndDefault>()
-}
-
 /// Initialize Servo. At that point, we need a valid GL context. In the future, this will
 /// be done in multiple steps.
 #[unsafe(no_mangle)]
@@ -90,19 +79,14 @@ pub extern "C" fn Java_org_servo_servoview_JNIServo_init<'local>(
     context: JObject<'local>,
     args: JString<'local>,
     url: JString<'local>,
-    size: JObject<'local>,
-    density: jfloat,
     logStr: JString<'local>,
     experimental_mode: jboolean,
     callbacks_obj: JObject<'local>,
-    surface: JObject<'local>,
 ) {
     env.with_env(|env| -> jni::errors::Result<_> {
         let args = JString::cast_local(env, args)?.try_to_string(env).ok();
         let url = JString::cast_local(env, url)?.try_to_string(env).ok();
         let log_str = JString::cast_local(env, logStr)?.try_to_string(env).ok();
-
-        let viewport_rect = jni_coordinate_to_rust_viewport_rect(env, &size)?;
 
         let mut args: Vec<String> = args
             .and_then(|args| {
@@ -119,8 +103,6 @@ pub extern "C" fn Java_org_servo_servoview_JNIServo_init<'local>(
         if experimental_mode {
             args.push("--enable-experimental-web-platform-features".to_owned());
         }
-
-        let (display_handle, window_handle) = display_and_window_handle(env, &surface);
 
         // Note: Android debug logs are stripped from a release build.
         // debug!() will only show in a debug build. Use info!() if logs
@@ -208,18 +190,6 @@ pub extern "C" fn Java_org_servo_servoview_JNIServo_init<'local>(
 
         crate::init_tracing(servoshell_preferences.tracing_filter.as_deref());
 
-        let (display_handle, window_handle) = unsafe {
-            (
-                DisplayHandle::borrow_raw(display_handle),
-                WindowHandle::borrow_raw(window_handle),
-            )
-        };
-        let hidpi_scale_factor = Scale::new(
-            servoshell_preferences
-                .device_pixel_ratio_override
-                .unwrap_or(density),
-        );
-
         APP.with(|app| {
             let new_app = App::new(AppInitOptions {
                 host,
@@ -231,14 +201,46 @@ pub extern "C" fn Java_org_servo_servoview_JNIServo_init<'local>(
                 #[cfg(feature = "webxr")]
                 xr_discovery: None,
             });
-            new_app.add_platform_window(
+            *app.borrow_mut() = Some(new_app);
+        });
+        Ok(())
+    })
+    .resolve::<ThrowRuntimeExAndDefault>()
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn Java_org_servo_servoview_JNIServo_addPlatformWindow<'local>(
+    mut env: EnvUnowned<'local>,
+    _: JClass<'local>,
+    size: JObject<'local>,
+    density: jfloat,
+    surface: JObject<'local>,
+) {
+    env.with_env(|env| -> jni::errors::Result<_> {
+        let viewport_rect = jni_coordinate_to_rust_viewport_rect(env, &size)?;
+
+        let (display_handle, window_handle) = display_and_window_handle(env, &surface);
+
+        let (display_handle, window_handle) = unsafe {
+            (
+                DisplayHandle::borrow_raw(display_handle),
+                WindowHandle::borrow_raw(window_handle),
+            )
+        };
+
+        call(env, |app| {
+            let hidpi_scale_factor = Scale::new(
+                app.servoshell_preferences()
+                    .device_pixel_ratio_override
+                    .unwrap_or(density),
+            );
+            app.add_platform_window(
                 display_handle,
                 window_handle,
                 viewport_rect,
                 hidpi_scale_factor,
-                None,
-            );
-            *app.borrow_mut() = Some(new_app);
+                ServoShellWindowId::next(),
+            )
         });
         Ok(())
     })
@@ -356,29 +358,12 @@ pub extern "C" fn Java_org_servo_servoview_JNIServo_goForward<'local>(
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn Java_org_servo_servoview_JNIServo_scroll<'local>(
-    mut env: EnvUnowned<'local>,
-    _: JClass<'local>,
-    dx: jint,
-    dy: jint,
-    x: jint,
-    y: jint,
-) {
-    env.with_env(|env| -> jni::errors::Result<_> {
-        debug!("scroll");
-        call(env, |s| s.scroll(dx as f32, dy as f32, x as f32, y as f32));
-        Ok(())
-    })
-    .resolve::<ThrowRuntimeExAndDefault>()
-}
-
-#[unsafe(no_mangle)]
 pub extern "C" fn Java_org_servo_servoview_JNIServo_doFrame<'local>(
     mut env: EnvUnowned<'local>,
     _: JClass<'local>,
 ) {
     env.with_env(|env| -> jni::errors::Result<_> {
-        call(env, |s| s.notify_vsync());
+        call(env, |s| s.notify_vsync_legacy());
         Ok(())
     })
     .resolve::<ThrowRuntimeExAndDefault>()
@@ -532,72 +517,6 @@ pub extern "C" fn Java_org_servo_servoview_JNIServo_touchCancel<'local>(
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn Java_org_servo_servoview_JNIServo_pinchZoomStart<'local>(
-    mut env: EnvUnowned<'local>,
-    _: JClass<'local>,
-    factor: jfloat,
-    x: jfloat,
-    y: jfloat,
-) {
-    env.with_env(|env| -> jni::errors::Result<_> {
-        debug!("pinchZoomStart");
-        call(env, |s| s.pinchzoom_start(factor, x, y));
-        Ok(())
-    })
-    .resolve::<ThrowRuntimeExAndDefault>()
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn Java_org_servo_servoview_JNIServo_pinchZoom<'local>(
-    mut env: EnvUnowned<'local>,
-    _: JClass<'local>,
-    factor: jfloat,
-    x: jfloat,
-    y: jfloat,
-) {
-    env.with_env(|env| -> jni::errors::Result<_> {
-        debug!("pinchZoom");
-        call(env, |s| s.pinchzoom(factor, x, y));
-        Ok(())
-    })
-    .resolve::<ThrowRuntimeExAndDefault>()
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn Java_org_servo_servoview_JNIServo_pinchZoomEnd<'local>(
-    mut env: EnvUnowned<'local>,
-    _: JClass<'local>,
-    factor: jfloat,
-    x: jfloat,
-    y: jfloat,
-) {
-    env.with_env(|env| -> jni::errors::Result<_> {
-        debug!("pinchZoomEnd");
-        call(env, |s| s.pinchzoom_end(factor, x, y));
-        Ok(())
-    })
-    .resolve::<ThrowRuntimeExAndDefault>()
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn Java_org_servo_servoview_JNIServo_click(
-    mut env: EnvUnowned,
-    _: JClass,
-    x: jfloat,
-    y: jfloat,
-) {
-    env.with_env(|env| -> jni::errors::Result<_> {
-        debug!("click");
-        call(env, |s| {
-            s.mouse_down(x, y, MouseButton::Primary);
-            s.mouse_up(x, y, MouseButton::Primary);
-        });
-        Ok(())
-    })
-    .resolve::<ThrowRuntimeExAndDefault>()
-}
-
-#[unsafe(no_mangle)]
 pub extern "C" fn Java_org_servo_servoview_JNIServo_pausePainting(
     mut env: EnvUnowned,
     _: JClass<'_>,
@@ -625,36 +544,6 @@ pub extern "C" fn Java_org_servo_servoview_JNIServo_resumePainting<'local>(
         call(env, |s| {
             s.resume_painting(window_handle, viewport_rect);
         });
-        Ok(())
-    })
-    .resolve::<ThrowRuntimeExAndDefault>()
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn Java_org_servo_servoview_JNIServo_mediaSessionAction<'local>(
-    mut env: EnvUnowned<'local>,
-    _: JClass<'local>,
-    action: jint,
-) {
-    env.with_env(|env| -> jni::errors::Result<_> {
-        debug!("mediaSessionAction");
-
-        let action = match action {
-            1 => MediaSessionActionType::Play,
-            2 => MediaSessionActionType::Pause,
-            3 => MediaSessionActionType::SeekBackward,
-            4 => MediaSessionActionType::SeekForward,
-            5 => MediaSessionActionType::PreviousTrack,
-            6 => MediaSessionActionType::NextTrack,
-            7 => MediaSessionActionType::SkipAd,
-            8 => MediaSessionActionType::Stop,
-            9 => MediaSessionActionType::SeekTo,
-            _ => {
-                warn!("Ignoring unknown MediaSessionAction");
-                return Ok(());
-            },
-        };
-        call(env, |s| s.media_session_action(action.clone()));
         Ok(())
     })
     .resolve::<ThrowRuntimeExAndDefault>()
@@ -723,7 +612,7 @@ impl HostTrait for HostCallbacks {
                     )
                     .map(|_| ()),
                 LoadStatus::HeadParsed => Ok(()),
-                LoadStatus::Complete => env
+                LoadStatus::Complete | LoadStatus::Stopped => env
                     .call_method(
                         callback_ref(),
                         jni_str!("onLoadEnded"),
@@ -807,77 +696,6 @@ impl HostTrait for HostCallbacks {
         self.jvm
             .attach_current_thread(|env| -> Result<(), Error> {
                 env.call_method(callback_ref(), jni_str!("onImeHide"), jni_sig!("()V"), &[])?;
-                Ok(())
-            })
-            .unwrap();
-    }
-
-    fn on_media_session_metadata(&self, title: String, artist: String, album: String) {
-        info!("on_media_session_metadata");
-        self.jvm
-            .attach_current_thread(|env| -> Result<(), Error> {
-                let Ok(title) = new_string_as_jvalue(env, &title) else {
-                    return Ok(());
-                };
-
-                let Ok(artist) = new_string_as_jvalue(env, &artist) else {
-                    return Ok(());
-                };
-
-                let Ok(album) = new_string_as_jvalue(env, &album) else {
-                    return Ok(());
-                };
-
-                env.call_method(
-                    callback_ref(),
-                    jni_str!("onMediaSessionMetadata"),
-                    jni_sig!("(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)V"),
-                    &[(&title).into(), (&artist).into(), (&album).into()],
-                )?;
-                Ok(())
-            })
-            .unwrap();
-    }
-
-    fn on_media_session_playback_state_change(&self, state: MediaSessionPlaybackState) {
-        info!("on_media_session_playback_state_change {:?}", state);
-        self.jvm
-            .attach_current_thread(|env| -> Result<(), Error> {
-                let state = state as i32;
-                let state = JValue::Int(state as jint);
-                env.call_method(
-                    callback_ref(),
-                    jni_str!("onMediaSessionPlaybackStateChange"),
-                    jni_sig!("(I)V"),
-                    &[state],
-                )?;
-                Ok(())
-            })
-            .unwrap();
-    }
-
-    fn on_media_session_set_position_state(
-        &self,
-        duration: f64,
-        position: f64,
-        playback_rate: f64,
-    ) {
-        info!(
-            "on_media_session_playback_state_change ({:?}, {:?}, {:?})",
-            duration, position, playback_rate
-        );
-        self.jvm
-            .attach_current_thread(|env| -> Result<(), Error> {
-                let duration = JValue::Float(duration as jfloat);
-                let position = JValue::Float(position as jfloat);
-                let playback_rate = JValue::Float(playback_rate as jfloat);
-
-                env.call_method(
-                    callback_ref(),
-                    jni_str!("onMediaSessionSetPositionState"),
-                    jni_sig!("(FFF)V"),
-                    &[duration, position, playback_rate],
-                )?;
                 Ok(())
             })
             .unwrap();

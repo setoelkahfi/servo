@@ -3,6 +3,7 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 use std::str::FromStr;
+use std::sync::Arc;
 
 use bytes::{Bytes, BytesMut};
 use cssparser::match_ignore_ascii_case;
@@ -24,8 +25,6 @@ use servo_url::{ImmutableOrigin, ServoUrl};
 use strum::IntoStaticStr;
 
 use crate::dom::bindings::refcounted::Trusted;
-use crate::dom::bindings::reflector::DomGlobal;
-use crate::dom::bindings::root::DomRoot;
 use crate::dom::csp::{GlobalCspReporting, Violation};
 use crate::dom::document::Document;
 use crate::dom::globalscope::GlobalScope;
@@ -34,10 +33,12 @@ use crate::dom::node::NodeTraits;
 use crate::dom::performance::performanceresourcetiming::InitiatorType;
 use crate::dom::srcset::SourceSet;
 use crate::dom::types::HTMLLinkElement;
-use crate::fetch::fetch::create_a_potential_cors_request;
+use crate::fetch::fetch::create_a_potential_cors_request_with_claim;
 use crate::fetch::network_listener::{
     FetchResponseListener, ResourceTimingListener, submit_timing,
 };
+use crate::scripting::fetching_options::ScriptFetchPriority;
+use crate::url::ensure_blob_referenced_by_url_is_kept_alive;
 
 trait ValueForKeyInLinkHeader {
     fn has_key_in_link_header(&self, key: &str) -> bool;
@@ -78,11 +79,9 @@ pub(crate) struct LinkProcessingOptions {
     /// <https://html.spec.whatwg.org/multipage/#link-options-referrer-policy>
     pub(crate) referrer_policy: ReferrerPolicy,
     /// <https://html.spec.whatwg.org/multipage/#link-options-policy-container>
-    pub(crate) policy_container: PolicyContainer,
+    pub(crate) policy_container: Arc<PolicyContainer>,
     /// <https://html.spec.whatwg.org/multipage/#link-options-source-set>
     pub(crate) source_set: Option<SourceSet>,
-    /// <https://html.spec.whatwg.org/multipage/#link-options-base-url>
-    pub(crate) base_url: ServoUrl,
     /// <https://html.spec.whatwg.org/multipage/#link-options-origin>
     pub(crate) origin: ImmutableOrigin,
     pub(crate) referrer: Referrer,
@@ -93,7 +92,7 @@ pub(crate) struct LinkProcessingOptions {
     // https://html.spec.whatwg.org/multipage/#link-options-on-document-ready
     // TODO
     // https://html.spec.whatwg.org/multipage/#link-options-fetch-priority
-    // TODO
+    pub(crate) fetch_priority: ScriptFetchPriority,
 }
 
 impl LinkProcessingOptions {
@@ -143,7 +142,9 @@ impl LinkProcessingOptions {
         // Step 7. If attribs["fetchpriority"] exists and is an ASCII case-insensitive match
         // for a fetch priority attribute keyword, then set options's fetch priority to that
         // fetch priority attribute keyword.
-        // TODO
+        if let Some(link_type) = link_object.value_for_key_in_link_header("fetchpriority") {
+            self.fetch_priority = link_type.into();
+        }
         // Step 8. Return true.
         true
     }
@@ -180,25 +181,31 @@ impl LinkProcessingOptions {
     }
 
     /// <https://html.spec.whatwg.org/multipage/#create-a-link-request>
-    pub(crate) fn create_link_request(self, webview_id: WebViewId) -> Option<RequestBuilder> {
+    pub(crate) fn create_link_request(
+        self,
+        webview_id: WebViewId,
+        global: &GlobalScope,
+        document: &Document,
+    ) -> Option<RequestBuilder> {
         // Step 1. Assert: options's href is not the empty string.
         assert!(!self.href.is_empty());
 
-        // Step 3. Let url be the result of encoding-parsing a URL given options's href, relative to options's base URL.
-        let Ok(url) = ServoUrl::parse_with_base(Some(&self.base_url), &self.href) else {
-            // Step 4. If url is failure, then return null.
+        // Step 2. Let url be the result of encoding-parsing a URL given options's href, relative to options's base URL.
+        let Ok(url) = document.encoding_parse_a_url(&self.href) else {
+            // Step 3. If url is failure, then return null.
             return None;
         };
+        let url = ensure_blob_referenced_by_url_is_kept_alive(global, url);
 
-        // Step 5. Let request be the result of creating a potential-CORS request given
+        // Step 4. Let request be the result of creating a potential-CORS request given
         //         url, options's destination, and options's crossorigin.
-        // Step 6. Set request's policy container to options's policy container.
-        // Step 7. Set request's integrity metadata to options's integrity.
-        // Step 8. Set request's cryptographic nonce metadata to options's cryptographic nonce metadata.
-        // Step 9. Set request's referrer policy to options's referrer policy.
-        // Step 10. Set request's client to options's environment.
-        // FIXME: Step 11. Set request's priority to options's fetch priority.
-        let builder = create_a_potential_cors_request(
+        // Step 5. Set request's policy container to options's policy container.
+        // Step 6. Set request's integrity metadata to options's integrity.
+        // Step 7. Set request's cryptographic nonce metadata to options's cryptographic nonce metadata.
+        // Step 8. Set request's referrer policy to options's referrer policy.
+        // Step 9. Set request's client to options's environment.
+        // FIXME: Step 10. Set request's priority to options's fetch priority.
+        let builder = create_a_potential_cors_request_with_claim(
             Some(webview_id),
             url,
             self.destination,
@@ -214,7 +221,7 @@ impl LinkProcessingOptions {
         .cryptographic_nonce_metadata(self.cryptographic_nonce_metadata)
         .referrer_policy(self.referrer_policy);
 
-        // Step 12. Return request.
+        // Step 11. Return request.
         Some(builder)
     }
 
@@ -293,7 +300,9 @@ impl LinkProcessingOptions {
             );
         }
         // Step 3. Let request be the result of creating a link request given options.
-        let Some(request) = self.create_link_request(webview_id) else {
+        let Some(request) =
+            self.create_link_request(webview_id, &document.owner_global(), document)
+        else {
             // Step 4. If request is null, then return.
             return;
         };
@@ -315,7 +324,6 @@ impl LinkProcessingOptions {
         let fetch_context = LinkFetchContext {
             url,
             link,
-            global: Trusted::new(&document.global()),
             type_: LinkFetchContextType::Preload,
             response_body: BytesMut::new(),
         };
@@ -412,12 +420,12 @@ pub(crate) fn process_link_headers(
             cryptographic_nonce_metadata: String::new(),
             cross_origin: None,
             referrer_policy: ReferrerPolicy::EmptyString,
-            policy_container: document.policy_container().to_owned(),
+            policy_container: document.policy_container().clone(),
             source_set: None,
             origin: document.origin().immutable().to_owned(),
-            base_url: document.base_url(),
             request_client: global.request_client(None),
             referrer: global.get_referrer(),
+            fetch_priority: Default::default(),
         };
         // Step 2.7. Apply link options from parsed header attributes to options given attribs and rel.
         // If that returned false, then return.
@@ -452,15 +460,13 @@ pub(crate) enum LinkFetchContextType {
 impl From<LinkFetchContextType> for InitiatorType {
     fn from(other: LinkFetchContextType) -> Self {
         let name: &'static str = other.into();
-        InitiatorType::LocalName(name.to_owned())
+        InitiatorType::LocalName(name.into())
     }
 }
 
 pub(crate) struct LinkFetchContext {
     /// The `<link>` element (if any) that caused this fetch
     pub(crate) link: Option<Trusted<HTMLLinkElement>>,
-
-    pub(crate) global: Trusted<GlobalScope>,
 
     /// The url being prefetched
     pub(crate) url: ServoUrl,
@@ -472,11 +478,12 @@ pub(crate) struct LinkFetchContext {
 }
 
 impl FetchResponseListener for LinkFetchContext {
-    fn process_request_body(&mut self, _: RequestId) {}
+    fn process_request_body(&mut self, _: &GlobalScope, _: RequestId) {}
 
     fn process_response(
         &mut self,
         _: &mut js::context::JSContext,
+        _: &GlobalScope,
         _: RequestId,
         fetch_metadata: Result<FetchMetadata, NetworkError>,
     ) {
@@ -486,6 +493,7 @@ impl FetchResponseListener for LinkFetchContext {
     fn process_response_chunk(
         &mut self,
         _: &mut js::context::JSContext,
+        _: &GlobalScope,
         _: RequestId,
         chunk: Bytes,
     ) {
@@ -499,11 +507,12 @@ impl FetchResponseListener for LinkFetchContext {
     fn process_response_eof(
         self,
         cx: &mut js::context::JSContext,
+        global: &GlobalScope,
         _: RequestId,
         response_result: Result<(), NetworkError>,
         timing: ResourceFetchTiming,
     ) {
-        submit_timing(cx, &self, &response_result, &timing);
+        submit_timing(cx, global, &self, &response_result, &timing);
 
         // Step 11.6. If processResponse is given, then call processResponse with response.
         //
@@ -520,24 +529,21 @@ impl FetchResponseListener for LinkFetchContext {
     fn process_csp_violations(
         &mut self,
         cx: &mut js::context::JSContext,
+        global: &GlobalScope,
         _request_id: RequestId,
         violations: Vec<Violation>,
     ) {
-        let global = &self.resource_timing_global();
         global.report_csp_violations(cx, violations, None, None);
     }
 
     fn process_content_length(&mut self, _request_id: RequestId, size: usize) {
-        self.response_body.reserve(size - self.response_body.len());
+        self.response_body
+            .reserve(size.saturating_sub(self.response_body.len()));
     }
 }
 
 impl ResourceTimingListener for LinkFetchContext {
     fn resource_timing_information(&self) -> (InitiatorType, ServoUrl) {
         (self.type_.clone().into(), self.url.clone())
-    }
-
-    fn resource_timing_global(&self) -> DomRoot<GlobalScope> {
-        self.global.root()
     }
 }

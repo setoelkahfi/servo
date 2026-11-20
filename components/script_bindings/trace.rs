@@ -9,6 +9,7 @@ use std::marker::PhantomData;
 use std::mem;
 use std::ops::{Deref, DerefMut};
 
+use atomic_refcell::AtomicRefCell;
 use crossbeam_channel::Sender;
 use html5ever::interface::{Tracer as HtmlTracer, TreeSink};
 use html5ever::tokenizer::{TokenSink, Tokenizer};
@@ -21,7 +22,7 @@ use malloc_size_of::{MallocSizeOf, MallocSizeOfOps};
 use parking_lot::RwLock;
 use servo_arc::Arc as ServoArc;
 use servo_base::text::{Utf8CodeUnits, Utf16CodeUnits};
-use smallvec::SmallVec;
+use smallvec::{Array, SmallVec};
 use style::author_styles::AuthorStyles;
 use style::stylesheet_set::{AuthorStylesheetSet, DocumentStylesheetSet};
 use tendril::TendrilSink;
@@ -37,6 +38,7 @@ use crate::JSTraceable;
 use crate::error::Error;
 use crate::reflector::Reflector;
 use crate::str::USVString;
+use crate::tasks::TaskBox;
 
 /// Trace the `JSObject` held by `reflector`.
 ///
@@ -88,6 +90,7 @@ macro_rules! unsafe_no_jsmanaged_fields(
 
 unsafe_no_jsmanaged_fields!(USVString);
 unsafe_no_jsmanaged_fields!(Error);
+unsafe_no_jsmanaged_fields!(Box<dyn TaskBox>);
 
 /// A trait to allow tracing only DOM sub-objects.
 ///
@@ -137,6 +140,12 @@ unsafe impl<T: JSTraceable> CustomTraceable for RwLock<T> {
     }
 }
 
+unsafe impl<T: JSTraceable> CustomTraceable for AtomicRefCell<T> {
+    unsafe fn trace(&self, trc: *mut JSTracer) {
+        unsafe { self.borrow().trace(trc) }
+    }
+}
+
 unsafe impl<T: JSTraceable + Eq + Hash> CustomTraceable for indexmap::IndexSet<T> {
     #[inline]
     unsafe fn trace(&self, trc: *mut JSTracer) {
@@ -148,7 +157,7 @@ unsafe impl<T: JSTraceable + Eq + Hash> CustomTraceable for indexmap::IndexSet<T
 
 // XXXManishearth Check if the following three are optimized to no-ops
 // if e.trace() is a no-op (e.g it is an unsafe_no_jsmanaged_fields type)
-unsafe impl<T: JSTraceable + 'static> CustomTraceable for SmallVec<[T; 1]> {
+unsafe impl<T: JSTraceable + 'static, const N: usize> CustomTraceable for SmallVec<[T; N]> {
     #[inline]
     unsafe fn trace(&self, trc: *mut JSTracer) {
         for e in self.iter() {
@@ -323,12 +332,15 @@ unsafe impl<Handle: JSTraceable + Clone, Sink: JSTraceable + XmlTreeSink<Handle 
     }
 }
 
-/// Roots any JSTraceable thing
+/// Roots any JSTraceable thing, at the cost of wrapping it in a Box.
+/// Unlike the rooted! macro, the resulting RootedTraceableBox can be safely moved.
+/// RootedTraceableBox is slower to create and drop than roots created by rooted!, due to the extra
+/// allocations involved.
 ///
 /// If you have a valid DomObject, use DomRoot.
-/// If you have GC things like *mut JSObject or JSVal, use rooted!.
+/// If you have GC things like *mut JSObject or JSVal, or anything implementing Rootable, use rooted!.
 /// If you have an arbitrary number of DomObjects to root, use rooted_vec!.
-/// If you know what you're doing, use this.
+/// If your needs are not covered by the previous options, use RootedTraceableBox.
 #[cfg_attr(crown, crown::unrooted_must_root_lint::allow_unrooted_interior)]
 pub struct RootedTraceableBox<T: JSTraceable + 'static>(js::gc::RootedTraceableBox<T>);
 
@@ -351,6 +363,10 @@ impl<T: JSTraceable + 'static> RootedTraceableBox<T> {
 
     pub fn into_box(self) -> Box<T> {
         self.0.into_box()
+    }
+
+    pub fn into_inner(self) -> T {
+        *self.into_box()
     }
 }
 
@@ -440,6 +456,42 @@ unsafe impl<T: CustomTraceable> CustomTraceable for Option<T> {
     unsafe fn trace(&self, tracer: *mut JSTracer) {
         unsafe {
             self.as_ref().inspect(|value| value.trace(tracer));
+        }
+    }
+}
+
+/// A newtype wrapper for [`SmallVec`] that allows tracing its contents. This allows creating
+/// [`SmallVec`]s of unrooted nodes on the stack that are contained within a containing
+/// [`RootedTraceableBox`].
+pub struct TraceableSmallVec<A: Array>(SmallVec<A>);
+
+impl<A: Array> Default for TraceableSmallVec<A> {
+    fn default() -> Self {
+        Self(Default::default())
+    }
+}
+
+impl<A: Array> Deref for TraceableSmallVec<A> {
+    type Target = SmallVec<A>;
+    fn deref(&self) -> &SmallVec<A> {
+        &self.0
+    }
+}
+
+impl<A: Array> DerefMut for TraceableSmallVec<A> {
+    fn deref_mut(&mut self) -> &mut SmallVec<A> {
+        &mut self.0
+    }
+}
+
+unsafe impl<A: Array> js::rust::Trace for TraceableSmallVec<A>
+where
+    A::Item: JSTraceable,
+{
+    #[inline]
+    unsafe fn trace(&self, tracer: *mut JSTracer) {
+        for value in self.0.iter() {
+            unsafe { value.trace(tracer) };
         }
     }
 }

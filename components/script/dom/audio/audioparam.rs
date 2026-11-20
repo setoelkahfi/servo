@@ -8,7 +8,7 @@ use std::sync::mpsc;
 use dom_struct::dom_struct;
 use js::context::JSContext;
 use script_bindings::cformat;
-use script_bindings::reflector::{Reflector, reflect_dom_object_with_cx};
+use script_bindings::reflector::{Reflector, reflect_dom_object};
 use servo_media::audio::audio_node::{AudioNodeMessage, AudioNodeType};
 use servo_media::audio::graph::NodeId;
 use servo_media::audio::param::{ParamRate, ParamType, RampKind, UserAutomationEvent};
@@ -27,13 +27,10 @@ use crate::dom::window::Window;
 pub(crate) struct AudioParam {
     reflector_: Reflector,
     context: Dom<BaseAudioContext>,
-    #[ignore_malloc_size_of = "servo_media"]
     #[no_trace]
     node: Option<NodeId>,
-    #[ignore_malloc_size_of = "servo_media"]
     #[no_trace]
     node_type: AudioNodeType,
-    #[ignore_malloc_size_of = "servo_media"]
     #[no_trace]
     param: ParamType,
     automation_rate: Cell<AutomationRate>,
@@ -43,7 +40,7 @@ pub(crate) struct AudioParam {
 }
 
 impl AudioParam {
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     pub(crate) fn new_inherited(
         context: &BaseAudioContext,
         node: Option<NodeId>,
@@ -67,7 +64,7 @@ impl AudioParam {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     #[cfg_attr(crown, expect(crown::unrooted_must_root))]
     pub(crate) fn new(
         cx: &mut JSContext,
@@ -91,7 +88,12 @@ impl AudioParam {
             min_value,
             max_value,
         );
-        reflect_dom_object_with_cx(Box::new(audio_param), window, cx)
+        // Update the value range
+        audio_param.message_node(AudioNodeMessage::SetParamRange(
+            audio_param.param,
+            (min_value, max_value),
+        ));
+        reflect_dom_object(cx, Box::new(audio_param), window)
     }
 
     fn message_node(&self, message: AudioNodeMessage) {
@@ -132,7 +134,9 @@ impl AudioParamMethods<crate::DomTypeHolder> for AudioParam {
             self.node_type == AudioNodeType::AudioBufferSourceNode &&
             (self.param == ParamType::Detune || self.param == ParamType::PlaybackRate)
         {
-            return Err(Error::InvalidState(None));
+            return Err(Error::InvalidState(Some(
+                "This AudioParam must be \"k-rate\"".into(),
+            )));
         }
 
         self.automation_rate.set(automation_rate);
@@ -280,7 +284,9 @@ impl AudioParamMethods<crate::DomTypeHolder> for AudioParam {
             )));
         }
         if values.len() < 2. as usize {
-            return Err(Error::InvalidState(None));
+            return Err(Error::InvalidState(Some(
+                "Values must contain at least 2 elements".into(),
+            )));
         }
 
         if *end_time < 0. {

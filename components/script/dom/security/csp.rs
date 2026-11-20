@@ -19,6 +19,7 @@ use js::context::JSContext;
 use js::realm::CurrentRealm;
 use js::rust::describe_scripted_caller;
 use log::warn;
+use script_bindings::str::DOMString;
 use servo_constellation_traits::{LoadData, LoadOrigin};
 use url::Url;
 
@@ -42,7 +43,7 @@ pub(crate) trait CspReporting {
         &self,
         cx: &mut JSContext,
         global: &GlobalScope,
-        source: &str,
+        source: &DOMString,
     ) -> bool;
     fn is_wasm_evaluation_allowed(&self, cx: &mut JSContext, global: &GlobalScope) -> bool;
     fn should_navigation_request_be_blocked(
@@ -104,13 +105,14 @@ impl CspReporting for Option<CspList> {
         &self,
         cx: &mut JSContext,
         global: &GlobalScope,
-        source: &str,
+        source: &DOMString,
     ) -> bool {
         let Some(csp_list) = self else {
             return true;
         };
 
-        let (is_js_evaluation_allowed, violations) = csp_list.is_js_evaluation_allowed(source);
+        let source = source.str();
+        let (is_js_evaluation_allowed, violations) = csp_list.is_js_evaluation_allowed(&source);
 
         global.report_csp_violations(cx, violations, None, None);
 
@@ -153,8 +155,8 @@ impl CspReporting for Option<CspList> {
             redirect_count: 0,
             destination: Destination::None,
             initiator: Initiator::None,
-            nonce: "".to_owned(),
-            integrity_metadata: "".to_owned(),
+            nonce: String::new(),
+            integrity_metadata: String::new(),
             parser_metadata: ParserMetadata::None,
         };
         // TODO: set correct navigation check type for form submission if applicable
@@ -215,7 +217,9 @@ impl CspReporting for Option<CspList> {
             }
             // Cross-origin parents go via the constellation (slower)
             if let Some(parent_proxy) = window_proxy.parent() {
-                let Some(parent_origin) = parent_proxy.document_origin() else {
+                let Some((parent_origin, _)) =
+                    parent_proxy.document_origin_and_internal_ancestor_origin_objects_list()
+                else {
                     break;
                 };
                 let parent_origin = parent_origin.immutable().ascii_serialization();

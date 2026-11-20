@@ -6,28 +6,31 @@ use std::rc::Rc;
 
 use dpi::PhysicalSize;
 use euclid::{Rect, Scale};
-use keyboard_types::{CompositionEvent, CompositionState, Key, KeyState, NamedKey};
-use log::{info, warn};
+use keyboard_types::{Key, KeyState, NamedKey};
+use log::{debug, info, warn};
 use raw_window_handle::{DisplayHandle, RawWindowHandle, WindowHandle};
 use servo::{
     DeviceIndependentIntRect, DeviceIndependentPixel, DeviceIntSize, DevicePixel, DevicePoint,
     DeviceVector2D, EmbedderControl, EmbedderControlId, EventLoopWaker, ImeEvent, InputEvent,
-    KeyboardEvent, LoadStatus, MediaSessionActionType, MediaSessionEvent, MouseButton,
-    MouseButtonAction, MouseButtonEvent, MouseMoveEvent, Opts, Preferences, RefreshDriver,
-    RenderingContext, ScreenGeometry, Scroll, Servo, ServoBuilder, SimpleDialog, TouchEvent,
-    TouchEventType, TouchId, TouchPointerType, UserContentManager, WebView, WebViewId,
-    WindowRenderingContext, convert_rect_to_css_pixel,
+    KeyboardEvent, LoadStatus, MouseButton, MouseButtonAction, MouseButtonEvent, MouseMoveEvent,
+    Opts, Preferences, RefreshDriver, RenderingContext, ScreenGeometry, Scroll, Servo,
+    ServoBuilder, SimpleDialog, TouchEvent, TouchEventType, TouchId, TouchPointerType,
+    UserContentManager, WebView, WebViewId, WindowRenderingContext, convert_rect_to_css_pixel,
 };
 use url::Url;
 
 use crate::egl::host_trait::HostTrait;
 use crate::prefs::ServoShellPreferences;
 use crate::running_app_state::{RunningAppState, UserInterfaceCommand};
-use crate::window::{PlatformWindow, ServoShellWindow, ServoShellWindowId};
+use crate::window::{
+    PlatformWindow, ServoShellWindow, ServoShellWindowId, TopLevelWebViewCreationRequest,
+};
 
 pub(crate) struct EmbeddedPlatformWindow {
     host: Rc<dyn HostTrait>,
     rendering_context: Rc<WindowRenderingContext>,
+    /// If the underlying surface was unbound, we can't paint.
+    painting_paused: Cell<bool>,
     refresh_driver: Rc<VsyncRefreshDriver>,
     viewport_rect: RefCell<Rect<i32, DevicePixel>>,
     /// The HiDPI scaling factor to use for the display of [`WebView`]s.
@@ -78,10 +81,6 @@ impl PlatformWindow for EmbeddedPlatformWindow {
         false
     }
 
-    #[cfg_attr(
-        not(all(feature = "tracing", feature = "tracing-hitrace")),
-        expect(unused_variables)
-    )]
     fn update_user_interface_state(
         &self,
         state: &RunningAppState,
@@ -128,31 +127,34 @@ impl PlatformWindow for EmbeddedPlatformWindow {
         let load_status_changed = Some(new_load_status) != self.current_load_status.get();
         if load_status_changed {
             self.host.notify_load_status_changed(new_load_status);
-
-            #[cfg(all(feature = "tracing", feature = "tracing-hitrace"))]
-            if new_load_status == LoadStatus::Complete {
-                let (callback, receiver) =
-                    servo_base::generic_channel::GenericCallback::new_blocking()
-                        .expect("Could not create channel");
-                state.servo().create_memory_report(callback);
-                std::thread::spawn(move || {
-                    let result = receiver.recv().expect("Could not get memory report");
-                    let reports = result
-                        .results
-                        .first()
-                        .expect("We should have some memory report");
-                    let search_string = String::from("resident-according-to-smaps");
-                    let sum = reports
-                        .reports
-                        .iter()
-                        .filter(|report| report.path.contains(&search_string))
-                        .map(|report| report.size)
-                        .sum::<usize>();
-                    hitrace::trace_metric_str(
-                        "servo_memory_profiling:resident-according-to-smaps/sum",
-                        sum as i64,
-                    );
-                });
+            if state.servoshell_preferences.memory_output &&
+                matches!(new_load_status, LoadStatus::Complete | LoadStatus::Stopped)
+            {
+                #[cfg(all(feature = "tracing", feature = "tracing-hitrace"))]
+                {
+                    let (callback, receiver) =
+                        servo_base::generic_channel::GenericCallback::new_blocking()
+                            .expect("Could not create channel");
+                    state.servo().create_memory_report(callback);
+                    std::thread::spawn(move || {
+                        let result = receiver.recv().expect("Could not get memory report");
+                        let reports = result
+                            .results
+                            .first()
+                            .expect("We should have some memory report");
+                        let search_string = String::from("resident-according-to-smaps");
+                        let sum = reports
+                            .reports
+                            .iter()
+                            .filter(|report| report.path.contains(&search_string))
+                            .map(|report| report.size)
+                            .sum::<usize>();
+                        hitrace::trace_metric_str(
+                            "servo_memory_profiling:resident-according-to-smaps/sum",
+                            sum as i64,
+                        );
+                    });
+                }
             }
         }
 
@@ -160,7 +162,9 @@ impl PlatformWindow for EmbeddedPlatformWindow {
     }
 
     fn request_repaint(&self, window: &ServoShellWindow) {
-        window.repaint_webviews();
+        if !self.painting_paused.get() {
+            window.repaint_webviews();
+        }
     }
 
     fn request_resize(&self, _: &WebView, _: DeviceIntSize) -> Option<DeviceIntSize> {
@@ -209,25 +213,6 @@ impl PlatformWindow for EmbeddedPlatformWindow {
         }
     }
 
-    fn notify_media_session_event(&self, event: MediaSessionEvent) {
-        match event {
-            MediaSessionEvent::SetMetadata(metadata) => {
-                self.host
-                    .on_media_session_metadata(metadata.title, metadata.artist, metadata.album)
-            },
-            MediaSessionEvent::PlaybackStateChange(state) => {
-                self.host.on_media_session_playback_state_change(state)
-            },
-            MediaSessionEvent::SetPositionState(position_state) => {
-                self.host.on_media_session_set_position_state(
-                    position_state.duration,
-                    position_state.position,
-                    position_state.playback_rate,
-                )
-            },
-        };
-    }
-
     fn notify_crashed(&self, _webview: WebView, reason: String, backtrace: Option<String>) {
         self.host.on_panic(reason, backtrace);
     }
@@ -243,15 +228,18 @@ pub(crate) struct VsyncRefreshDriver {
     /// only when an observer asks for one.
     #[cfg(target_env = "ohos")]
     native_vsync: ohos_vsync::NativeVsync,
+    #[cfg_attr(target_os = "android", expect(dead_code))]
+    window_id: ServoShellWindowId,
 }
 
 impl VsyncRefreshDriver {
-    pub(crate) fn new() -> Self {
+    pub(crate) fn new(window_id: ServoShellWindowId) -> Self {
         Self {
             start_frame_callbacks: Default::default(),
             #[cfg(target_env = "ohos")]
             native_vsync: ohos_vsync::NativeVsync::new("ServoVsync")
                 .expect("Failed to create NativeVsync"),
+            window_id,
         }
     }
 
@@ -277,7 +265,7 @@ impl RefreshDriver for VsyncRefreshDriver {
         };
         #[cfg(target_env = "ohos")]
         if was_empty {
-            super::ohos::request_vsync_callback(&self.native_vsync);
+            super::ohos::request_vsync_callback(&self.native_vsync, self.window_id);
         }
     }
 }
@@ -339,16 +327,25 @@ impl App {
         })
     }
 
+    /// Add a platform window backing the window `window_id`.
+    ///
+    /// `window_id` may be an existing window, in which case the platform window will be
+    /// re-attached to the existing window and painting resumed.
     pub(crate) fn add_platform_window(
         &self,
         display_handle: DisplayHandle,
         window_handle: WindowHandle,
         viewport_rect: Rect<i32, DevicePixel>,
         hidpi_scale_factor: Scale<f32, DeviceIndependentPixel, DevicePixel>,
-        window_id: Option<ServoShellWindowId>,
+        window_id: ServoShellWindowId,
     ) {
+        // The surface of an existing window might have been destroyed and created again.
+        if let Some(window) = self.state.window(window_id) {
+            self.resume_painting_in_window(&window, window_handle, viewport_rect);
+            return;
+        }
         let viewport_size = viewport_rect.size;
-        let refresh_driver = Rc::new(VsyncRefreshDriver::new());
+        let refresh_driver = Rc::new(VsyncRefreshDriver::new(window_id));
         let rendering_context = Rc::new(
             WindowRenderingContext::new_with_refresh_driver(
                 display_handle,
@@ -358,11 +355,11 @@ impl App {
             )
             .expect("Could not create RenderingContext"),
         );
-        let id = window_id.unwrap_or(ServoShellWindowId::next());
         let platform_window = Rc::new(EmbeddedPlatformWindow {
-            id,
+            id: window_id,
             host: self.host.clone(),
             rendering_context,
+            painting_paused: Cell::new(false),
             refresh_driver,
             viewport_rect: RefCell::new(viewport_rect),
             hidpi_scale_factor,
@@ -373,8 +370,10 @@ impl App {
             current_can_go_forward: Default::default(),
             current_load_status: Default::default(),
         });
-        self.state
-            .open_window(platform_window, self.initial_url.clone());
+        self.state.open_window(
+            platform_window,
+            TopLevelWebViewCreationRequest::WithUrl(self.initial_url.clone()),
+        );
     }
 
     pub(crate) fn servo(&self) -> &Servo {
@@ -400,8 +399,10 @@ impl App {
     }
 
     pub(crate) fn create_and_activate_toplevel_webview(self: &Rc<Self>, url: Url) -> WebView {
-        self.window()
-            .create_and_activate_toplevel_webview(self.state.clone(), url)
+        self.window().create_and_activate_toplevel_webview(
+            self.state.clone(),
+            TopLevelWebViewCreationRequest::WithUrl(url),
+        )
     }
 
     /// The active webview will be immediately valid via `active_or_newest_webview()`
@@ -457,15 +458,26 @@ impl App {
         self.spin_event_loop();
     }
 
-    /// Let Servo know that the window has been resized.
+    /// Let Servo know that the platform window has been resized.
     pub fn resize(&self, viewport_rect: Rect<i32, DevicePixel>) {
-        if let Some(webview) = self.active_or_newest_webview() {
+        self.resize_window(&self.window(), viewport_rect);
+    }
+
+    /// Let Servo know that `window` has been resized.
+    pub(crate) fn resize_window(
+        &self,
+        window: &ServoShellWindow,
+        viewport_rect: Rect<i32, DevicePixel>,
+    ) {
+        if let Some(webview) = window.active_or_newest_webview() {
             info!("Setting viewport to {viewport_rect:?}");
             let size = viewport_rect.size;
             webview.resize(PhysicalSize::new(size.width as u32, size.height as u32));
         }
-        let window = self.window().platform_window();
-        let embedded_platform_window = window.as_headed_window().expect("No headed window");
+        let platform_window = window.platform_window();
+        let embedded_platform_window = platform_window
+            .as_headed_window()
+            .expect("No headed window");
         *embedded_platform_window.viewport_rect.borrow_mut() = viewport_rect;
 
         self.spin_event_loop();
@@ -637,29 +649,12 @@ impl App {
             KeyState::Down,
             Key::Named(NamedKey::Process),
         )));
-        webview.notify_input_event(InputEvent::Ime(ImeEvent::Composition(CompositionEvent {
-            state: CompositionState::End,
-            data: text,
-        })));
+        webview.notify_input_event(InputEvent::Ime(ImeEvent::Commit(text)));
         webview.notify_input_event(InputEvent::Keyboard(KeyboardEvent::from_state_and_key(
             KeyState::Up,
             Key::Named(NamedKey::Process),
         )));
         self.spin_event_loop();
-    }
-
-    pub fn media_session_action(&self, action: MediaSessionActionType) {
-        if let Some(webview) = self.active_or_newest_webview() {
-            webview.notify_media_session_action_event(action);
-            self.spin_event_loop();
-        }
-    }
-
-    pub fn set_throttled(&self, throttled: bool) {
-        if let Some(webview) = self.active_or_newest_webview() {
-            webview.set_throttled(throttled);
-            self.spin_event_loop();
-        }
     }
 
     pub fn ime_dismissed(&self) {
@@ -670,7 +665,8 @@ impl App {
         self.spin_event_loop();
     }
 
-    pub fn notify_vsync(&self) {
+    // This function is deprecated and should be removed once android supports multi-window.
+    pub fn notify_vsync_legacy(&self) {
         let platform_window = self.window().platform_window();
         let embedded_platform_window = platform_window
             .as_headed_window()
@@ -679,15 +675,40 @@ impl App {
         self.spin_event_loop();
     }
 
+    pub fn notify_vsync(&self, window_id: ServoShellWindowId) {
+        if let Some(window) = self.state.window(window_id) {
+            let platform_window = window.platform_window();
+            let embedded_platform_window = platform_window
+                .as_headed_window()
+                .expect("No headed window");
+            embedded_platform_window.refresh_driver.notify_vsync();
+        } else {
+            debug!("Window {window_id:?} not found - dropping vsync notification");
+        }
+        self.spin_event_loop();
+    }
+
     pub fn pause_painting(&self) {
-        let platform_window = self.window().platform_window();
+        let window = self.window();
+        self.pause_painting_in_window(&window);
+        self.spin_event_loop();
+    }
+
+    pub fn pause_painting_in_window(&self, window: &ServoShellWindow) {
+        let platform_window = window.platform_window();
         let embedded_platform_window = platform_window
             .as_headed_window()
             .expect("No headed window");
+        if embedded_platform_window.painting_paused.replace(true) {
+            return;
+        }
         if let Err(error) = embedded_platform_window.rendering_context.take_window() {
             warn!("Unbinding native surface from context failed ({error:?})");
         }
-        self.spin_event_loop();
+        // We need to explicitly make the context current again, to avoid the old surface still being current.
+        if let Err(error) = embedded_platform_window.rendering_context.make_current() {
+            warn!("Making the context current without a surface failed ({error:?})");
+        }
     }
 
     pub fn resume_painting(
@@ -696,19 +717,30 @@ impl App {
         viewport_rect: Rect<i32, DevicePixel>,
     ) {
         let window_handle = unsafe { WindowHandle::borrow_raw(window_handle) };
+        let platform_window = self.window();
+        self.resume_painting_in_window(&platform_window, window_handle, viewport_rect);
+    }
+
+    pub fn resume_painting_in_window(
+        &self,
+        window: &ServoShellWindow,
+        window_handle: WindowHandle,
+        viewport_rect: Rect<i32, DevicePixel>,
+    ) {
         let size = viewport_rect.size.to_u32();
-        let platform_window = self.window().platform_window();
+        let platform_window = window.platform_window();
         let embedded_platform_window = platform_window
             .as_headed_window()
             .expect("No headed window");
-        if let Err(error) = embedded_platform_window
+        match embedded_platform_window
             .rendering_context
             .set_window(window_handle, PhysicalSize::new(size.width, size.height))
         {
-            warn!("Binding native surface to context failed ({error:?})");
+            Ok(()) => embedded_platform_window.painting_paused.set(false),
+            Err(error) => warn!("Binding native surface to context failed ({error:?})"),
         }
-        embedded_platform_window.request_repaint(&self.window());
-        self.spin_event_loop();
+        self.resize_window(window, viewport_rect);
+        embedded_platform_window.request_repaint(window);
     }
 }
 

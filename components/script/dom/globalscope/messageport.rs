@@ -3,18 +3,19 @@
  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
 
 use std::cell::{Cell, RefCell};
-use std::ptr;
 use std::rc::Rc;
 
 use dom_struct::dom_struct;
 use js::context::JSContext;
 use js::conversions::ToJSValConvertible;
-use js::jsapi::{Heap, JSObject};
+use js::jsapi::JSObject;
 use js::jsval::UndefinedValue;
-use js::rust::wrappers2::JS_NewObject;
-use js::rust::{CustomAutoRooter, CustomAutoRooterGuard, HandleValue};
+use js::rust::{CustomAutoRooterGuard, HandleValue};
 use rustc_hash::FxHashMap;
+use script_bindings::callback::RootedCallback;
+use script_bindings::js::JS_NewObject;
 use script_bindings::reflector::reflect_weak_referenceable_dom_object;
+use script_bindings::structuredclone::StructuredData;
 use servo_base::id::{MessagePortId, MessagePortIndex};
 use servo_constellation_traits::{MessagePortImpl, PortMessageTask};
 
@@ -27,8 +28,7 @@ use crate::dom::bindings::error::{Error, ErrorResult, ErrorToJsval, Fallible};
 use crate::dom::bindings::inheritance::Castable;
 use crate::dom::bindings::reflector::DomGlobal;
 use crate::dom::bindings::root::DomRoot;
-use crate::dom::bindings::structuredclone::{self, StructuredData};
-use crate::dom::bindings::trace::RootedTraceableBox;
+use crate::dom::bindings::structuredclone;
 use crate::dom::bindings::transferable::Transferable;
 use crate::dom::bindings::utils::set_dictionary_property;
 use crate::dom::eventtarget::EventTarget;
@@ -108,7 +108,11 @@ impl MessagePort {
     }
 
     /// <https://html.spec.whatwg.org/multipage/#handler-messageport-onmessage>
-    fn set_onmessage(&self, cx: &mut JSContext, listener: Option<Rc<EventHandlerNonNull>>) {
+    fn set_onmessage(
+        &self,
+        cx: &mut JSContext,
+        listener: Option<RootedCallback<EventHandlerNonNull>>,
+    ) {
         let eventtarget = self.upcast::<EventTarget>();
         eventtarget.set_event_handler_common(cx, "message", listener);
     }
@@ -207,7 +211,6 @@ impl MessagePort {
     }
 
     /// <https://streams.spec.whatwg.org/#abstract-opdef-packandpostmessage>
-    #[expect(unsafe_code)]
     pub(crate) fn pack_and_post_message(
         &self,
         cx: &mut JSContext,
@@ -215,7 +218,7 @@ impl MessagePort {
         value: HandleValue,
     ) -> ErrorResult {
         // Let message be OrdinaryObjectCreate(null).
-        rooted!(&in(cx) let mut message = unsafe { JS_NewObject(cx, ptr::null()) });
+        rooted!(&in(cx) let mut message = JS_NewObject(cx, None));
         rooted!(&in(cx) let mut type_string = UndefinedValue());
         type_.to_jsval(cx, type_string.handle_mut());
 
@@ -231,8 +234,7 @@ impl MessagePort {
         // Done in `global.post_messageport_msg`.
 
         // Let options be «[ "transfer" → « » ]».
-        let mut rooted = CustomAutoRooter::new(vec![]);
-        let transfer = unsafe { CustomAutoRooterGuard::new(cx.raw_cx(), &mut rooted) };
+        auto_root!(&in(cx) let transfer = Vec::<*mut JSObject>::new());
 
         // Run the message port post message steps providing targetPort, message, and options.
         rooted!(&in(cx) let mut message_val = UndefinedValue());
@@ -309,20 +311,17 @@ impl MessagePortMethods<crate::DomTypeHolder> for MessagePort {
         &self,
         cx: &mut JSContext,
         message: HandleValue,
-        options: RootedTraceableBox<StructuredSerializeOptions>,
+        options: &StructuredSerializeOptions,
     ) -> ErrorResult {
         if self.detached.get() {
             return Ok(());
         }
-        let mut rooted = CustomAutoRooter::new(
+        auto_root!(&in(cx) let guard =
             options
                 .transfer
                 .iter()
-                .map(|js: &RootedTraceableBox<Heap<*mut JSObject>>| js.get())
-                .collect(),
-        );
-        #[expect(unsafe_code)]
-        let guard = unsafe { CustomAutoRooterGuard::new(cx.raw_cx(), &mut rooted) };
+                .map(|js| js.get())
+                .collect::<Vec<_>>());
         self.post_message_impl(cx, message, guard)
     }
 
@@ -347,7 +346,7 @@ impl MessagePortMethods<crate::DomTypeHolder> for MessagePort {
     }
 
     /// <https://html.spec.whatwg.org/multipage/#handler-messageport-onmessage>
-    fn GetOnmessage(&self, cx: &mut JSContext) -> Option<Rc<EventHandlerNonNull>> {
+    fn GetOnmessage(&self, cx: &mut JSContext) -> Option<RootedCallback<EventHandlerNonNull>> {
         if self.detached.get() {
             return None;
         }
@@ -356,7 +355,11 @@ impl MessagePortMethods<crate::DomTypeHolder> for MessagePort {
     }
 
     /// <https://html.spec.whatwg.org/multipage/#handler-messageport-onmessage>
-    fn SetOnmessage(&self, cx: &mut JSContext, listener: Option<Rc<EventHandlerNonNull>>) {
+    fn SetOnmessage(
+        &self,
+        cx: &mut JSContext,
+        listener: Option<RootedCallback<EventHandlerNonNull>>,
+    ) {
         if self.detached.get() {
             return;
         }

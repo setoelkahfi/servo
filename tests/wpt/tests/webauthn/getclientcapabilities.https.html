@@ -13,6 +13,7 @@
 const KNOWN_CAPABILITIES_SET = new Set([
   "conditionalCreate",
   "conditionalGet",
+  "conditionalPassiveGet",
   "hybridTransport",
   "immediateGet",
   "passkeyPlatformAuthenticator",
@@ -37,6 +38,7 @@ const KNOWN_CAPABILITIES_SET = new Set([
   "extension:prf",
   "extension:cmtgKey",
   "extension:crossDeviceFallbackUrl",
+  "extension:remoteClientDataJSON",
 ]);
 
 promise_test(async t => {

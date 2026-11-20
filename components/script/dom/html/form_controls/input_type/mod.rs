@@ -1,13 +1,14 @@
 /* This Source Code Form is subject to the terms of the Mozilla Public
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
+use bitflags::bitflags;
 use embedder_traits::InputMethodType;
-use js::context::JSContext;
+use js::context::{JSContext, NoGC};
 use script_bindings::cell::DomRefCell;
 use script_bindings::codegen::GenericBindings::HTMLInputElementBinding::HTMLInputElementMethods;
 use script_bindings::domstring::DOMString;
 use script_bindings::root::DomRoot;
-use stylo_atoms::Atom;
+use stylo_atoms::{Atom, atom};
 use time::OffsetDateTime;
 
 use crate::dom::element::AttributeMutation;
@@ -58,7 +59,7 @@ use crate::dom::html::form_controls::input_type::url_input_type::UrlInputType;
 use crate::dom::html::form_controls::input_type::week_input_type::WeekInputType;
 use crate::dom::htmlformelement::HTMLFormElement;
 use crate::dom::input_type::text_input_widget::TextInputWidget;
-use crate::dom::node::{BindContext, UnbindContext};
+use crate::dom::node::UnbindContext;
 
 pub(crate) mod button_input_type;
 pub(crate) mod checkbox_input_type;
@@ -199,50 +200,49 @@ impl InputActivationType {
 
 impl InputType {
     pub(crate) fn new_from_atom(value: &Atom) -> Self {
-        let value = value.as_ref();
-        if value.eq_ignore_ascii_case("button") {
+        if value.eq_ignore_ascii_case(&atom!("button")) {
             InputType::Button(Default::default())
-        } else if value.eq_ignore_ascii_case("checkbox") {
+        } else if value.eq_ignore_ascii_case(&atom!("checkbox")) {
             InputType::Checkbox(Default::default())
-        } else if value.eq_ignore_ascii_case("color") {
+        } else if value.eq_ignore_ascii_case(&atom!("color")) {
             InputType::Color(Default::default())
-        } else if value.eq_ignore_ascii_case("date") {
+        } else if value.eq_ignore_ascii_case(&atom!("date")) {
             InputType::Date(Default::default())
-        } else if value.eq_ignore_ascii_case("datetime-local") {
+        } else if value.eq_ignore_ascii_case(&atom!("datetime-local")) {
             InputType::DatetimeLocal(Default::default())
-        } else if value.eq_ignore_ascii_case("email") {
+        } else if value.eq_ignore_ascii_case(&atom!("email")) {
             InputType::Email(Default::default())
-        } else if value.eq_ignore_ascii_case("file") {
+        } else if value.eq_ignore_ascii_case(&atom!("file")) {
             InputType::File(Default::default())
-        } else if value.eq_ignore_ascii_case("hidden") {
+        } else if value.eq_ignore_ascii_case(&atom!("hidden")) {
             InputType::Hidden(Default::default())
-        } else if value.eq_ignore_ascii_case("image") {
+        } else if value.eq_ignore_ascii_case(&atom!("image")) {
             InputType::Image(Default::default())
-        } else if value.eq_ignore_ascii_case("month") {
+        } else if value.eq_ignore_ascii_case(&atom!("month")) {
             InputType::Month(Default::default())
-        } else if value.eq_ignore_ascii_case("number") {
+        } else if value.eq_ignore_ascii_case(&atom!("number")) {
             InputType::Number(Default::default())
-        } else if value.eq_ignore_ascii_case("password") {
+        } else if value.eq_ignore_ascii_case(&atom!("password")) {
             InputType::Password(Default::default())
-        } else if value.eq_ignore_ascii_case("radio") {
+        } else if value.eq_ignore_ascii_case(&atom!("radio")) {
             InputType::Radio(Default::default())
-        } else if value.eq_ignore_ascii_case("range") {
+        } else if value.eq_ignore_ascii_case(&atom!("range")) {
             InputType::Range(Default::default())
-        } else if value.eq_ignore_ascii_case("reset") {
+        } else if value.eq_ignore_ascii_case(&atom!("reset")) {
             InputType::Reset(Default::default())
-        } else if value.eq_ignore_ascii_case("search") {
+        } else if value.eq_ignore_ascii_case(&atom!("search")) {
             InputType::Search(Default::default())
-        } else if value.eq_ignore_ascii_case("submit") {
+        } else if value.eq_ignore_ascii_case(&atom!("submit")) {
             InputType::Submit(Default::default())
-        } else if value.eq_ignore_ascii_case("tel") {
+        } else if value.eq_ignore_ascii_case(&atom!("tel")) {
             InputType::Tel(Default::default())
-        } else if value.eq_ignore_ascii_case("text") {
+        } else if value.eq_ignore_ascii_case(&atom!("text")) {
             InputType::Text(Default::default())
-        } else if value.eq_ignore_ascii_case("time") {
+        } else if value.eq_ignore_ascii_case(&atom!("time")) {
             InputType::Time(Default::default())
-        } else if value.eq_ignore_ascii_case("url") {
+        } else if value.eq_ignore_ascii_case(&atom!("url")) {
             InputType::Url(Default::default())
-        } else if value.eq_ignore_ascii_case("week") {
+        } else if value.eq_ignore_ascii_case(&atom!("week")) {
             InputType::Week(Default::default())
         } else {
             InputType::Text(Default::default())
@@ -362,6 +362,20 @@ impl TryFrom<&InputType> for InputMethodType {
     }
 }
 
+/// The events that a specific InputType asks its HTMLInputElement to fire after a
+/// user interaction changed the element's value.
+#[derive(Clone, Copy, PartialEq)]
+pub(crate) struct ValueChangeEvents(u8);
+
+bitflags! {
+    impl ValueChangeEvents: u8 {
+        /// <https://html.spec.whatwg.org/multipage/#event-input-input>
+        const Input = 1 << 0;
+        /// <https://html.spec.whatwg.org/multipage/#event-input-change>
+        const Change = 1 << 1;
+    }
+}
+
 pub(crate) trait SpecificInputType {
     fn sanitize_value(&self, _input: &HTMLInputElement, _value: &mut DOMString) {}
 
@@ -390,7 +404,12 @@ pub(crate) trait SpecificInputType {
     }
 
     /// <https://html.spec.whatwg.org/multipage/#the-required-attribute%3Asuffering-from-being-missing>
-    fn suffers_from_being_missing(&self, input: &HTMLInputElement, value: &DOMString) -> bool {
+    fn suffers_from_being_missing(
+        &self,
+        _no_gc: &NoGC,
+        input: &HTMLInputElement,
+        value: &DOMString,
+    ) -> bool {
         input.Required() &&
             input.value_mode() == ValueMode::Value &&
             input.is_mutable() &&
@@ -406,7 +425,7 @@ pub(crate) trait SpecificInputType {
     }
 
     fn value_for_shadow_dom(&self, _input: &HTMLInputElement) -> DOMString {
-        "".into()
+        DOMString::new()
     }
 
     /// <https://html.spec.whatwg.org/multipage/#signal-a-type-change>
@@ -428,9 +447,15 @@ pub(crate) trait SpecificInputType {
     ) {
     }
 
-    fn show_the_picker_if_applicable(&self, _input: &HTMLInputElement) {}
+    fn show_the_picker_if_applicable(&self, _cx: &mut JSContext, _input: &HTMLInputElement) {}
 
-    fn select_files(&self, _input: &HTMLInputElement, _test_paths: Option<Vec<DOMString>>) {}
+    fn select_files(
+        &self,
+        _cx: &mut JSContext,
+        _input: &HTMLInputElement,
+        _test_paths: Option<Vec<DOMString>>,
+    ) {
+    }
 
     fn get_files(&self) -> Option<DomRoot<FileList>> {
         None
@@ -439,6 +464,17 @@ pub(crate) trait SpecificInputType {
     fn set_files(&self, _filelist: &FileList) {}
 
     fn update_shadow_tree(&self, _cx: &mut JSContext, _input: &HTMLInputElement) {}
+
+    /// Called on the input element that `event` was dispatched at, once the dispatch is
+    /// over and only if the event's default action was not prevented.
+    fn handle_event(
+        &self,
+        _cx: &mut JSContext,
+        _input: &HTMLInputElement,
+        _event: &Event,
+    ) -> ValueChangeEvents {
+        ValueChangeEvents::empty()
+    }
 
     fn update_placeholder_contents(&self, _cx: &mut JSContext, _input: &HTMLInputElement) {}
 
@@ -451,7 +487,11 @@ pub(crate) trait SpecificInputType {
     ) {
     }
 
-    fn bind_to_tree(&self, _cx: &mut JSContext, _input: &HTMLInputElement, _context: &BindContext) {
+    fn run_shared_bind_to_tree_or_moving_steps(
+        &self,
+        _cx: &mut JSContext,
+        _input: &HTMLInputElement,
+    ) {
     }
 
     fn unbind_from_tree(
@@ -460,6 +500,17 @@ pub(crate) trait SpecificInputType {
         _input: &HTMLInputElement,
         _form_owner: Option<DomRoot<HTMLFormElement>>,
         _context: &UnbindContext,
+    ) {
+    }
+
+    fn form_owner_changed(&self, _cx: &mut JSContext, _input: &HTMLInputElement) {}
+
+    fn update_checkedness(
+        &self,
+        _cx: &mut JSContext,
+        _input: &HTMLInputElement,
+        _checked: bool,
+        _previously_checked: bool,
     ) {
     }
 }

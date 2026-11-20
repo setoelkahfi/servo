@@ -17,7 +17,7 @@ use euclid::default::Size2D;
 use glow::{
     self as gl, ActiveTransformFeedback, Context as Gl, HasContext, NativeTransformFeedback,
     NativeUniformLocation, NativeVertexArray, PixelUnpackData, ShaderPrecisionFormat,
-    bytes_per_type, components_per_format,
+    bytes_per_type,
 };
 use half::f16;
 use itertools::Itertools;
@@ -86,7 +86,7 @@ pub(crate) struct GLContextData {
 
 #[derive(Debug)]
 pub struct GLState {
-    _webgl_version: WebGLVersion,
+    webgl_version: WebGLVersion,
     _gl_version: GLVersion,
     requested_flags: ContextAttributeFlags,
     // This is the WebGL view of the color mask
@@ -98,6 +98,8 @@ pub struct GLState {
     scissor_test_enabled: bool,
     // The WebGL view of the stencil write mask (see comment re `color_write_mask`)
     stencil_write_mask: (u32, u32),
+    // Kept here rather than read back: glGetIntegerv cannot return a full GLuint.
+    stencil_value_mask: (u32, u32),
     stencil_test_enabled: bool,
     stencil_clear_value: i32,
     // The WebGL view of the depth write mask (see comment re `color_write_mask`)
@@ -130,16 +132,20 @@ impl GLState {
 
     // We maintain invariants between the GLState object and the GL state.
     fn restore_invariant(&self, gl: &Gl) {
-        self.restore_clear_color_invariant(gl);
+        self.restore_clear_invariant(gl);
         self.restore_scissor_invariant(gl);
         self.restore_alpha_invariant(gl);
         self.restore_depth_invariant(gl);
         self.restore_stencil_invariant(gl);
     }
 
-    fn restore_clear_color_invariant(&self, gl: &Gl) {
+    fn restore_clear_invariant(&self, gl: &Gl) {
         let (r, g, b, a) = self.clear_color;
-        unsafe { gl.clear_color(r, g, b, a) };
+        unsafe {
+            gl.clear_color(r, g, b, a);
+            gl.clear_depth(self.depth_clear_value);
+            gl.clear_stencil(self.stencil_clear_value);
+        }
     }
 
     fn restore_scissor_invariant(&self, gl: &Gl) {
@@ -198,13 +204,14 @@ impl Default for GLState {
     fn default() -> GLState {
         GLState {
             _gl_version: GLVersion { major: 1, minor: 0 },
-            _webgl_version: WebGLVersion::WebGL1,
+            webgl_version: WebGLVersion::WebGL1,
             requested_flags: ContextAttributeFlags::empty(),
             color_write_mask: [true, true, true, true],
             clear_color: (0., 0., 0., 0.),
             scissor_test_enabled: false,
-            // Should these be 0xFFFF_FFFF?
-            stencil_write_mask: (0, 0),
+            // GL's initial stencil writemask is all ones.
+            stencil_write_mask: (u32::MAX, u32::MAX),
+            stencil_value_mask: (u32::MAX, u32::MAX),
             stencil_test_enabled: false,
             stencil_clear_value: 0,
             depth_write_mask: true,
@@ -418,7 +425,7 @@ impl WebGLThread {
         false
     }
 
-    fn get_or_create_device_for_painter(
+    pub(crate) fn get_or_create_device_for_painter(
         &mut self,
         painter_id: PainterId,
     ) -> Result<Rc<Device>, String> {
@@ -672,7 +679,7 @@ impl WebGLThread {
 
         let state = GLState {
             _gl_version: gl_version,
-            _webgl_version: webgl_version,
+            webgl_version,
             requested_flags,
             default_vao,
             ..Default::default()
@@ -850,8 +857,12 @@ impl WebGLThread {
                 .get_mut(&context_id)
                 .expect("Missing WebGL context");
 
-            // Ensure there are no pending GL errors from other parts of the pipeline.
-            debug_assert_eq!(unsafe { data.gl.get_error() }, gl::NO_ERROR);
+            // Some surfman backends fail to create the next surface while a GL error is pending.
+            let pending_error = unsafe { data.gl.get_error() };
+            debug_assert_eq!(pending_error, gl::NO_ERROR);
+            if pending_error != gl::NO_ERROR {
+                warn!("Discarding GL error {pending_error:#x} before swapping {context_id:?}");
+            }
 
             // Check to see if any of the current framebuffer bindings are the surface we're about
             // to swap out. If so, we'll have to reset them after destroying the surface.
@@ -1262,9 +1273,8 @@ impl WebGLImpl {
                 gl.polygon_offset(factor, units)
             },
             WebGLCommand::ReadPixels(rect, format, pixel_type, ref sender) => {
-                let len = bytes_per_type(pixel_type) *
-                    components_per_format(format) *
-                    rect.size.area() as usize;
+                let len =
+                    read_pixels_bytes_per_pixel(format, pixel_type) * rect.size.area() as usize;
                 let mut pixels = vec![0; len];
                 unsafe {
                     // We don't want any alignment padding on pixel rows.
@@ -1319,21 +1329,32 @@ impl WebGLImpl {
                 // that can happen in the real world.
                 unsafe { gl.scissor(x, y, width as i32, height as i32) };
             },
-            WebGLCommand::StencilFunc(func, ref_, mask) => unsafe {
-                gl.stencil_func(func, ref_, mask)
+            WebGLCommand::StencilFunc(func, ref_, mask) => {
+                state.stencil_value_mask = (mask, mask);
+                unsafe { gl.stencil_func(func, ref_, mask) }
             },
-            WebGLCommand::StencilFuncSeparate(face, func, ref_, mask) => unsafe {
-                gl.stencil_func_separate(face, func, ref_, mask)
+            WebGLCommand::StencilFuncSeparate(face, func, ref_, mask) => {
+                if face != gl::BACK {
+                    state.stencil_value_mask.0 = mask;
+                }
+                if face != gl::FRONT {
+                    state.stencil_value_mask.1 = mask;
+                }
+                unsafe { gl.stencil_func_separate(face, func, ref_, mask) }
             },
             WebGLCommand::StencilMask(mask) => {
                 state.stencil_write_mask = (mask, mask);
                 state.restore_stencil_invariant(gl);
             },
             WebGLCommand::StencilMaskSeparate(face, mask) => {
-                if face == gl::FRONT {
-                    state.stencil_write_mask.0 = mask;
-                } else {
-                    state.stencil_write_mask.1 = mask;
+                match face {
+                    gl::FRONT => state.stencil_write_mask.0 = mask,
+                    gl::BACK => state.stencil_write_mask.1 = mask,
+                    gl::FRONT_AND_BACK => state.stencil_write_mask = (mask, mask),
+                    _ => debug_assert!(
+                        false,
+                        "stencilMaskSeparate face {face:#x} should have been rejected by the DOM"
+                    ),
                 }
                 state.restore_stencil_invariant(gl);
             },
@@ -1648,6 +1669,9 @@ impl WebGLImpl {
                     offset as _,
                 )
             },
+            WebGLCommand::VertexAttribIPointer(attrib_id, size, data_type, stride, offset) => unsafe {
+                gl.vertex_attrib_pointer_i32(attrib_id, size, data_type, stride, offset as _)
+            },
             WebGLCommand::SetViewport(x, y, width, height) => unsafe {
                 gl.viewport(x, y, width, height)
             },
@@ -1845,7 +1869,17 @@ impl WebGLImpl {
                     internal_format.as_gl_constant(),
                     width as i32,
                     height as i32,
-                )
+                );
+                // Zero-initialize the texture for security
+                Self::zero_initialize_texture(
+                    gl,
+                    target,
+                    internal_format,
+                    width,
+                    height,
+                    1,
+                    levels,
+                );
             },
             WebGLCommand::TexStorage3D(target, levels, internal_format, width, height, depth) => unsafe {
                 gl.tex_storage_3d(
@@ -1855,7 +1889,17 @@ impl WebGLImpl {
                     width as i32,
                     height as i32,
                     depth as i32,
-                )
+                );
+                // Zero-initialize the texture for security
+                Self::zero_initialize_texture(
+                    gl,
+                    target,
+                    internal_format,
+                    width,
+                    height,
+                    depth,
+                    levels,
+                );
             },
             WebGLCommand::DrawingBufferWidth(ref sender) => {
                 let size = device
@@ -1923,13 +1967,52 @@ impl WebGLImpl {
                 sender.send(value).unwrap()
             },
             WebGLCommand::GetParameterInt(param, ref sender) => {
+                // The core profiles used for WebGL 2 dropped the `*_BITS` queries.
+                let webgl2 = state.webgl_version == WebGLVersion::WebGL2;
                 let value = match param {
                     webgl::ParameterInt::AlphaBits if state.fake_no_alpha() => 0,
                     webgl::ParameterInt::DepthBits if state.fake_no_depth() => 0,
                     webgl::ParameterInt::StencilBits if state.fake_no_stencil() => 0,
-                    webgl::ParameterInt::StencilWritemask => state.stencil_write_mask.0 as i32,
-                    webgl::ParameterInt::StencilBackWritemask => state.stencil_write_mask.1 as i32,
+                    webgl::ParameterInt::RedBits if webgl2 => Self::read_draw_framebuffer_bits(
+                        gl,
+                        gl::COLOR_ATTACHMENT0,
+                        gl::FRAMEBUFFER_ATTACHMENT_RED_SIZE,
+                    ),
+                    webgl::ParameterInt::GreenBits if webgl2 => Self::read_draw_framebuffer_bits(
+                        gl,
+                        gl::COLOR_ATTACHMENT0,
+                        gl::FRAMEBUFFER_ATTACHMENT_GREEN_SIZE,
+                    ),
+                    webgl::ParameterInt::BlueBits if webgl2 => Self::read_draw_framebuffer_bits(
+                        gl,
+                        gl::COLOR_ATTACHMENT0,
+                        gl::FRAMEBUFFER_ATTACHMENT_BLUE_SIZE,
+                    ),
+                    webgl::ParameterInt::AlphaBits if webgl2 => Self::read_draw_framebuffer_bits(
+                        gl,
+                        gl::COLOR_ATTACHMENT0,
+                        gl::FRAMEBUFFER_ATTACHMENT_ALPHA_SIZE,
+                    ),
+                    webgl::ParameterInt::DepthBits if webgl2 => Self::read_draw_framebuffer_bits(
+                        gl,
+                        gl::DEPTH_ATTACHMENT,
+                        gl::FRAMEBUFFER_ATTACHMENT_DEPTH_SIZE,
+                    ),
+                    webgl::ParameterInt::StencilBits if webgl2 => Self::read_draw_framebuffer_bits(
+                        gl,
+                        gl::STENCIL_ATTACHMENT,
+                        gl::FRAMEBUFFER_ATTACHMENT_STENCIL_SIZE,
+                    ),
                     _ => unsafe { gl.get_parameter_i32(param as u32) },
+                };
+                sender.send(value).unwrap()
+            },
+            WebGLCommand::GetParameterUInt(param, ref sender) => {
+                let value = match param {
+                    webgl::ParameterUInt::StencilWritemask => state.stencil_write_mask.0,
+                    webgl::ParameterUInt::StencilBackWritemask => state.stencil_write_mask.1,
+                    webgl::ParameterUInt::StencilValueMask => state.stencil_value_mask.0,
+                    webgl::ParameterUInt::StencilBackValueMask => state.stencil_value_mask.1,
                 };
                 sender.send(value).unwrap()
             },
@@ -1966,6 +2049,14 @@ impl WebGLImpl {
                 unsafe {
                     gl.get_parameter_f32_slice(param as u32, &mut value);
                 }
+                sender.send(value).unwrap()
+            },
+            WebGLCommand::GetParameterString(param, ref sender) => {
+                let gl_param = match param {
+                    webgl::ParameterString::UnmaskedVendor => gl::VENDOR,
+                    webgl::ParameterString::UnmaskedRenderer => gl::RENDERER,
+                };
+                let value = unsafe { gl.get_parameter_string(gl_param) };
                 sender.send(value).unwrap()
             },
             WebGLCommand::GetProgramValidateStatus(program, ref sender) => sender
@@ -2034,7 +2125,7 @@ impl WebGLImpl {
                 gl.tex_parameter_f32(target, param, value)
             },
             WebGLCommand::LinkProgram(program_id, ref sender) => {
-                return sender.send(Self::link_program(gl, program_id)).unwrap();
+                sender.send(Self::link_program(gl, program_id)).unwrap()
             },
             WebGLCommand::UseProgram(program_id) => unsafe {
                 gl.use_program(program_id.map(|p| p.glow()))
@@ -2495,8 +2586,16 @@ impl WebGLImpl {
                     attach(attachment)
                 }
             },
-            WebGLCommand::ReadBuffer(buffer) => unsafe { gl.read_buffer(buffer) },
-            WebGLCommand::DrawBuffers(ref buffers) => unsafe { gl.draw_buffers(buffers) },
+            WebGLCommand::ReadBuffer(buffer) => unsafe {
+                gl.read_buffer(Self::default_framebuffer_color_buffer(buffer, ctx, device))
+            },
+            WebGLCommand::DrawBuffers(ref buffers) => {
+                let buffers: Vec<_> = buffers
+                    .iter()
+                    .map(|&buffer| Self::default_framebuffer_color_buffer(buffer, ctx, device))
+                    .collect();
+                unsafe { gl.draw_buffers(&buffers) }
+            },
         }
 
         // If debug asertions are enabled, then check the error state.
@@ -2527,6 +2626,135 @@ impl WebGLImpl {
                     error,
                     error,
                     command
+                );
+            }
+        }
+    }
+
+    fn tex_bytes_per_pixel(format: TexFormat, data_type: TexDataType) -> usize {
+        match data_type {
+            TexDataType::Float32UnsignedInt248Rev => 8,
+            _ if data_type.components_per_element() > 1 => data_type.element_size() as usize,
+            _ => (format.components() * data_type.element_size()) as usize,
+        }
+    }
+
+    /// Zero-initializes a texture after texStorage allocation using tex_sub_image_2d or tex_sub_image_3d.
+    /// This is required by WebGL for security to prevent information leakage
+    /// from uninitialized GPU memory without causing state corruption or format incompatibility.
+    fn zero_initialize_texture(
+        gl: &Gl,
+        target: u32,
+        internal_format: TexFormat,
+        width: u32,
+        height: u32,
+        depth: u32,
+        levels: u32,
+    ) {
+        // TODO: Zero-initialize compressed formats with compressedTexSubImage2D/3D.
+        if internal_format.is_compressed() {
+            return;
+        }
+        let Some(&data_type) = internal_format.compatible_data_types().first() else {
+            return;
+        };
+        let unsized_format = internal_format.to_unsized();
+        let bpp = Self::tex_bytes_per_pixel(unsized_format, data_type);
+
+        let gl_type = if data_type == TexDataType::HalfFloat {
+            gl::HALF_FLOAT
+        } else {
+            data_type.as_gl_constant()
+        };
+
+        // Temporarily unbind PIXEL_UNPACK_BUFFER if bound.
+        let prev_pbo = unsafe { gl.get_parameter_i32(gl::PIXEL_UNPACK_BUFFER_BINDING) };
+        if prev_pbo != 0 {
+            unsafe { gl.bind_buffer(gl::PIXEL_UNPACK_BUFFER, None) };
+        }
+        unsafe { gl.pixel_store_i32(gl::UNPACK_ALIGNMENT, 1) };
+
+        // Upload in bands of rows using a buffer capped to at most 1 MiB to avoid OOM crashes on huge textures.
+        const MAX_CHUNK_BYTES: usize = 1024 * 1024;
+        let mut zeros = Vec::new();
+
+        let is_3d_target = target == gl::TEXTURE_3D || target == gl::TEXTURE_2D_ARRAY;
+
+        for level in 0..levels {
+            let level_width = (width >> level).max(1);
+            let level_height = (height >> level).max(1);
+            let row_bytes = level_width as usize * bpp;
+            let rows_per_chunk = (MAX_CHUNK_BYTES / row_bytes).clamp(1, level_height as usize);
+            let chunk_bytes = rows_per_chunk * row_bytes;
+
+            if zeros.len() < chunk_bytes {
+                zeros.resize(chunk_bytes, 0);
+            }
+
+            let level_depth = if target == gl::TEXTURE_3D {
+                (depth >> level).max(1)
+            } else {
+                depth
+            };
+
+            let num_images = if target == gl::TEXTURE_CUBE_MAP {
+                6
+            } else {
+                level_depth
+            };
+
+            for img in 0..num_images {
+                let mut y = 0;
+                while y < level_height {
+                    let rows = (level_height - y).min(rows_per_chunk as u32);
+                    let upload_bytes = rows as usize * row_bytes;
+                    let slice = &zeros[..upload_bytes];
+
+                    unsafe {
+                        if is_3d_target {
+                            gl.tex_sub_image_3d(
+                                target,
+                                level as i32,
+                                0,
+                                y as i32,
+                                img as i32,
+                                level_width as i32,
+                                rows as i32,
+                                1,
+                                unsized_format.as_gl_constant(),
+                                gl_type,
+                                PixelUnpackData::Slice(Some(slice)),
+                            );
+                        } else {
+                            let img_target = if target == gl::TEXTURE_CUBE_MAP {
+                                gl::TEXTURE_CUBE_MAP_POSITIVE_X + img
+                            } else {
+                                target
+                            };
+                            gl.tex_sub_image_2d(
+                                img_target,
+                                level as i32,
+                                0,
+                                y as i32,
+                                level_width as i32,
+                                rows as i32,
+                                unsized_format.as_gl_constant(),
+                                gl_type,
+                                PixelUnpackData::Slice(Some(slice)),
+                            );
+                        }
+                    }
+
+                    y += rows;
+                }
+            }
+        }
+
+        if prev_pbo != 0 {
+            unsafe {
+                gl.bind_buffer(
+                    gl::PIXEL_UNPACK_BUFFER,
+                    NonZeroU32::new(prev_pbo as u32).map(gl::NativeBuffer),
                 );
             }
         }
@@ -2697,6 +2925,22 @@ impl WebGLImpl {
         chan.send(parameter).unwrap();
     }
 
+    /// Reads one component size of a draw framebuffer attachment, or 0 when
+    /// nothing is attached, as OpenGL ES 3.0.6 §4.4.5 defines the `*_BITS` values.
+    fn read_draw_framebuffer_bits(gl: &Gl, attachment: u32, pname: u32) -> i32 {
+        unsafe {
+            let object_type = gl.get_framebuffer_attachment_parameter_i32(
+                gl::DRAW_FRAMEBUFFER,
+                attachment,
+                gl::FRAMEBUFFER_ATTACHMENT_OBJECT_TYPE,
+            );
+            if object_type as u32 == gl::NONE {
+                return 0;
+            }
+            gl.get_framebuffer_attachment_parameter_i32(gl::DRAW_FRAMEBUFFER, attachment, pname)
+        }
+    }
+
     /// <https://www.khronos.org/registry/webgl/specs/latest/1.0/#5.14.7>
     fn get_renderbuffer_parameter(gl: &Gl, target: u32, pname: u32, chan: &GenericSender<i32>) {
         let parameter = unsafe { gl.get_renderbuffer_parameter_i32(target, pname) };
@@ -2707,14 +2951,13 @@ impl WebGLImpl {
         gl: &Gl,
         program_id: WebGLProgramId,
         name: &str,
-        chan: &GenericSender<i32>,
+        chan: &GenericSender<Option<i32>>,
     ) {
         let location = unsafe {
             gl.get_uniform_location(program_id.glow(), &to_name_in_compiled_shader(name))
         };
         // (#34300): replace this with WebGLUniformId
-        chan.send(location.map(|l| l.0).unwrap_or_default() as i32)
-            .unwrap();
+        chan.send(location.map(|l| l.0 as i32)).unwrap();
     }
 
     fn shader_info_log(gl: &Gl, shader_id: WebGLShaderId, chan: &GenericSender<String>) {
@@ -2807,6 +3050,23 @@ impl WebGLImpl {
             state.drawing_to_default_framebuffer =
                 request == WebGLFramebufferBindingRequest::Default;
             state.restore_invariant(gl);
+        }
+    }
+
+    /// Maps a WebGL default framebuffer color buffer to its GL name: when the surface is backed
+    /// by a framebuffer object, GL rejects `BACK` and uses `COLOR_ATTACHMENT0` for the color
+    /// buffer.
+    fn default_framebuffer_color_buffer(buffer: u32, ctx: &Context, device: &Device) -> u32 {
+        if buffer != gl::BACK {
+            return buffer;
+        }
+        let surface_info = device
+            .context_surface_info(ctx)
+            .expect("WebGL commands run with their context current")
+            .expect("WebGL contexts are created with a surface attached");
+        match surface_info.framebuffer_object {
+            Some(_) => gl::COLOR_ATTACHMENT0,
+            None => gl::BACK,
         }
     }
 
@@ -3334,5 +3594,272 @@ impl FramebufferRebindingInfo {
                 self.viewport[3],
             )
         };
+    }
+}
+
+/// Returns the bytes per pixel of a `readPixels` format and type, including the integer
+/// formats and the packed types that glow's size helpers reject.
+fn read_pixels_bytes_per_pixel(format: u32, pixel_type: u32) -> usize {
+    let components = match format {
+        gl::RED | gl::RED_INTEGER | gl::ALPHA | gl::LUMINANCE => 1,
+        gl::RG | gl::RG_INTEGER | gl::LUMINANCE_ALPHA => 2,
+        gl::RGB | gl::RGB_INTEGER => 3,
+        gl::RGBA | gl::RGBA_INTEGER => 4,
+        _ => unreachable!("readPixels formats are validated on the script side"),
+    };
+    match pixel_type {
+        gl::UNSIGNED_SHORT_4_4_4_4 | gl::UNSIGNED_SHORT_5_5_5_1 | gl::UNSIGNED_SHORT_5_6_5 => 2,
+        gl::UNSIGNED_INT_2_10_10_10_REV |
+        gl::UNSIGNED_INT_10F_11F_11F_REV |
+        gl::UNSIGNED_INT_5_9_9_9_REV => 4,
+        _ => components * bytes_per_type(pixel_type),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use servo_canvas_traits::webgl::{TexDataType, TexFormat};
+
+    use super::*;
+
+    #[test]
+    fn test_tex_bytes_per_pixel() {
+        // Standard uncompressed formats
+        assert_eq!(
+            WebGLImpl::tex_bytes_per_pixel(TexFormat::RGBA, TexDataType::UnsignedByte),
+            4
+        );
+        assert_eq!(
+            WebGLImpl::tex_bytes_per_pixel(TexFormat::RGB, TexDataType::UnsignedByte),
+            3
+        );
+        assert_eq!(
+            WebGLImpl::tex_bytes_per_pixel(TexFormat::RG, TexDataType::UnsignedByte),
+            2
+        );
+        assert_eq!(
+            WebGLImpl::tex_bytes_per_pixel(TexFormat::Red, TexDataType::UnsignedByte),
+            1
+        );
+        assert_eq!(
+            WebGLImpl::tex_bytes_per_pixel(TexFormat::RGBA, TexDataType::Float),
+            16
+        );
+        assert_eq!(
+            WebGLImpl::tex_bytes_per_pixel(TexFormat::RGBA, TexDataType::HalfFloat),
+            8
+        );
+        assert_eq!(
+            WebGLImpl::tex_bytes_per_pixel(TexFormat::DepthComponent, TexDataType::UnsignedShort),
+            2
+        );
+        assert_eq!(
+            WebGLImpl::tex_bytes_per_pixel(TexFormat::DepthComponent, TexDataType::UnsignedInt),
+            4
+        );
+        assert_eq!(
+            WebGLImpl::tex_bytes_per_pixel(TexFormat::DepthComponent, TexDataType::Float),
+            4
+        );
+
+        // Packed types
+        assert_eq!(
+            WebGLImpl::tex_bytes_per_pixel(TexFormat::RGB, TexDataType::UnsignedShort565),
+            2
+        );
+        assert_eq!(
+            WebGLImpl::tex_bytes_per_pixel(TexFormat::RGBA, TexDataType::UnsignedShort4444),
+            2
+        );
+        assert_eq!(
+            WebGLImpl::tex_bytes_per_pixel(TexFormat::RGBA, TexDataType::UnsignedShort5551),
+            2
+        );
+        assert_eq!(
+            WebGLImpl::tex_bytes_per_pixel(TexFormat::RGB, TexDataType::UnsignedInt10f11f11fRev),
+            4
+        );
+        assert_eq!(
+            WebGLImpl::tex_bytes_per_pixel(TexFormat::RGBA, TexDataType::UnsignedInt2101010Rev),
+            4
+        );
+        assert_eq!(
+            WebGLImpl::tex_bytes_per_pixel(TexFormat::RGB, TexDataType::UnsignedInt5999Rev),
+            4
+        );
+        assert_eq!(
+            WebGLImpl::tex_bytes_per_pixel(TexFormat::DepthStencil, TexDataType::UnsignedInt248),
+            4
+        );
+        assert_eq!(
+            WebGLImpl::tex_bytes_per_pixel(
+                TexFormat::DepthStencil,
+                TexDataType::Float32UnsignedInt248Rev
+            ),
+            8
+        );
+    }
+
+    #[test]
+    fn test_sized_internal_formats_resolution() {
+        let test_formats = [
+            (TexFormat::R8, TexFormat::Red, TexDataType::UnsignedByte, 1),
+            (TexFormat::R8SNorm, TexFormat::Red, TexDataType::Byte, 1),
+            (TexFormat::R16f, TexFormat::Red, TexDataType::HalfFloat, 2),
+            (TexFormat::R32f, TexFormat::Red, TexDataType::Float, 4),
+            (
+                TexFormat::R8ui,
+                TexFormat::RedInteger,
+                TexDataType::UnsignedByte,
+                1,
+            ),
+            (TexFormat::R8i, TexFormat::RedInteger, TexDataType::Byte, 1),
+            (TexFormat::RG8, TexFormat::RG, TexDataType::UnsignedByte, 2),
+            (TexFormat::RG16f, TexFormat::RG, TexDataType::HalfFloat, 4),
+            (TexFormat::RG32f, TexFormat::RG, TexDataType::Float, 8),
+            (
+                TexFormat::RGB8,
+                TexFormat::RGB,
+                TexDataType::UnsignedByte,
+                3,
+            ),
+            (
+                TexFormat::SRGB8,
+                TexFormat::RGB,
+                TexDataType::UnsignedByte,
+                3,
+            ),
+            (
+                TexFormat::RGB565,
+                TexFormat::RGB,
+                TexDataType::UnsignedByte,
+                3,
+            ),
+            (
+                TexFormat::R11fG11fB10f,
+                TexFormat::RGB,
+                TexDataType::UnsignedInt10f11f11fRev,
+                4,
+            ),
+            (
+                TexFormat::RGB9E5,
+                TexFormat::RGB,
+                TexDataType::UnsignedInt5999Rev,
+                4,
+            ),
+            (TexFormat::RGB16f, TexFormat::RGB, TexDataType::HalfFloat, 6),
+            (TexFormat::RGB32f, TexFormat::RGB, TexDataType::Float, 12),
+            (
+                TexFormat::RGBA8,
+                TexFormat::RGBA,
+                TexDataType::UnsignedByte,
+                4,
+            ),
+            (
+                TexFormat::SRGB8Alpha8,
+                TexFormat::RGBA,
+                TexDataType::UnsignedByte,
+                4,
+            ),
+            (
+                TexFormat::RGB5A1,
+                TexFormat::RGBA,
+                TexDataType::UnsignedByte,
+                4,
+            ),
+            (
+                TexFormat::RGBA4,
+                TexFormat::RGBA,
+                TexDataType::UnsignedByte,
+                4,
+            ),
+            (
+                TexFormat::RGB10A2,
+                TexFormat::RGBA,
+                TexDataType::UnsignedInt2101010Rev,
+                4,
+            ),
+            (
+                TexFormat::RGBA16f,
+                TexFormat::RGBA,
+                TexDataType::HalfFloat,
+                8,
+            ),
+            (TexFormat::RGBA32f, TexFormat::RGBA, TexDataType::Float, 16),
+            (
+                TexFormat::RGBA8ui,
+                TexFormat::RGBAInteger,
+                TexDataType::UnsignedByte,
+                4,
+            ),
+            (
+                TexFormat::RGB10A2ui,
+                TexFormat::RGBAInteger,
+                TexDataType::UnsignedInt2101010Rev,
+                4,
+            ),
+            (
+                TexFormat::RGBA16ui,
+                TexFormat::RGBAInteger,
+                TexDataType::UnsignedShort,
+                8,
+            ),
+            (
+                TexFormat::RGBA32ui,
+                TexFormat::RGBAInteger,
+                TexDataType::UnsignedInt,
+                16,
+            ),
+            (
+                TexFormat::DepthComponent16,
+                TexFormat::DepthComponent,
+                TexDataType::UnsignedShort,
+                2,
+            ),
+            (
+                TexFormat::DepthComponent24,
+                TexFormat::DepthComponent,
+                TexDataType::UnsignedInt,
+                4,
+            ),
+            (
+                TexFormat::DepthComponent32f,
+                TexFormat::DepthComponent,
+                TexDataType::Float,
+                4,
+            ),
+            (
+                TexFormat::Depth24Stencil8,
+                TexFormat::DepthStencil,
+                TexDataType::UnsignedInt248,
+                4,
+            ),
+            (
+                TexFormat::Depth32fStencil8,
+                TexFormat::DepthStencil,
+                TexDataType::Float32UnsignedInt248Rev,
+                8,
+            ),
+        ];
+
+        for (sized, expected_unsized, expected_type, expected_bpp) in test_formats {
+            let unsized_format = sized.to_unsized();
+            assert_eq!(
+                unsized_format, expected_unsized,
+                "Unsized format mismatch for {:?}",
+                sized
+            );
+            let first_type = *sized
+                .compatible_data_types()
+                .first()
+                .expect("Compatible data type missing");
+            assert_eq!(
+                first_type, expected_type,
+                "Data type mismatch for {:?}",
+                sized
+            );
+            let bpp = WebGLImpl::tex_bytes_per_pixel(unsized_format, first_type);
+            assert_eq!(bpp, expected_bpp, "Bpp mismatch for {:?}", sized);
+        }
     }
 }

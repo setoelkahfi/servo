@@ -283,6 +283,14 @@ function* makeDebuggeeIterator(object) {
     }
 }
 
+// Used by the console to preview functions logged from debuggee code.
+// The function arrives as a cross-compartment wrapper, and `parameterNames` is only
+// available on the function itself, so unwrap it first.
+setGetFunctionParameterNamesCallback(fn => {
+    const [debuggee] = dbg.getDebuggees();
+    return debuggee?.makeDebuggeeValue(fn).unwrap()?.parameterNames ?? [];
+});
+
 // <https://searchfox.org/mozilla-central/source/devtools/server/actors/object/previewers.js#125>
 previewers.Function = [ function FunctionPreviewer(obj, depth) {
     let functionDetails = {
@@ -439,10 +447,19 @@ addEventListener("eval", event => {
                 hasException: false,
             };
         } else if ("throw" in completionValue) {
-            let realError = completionValue.throw.unsafeDereference();
+            let exceptionMessage = null;
+            if (typeof completionValue.throw.unsafeDereference === "function") {
+                const deref = completionValue.throw.unsafeDereference();
+                if (typeof deref.message === "string") {
+                    exceptionMessage = deref.message;
+                }
+            }
+            if (!exceptionMessage) {
+                exceptionMessage = `Uncaught ${completionValue.throw}`;
+            }
             resultValue = {
                 value: createValueGrip(completionValue.throw, 0),
-                exceptionMessage: realError.message,
+                exceptionMessage,
                 hasException: true,
             };
         } else if ("return" in completionValue) {

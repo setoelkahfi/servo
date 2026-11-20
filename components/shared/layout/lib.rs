@@ -8,11 +8,15 @@
 
 #![deny(unsafe_code)]
 
+mod accessibility;
+mod container_timing_record;
+mod largest_contentful_paint_candidate;
 mod layout_damage;
 mod layout_dom;
 mod layout_element;
 mod layout_node;
 mod pseudo_element_chain;
+mod writing_mode_ext;
 
 use std::any::Any;
 use std::rc::Rc;
@@ -21,13 +25,20 @@ use std::sync::atomic::AtomicIsize;
 use std::thread::JoinHandle;
 use std::time::Duration;
 
+pub use accessibility::{
+    ACCESSKIT_ROLE_TO_ARIA_ROLE, ARIA_ROLE_TO_ACCESSKIT_ROLE, AccessibilityDamage,
+    SUPPORTED_ARIA_ROLES,
+};
+use accesskit::{Action, ActionData, ActionRequest};
 use app_units::Au;
 use background_hang_monitor_api::BackgroundHangMonitorRegister;
 use bitflags::bitflags;
+pub use container_timing_record::ContainerTimingRecord;
 use embedder_traits::{Cursor, ScriptToEmbedderChan, Theme, UntrustedNodeAddress, ViewportDetails};
 use euclid::{Point2D, Rect};
 use fonts::{FontContext, WebFontDocumentContext, WebFontSetDifference};
-pub use layout_damage::{AccessibilityDamage, LayoutDamage};
+pub use largest_contentful_paint_candidate::LCPCandidate;
+pub use layout_damage::LayoutDamage;
 pub use layout_dom::{
     DangerousStyleElementOf, DangerousStyleNodeOf, LayoutDomTypeBundle, LayoutElementOf,
     LayoutNodeOf,
@@ -40,7 +51,7 @@ use malloc_size_of_derive::MallocSizeOf;
 use net_traits::image_cache::{ImageCache, ImageCacheFactory, PendingImageId};
 use net_traits::request::InternalRequest;
 use paint_api::CrossProcessPaintApi;
-use paint_api::largest_contentful_paint_candidate::LCPCandidate;
+use paint_api::display_list::PaintTimingInfo;
 use parking_lot::RwLock;
 use pixels::{RasterImage, Repeat};
 use profile_traits::mem::Report;
@@ -63,10 +74,10 @@ use style::data::ElementDataWrapper;
 use style::device::Device;
 use style::dom::OpaqueNode;
 use style::invalidation::element::restyle_hints::RestyleHint;
+use style::logical_geometry::WritingMode;
 use style::properties::style_structs::Font;
 use style::properties::{ComputedValues, PropertyId};
 use style::selector_parser::{PseudoElement, RestyleDamage, Snapshot};
-use style::str::char_is_whitespace;
 use style::stylesheets::{DocumentStyleSheet, Stylesheet};
 use style::stylist::Stylist;
 #[cfg(debug_assertions)]
@@ -77,11 +88,25 @@ use uuid::Uuid;
 use webrender_api::units::{DeviceIntSize, LayoutPoint, LayoutVector2D};
 use webrender_api::{ExternalScrollId, ImageKey};
 
+pub use crate::writing_mode_ext::WritingModeExt;
+
 pub trait GenericLayoutDataTrait: Any + MallocSizeOfTrait + Send + Sync + 'static {
     fn as_any(&self) -> &dyn Any;
 
     /// Returns whether `new_range` was successfully set on an existing text run
-    fn set_text_run_selection(&self, new_range: Option<RangeAny<Utf32CodeUnits>>) -> bool;
+    fn set_text_run_selection(
+        &self,
+        new_range: Option<RangeAny<Utf32CodeUnits>>,
+        new_paints_caret: bool,
+    ) -> bool;
+
+    /// Set whether or not this node is selected when it is an element. Returns `true`
+    /// if anything changed that requires a new display list.
+    fn set_element_selection(&self, selected: bool) -> bool;
+
+    /// Get the text rendered by this node, if it is a `CharacterData` node and produces
+    /// a `TextRun` in the box tree.
+    fn rendered_text(&self, range: RangeAny<Utf32CodeUnits>) -> Option<String>;
 }
 
 pub trait LayoutDataTrait: GenericLayoutDataTrait + Default {}
@@ -124,11 +149,13 @@ pub enum LayoutElementType {
     HTMLImageElement,
     HTMLInputElement,
     HTMLMediaElement,
+    HTMLMeterElement,
     HTMLObjectElement,
     HTMLOptGroupElement,
     HTMLOptionElement,
     HTMLParagraphElement,
     HTMLPreElement,
+    HTMLProgressElement,
     HTMLSelectElement,
     HTMLTableCellElement,
     HTMLTableColElement,
@@ -149,106 +176,10 @@ pub struct HTMLCanvasData {
 pub struct SVGElementData<'dom> {
     /// The SVG's XML source represented as a base64 encoded `data:` url.
     pub source: Option<Result<ServoUrl, ()>>,
+    pub view_box_ratio: Option<f32>,
     pub width: Option<&'dom AttrValue>,
     pub height: Option<&'dom AttrValue>,
     pub svg_id: Uuid,
-    pub view_box: Option<&'dom AttrValue>,
-}
-
-impl SVGElementData<'_> {
-    pub fn ratio_from_view_box(&self) -> Option<f32> {
-        // <https://svgwg.org/svg2-draft/coords.html#ViewBoxAttribute>
-        // The viewBox is four `<number>`s, so it cannot be parsed with the HTML
-        // integer parsers: `viewBox="0 0 114.778 100"` is valid and common.
-        let [_min_x, _min_y, width, height] = parse_view_box(self.view_box?)?;
-
-        // A negative width or height makes the attribute invalid, and a zero one
-        // disables rendering of the element. Neither yields a natural ratio.
-        (width > 0. && height > 0.).then(|| width / height)
-    }
-}
-
-/// Parses the four `<number>`s of an SVG `viewBox` attribute, which are separated
-/// by whitespace and/or a single comma.
-/// <https://svgwg.org/svg2-draft/coords.html#ViewBoxAttribute>
-fn parse_view_box(value: &str) -> Option<[f32; 4]> {
-    let mut numbers = [0f32; 4];
-    let mut rest = value;
-
-    for (index, number) in numbers.iter_mut().enumerate() {
-        rest = rest.trim_start_matches(char_is_whitespace);
-        if index != 0 {
-            // Separators are required between numbers, but a lone comma is enough.
-            rest = rest.strip_prefix(',').unwrap_or(rest);
-            rest = rest.trim_start_matches(char_is_whitespace);
-        }
-
-        let (value, remainder) = parse_number_prefix(rest)?;
-        *number = value;
-        rest = remainder;
-
-        // Without a separator, `1 2 34` would parse as four numbers.
-        if index != 3 &&
-            !rest.starts_with(',') &&
-            !rest.starts_with(char_is_whitespace) &&
-            !rest.is_empty()
-        {
-            return None;
-        }
-    }
-
-    rest.trim_matches(char_is_whitespace)
-        .is_empty()
-        .then_some(numbers)
-}
-
-/// Splits the leading SVG `<number>` off `input`, returning it and the rest of the
-/// string. <https://svgwg.org/svg2-draft/types.html#syntax>
-fn parse_number_prefix(input: &str) -> Option<(f32, &str)> {
-    let bytes = input.as_bytes();
-    let mut end = 0;
-
-    if matches!(bytes.get(end), Some(b'+' | b'-')) {
-        end += 1;
-    }
-
-    let integer_start = end;
-    while matches!(bytes.get(end), Some(byte) if byte.is_ascii_digit()) {
-        end += 1;
-    }
-    let mut digits = end - integer_start;
-
-    if bytes.get(end) == Some(&b'.') {
-        end += 1;
-        let fraction_start = end;
-        while matches!(bytes.get(end), Some(byte) if byte.is_ascii_digit()) {
-            end += 1;
-        }
-        digits += end - fraction_start;
-    }
-
-    if digits == 0 {
-        return None;
-    }
-
-    // An exponent only counts if it has at least one digit; `1e` is `1` followed
-    // by junk, which makes the whole attribute invalid rather than this number.
-    if matches!(bytes.get(end), Some(b'e' | b'E')) {
-        let mut exponent_end = end + 1;
-        if matches!(bytes.get(exponent_end), Some(b'+' | b'-')) {
-            exponent_end += 1;
-        }
-        let exponent_start = exponent_end;
-        while matches!(bytes.get(exponent_end), Some(byte) if byte.is_ascii_digit()) {
-            exponent_end += 1;
-        }
-        if exponent_end > exponent_start {
-            end = exponent_end;
-        }
-    }
-
-    let number = input[..end].parse::<f32>().ok()?;
-    number.is_finite().then(|| (number, &input[end..]))
 }
 
 /// The address of a node known to be valid. These are sent from script to layout.
@@ -310,7 +241,14 @@ pub struct MediaMetadata {
 pub struct HTMLMediaData {
     pub current_frame: Option<MediaFrame>,
     pub metadata: Option<MediaMetadata>,
-    pub poster_url: Option<ServoUrl>,
+    pub poster_or_src_url: Option<ServoUrl>,
+}
+
+#[derive(Debug)]
+pub struct AccessibilityActionRequest {
+    pub action: Action,
+    pub target: OpaqueNode,
+    pub data: Option<ActionData>,
 }
 
 pub struct LayoutConfig {
@@ -327,6 +265,10 @@ pub struct LayoutConfig {
     pub user_stylesheets: Rc<Vec<DocumentStyleSheet>>,
     pub theme: Theme,
     pub embedder_chan: ScriptToEmbedderChan,
+    /// Document-scoped key for hashing the inputs of CSS `random()` functions.
+    /// This random value is 128 bits, as required for the key of the SipHash-1-3
+    /// keyed hash function (see [`style::device::Device::document_random_hasher()`]).
+    pub document_random_hasher_key: (u64, u64),
 }
 
 bitflags! {
@@ -427,7 +369,7 @@ pub trait Layout {
         root: TrustedNodeAddress,
         possible_descendant: TrustedNodeAddress,
     ) -> bool;
-    fn query_padding(&self, node: TrustedNodeAddress) -> Option<PhysicalSides>;
+    fn query_padding(&self, node: TrustedNodeAddress) -> Option<PhysicalSides<Au>>;
     fn query_box_area(
         &self,
         node: TrustedNodeAddress,
@@ -454,6 +396,9 @@ pub trait Layout {
         animations: DocumentAnimationSet,
         animation_timeline_value: f64,
     ) -> String;
+
+    fn query_accesskit_node(&self, node: TrustedNodeAddress) -> Option<accesskit::Node>;
+
     fn query_resolved_font_style(
         &self,
         node: TrustedNodeAddress,
@@ -470,6 +415,17 @@ pub trait Layout {
         node: TrustedNodeAddress,
         point_in_viewport: Point2D<Au, CSSPixel>,
     ) -> Option<(OpaqueNode, Utf32CodeUnits)>;
+    /// Find the text segment of the given [`SegmentGranularity`] at the given `offset` in the
+    /// given node. Returns `None` when `node` is not a text node or due to any other failure.
+    fn query_text_segment(
+        &self,
+        node: TrustedNodeAddress,
+        offset: Utf32CodeUnitsOrNodeOffset,
+        granularity: SegmentGranularity,
+    ) -> Option<(
+        (OpaqueNode, Utf32CodeUnitsOrNodeOffset),
+        (OpaqueNode, Utf32CodeUnitsOrNodeOffset),
+    )>;
     fn hit_test(&self, flags: HitTestFlags, point: LayoutPoint) -> HitTestResult;
     fn query_effective_overflow(&self, node: TrustedNodeAddress) -> Option<AxesOverflow>;
     fn stylist_mut(&mut self) -> &mut Stylist;
@@ -481,19 +437,36 @@ pub trait Layout {
     /// Returns whether accessibility is active for this Layout.
     fn accessibility_active(&self) -> bool;
 
-    /// Whether the accessibility tree must be updated. This is set to true when
-    /// - accessibility is activated; or
-    /// - a page is loaded after accesibility is activated.
+    /// Whether the accessibility tree must be updated. This is true when accessibility is
+    /// activated, and at least one of the following conditions is met:
+    /// - the accessibility tree has not yet been built after activating accessibility;
+    /// - set_force_accessibility_update_if_active() has been called since the accessibility tree
+    ///   was last updated (for example, if a scroll occurred, or the focused element changed);
+    /// - there are pending actions from assistive technology.
     ///
-    /// Checked in can_skip_reflow_request_entirely(), as a dirty accessibility tree
-    /// should force a reflow, and handle_accessibility_tree_update() to determine whether to
-    /// update the accessibility tree during reflow.
-    fn force_accessibility_update(&self) -> bool;
+    /// Checked in can_skip_reflow_request_entirely(), as a pending accessibility tree update
+    /// should force a reflow, and during reflow to determine whether to update the
+    /// accessibility tree.
+    fn needs_accessibility_update(&self) -> bool;
 
-    /// See [Self::force_accessibility_update()].
-    fn set_force_accessibility_update(&self);
+    /// If accessibility is active, force an accessibility update on the next reflow.
+    /// See [Self::needs_accessibility_update()].
+    fn set_force_accessibility_update_if_active(&self);
+
+    /// Handle an accessibility action.
+    fn handle_accessibility_action(&self, action_request: ActionRequest);
 
     fn font_context(&self) -> &Arc<FontContext>;
+}
+
+/// The granularity of the text boundaries to find.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, MallocSizeOf, PartialEq, Serialize)]
+pub enum SegmentGranularity {
+    /// A Unicode word boundary.
+    Word,
+    /// A hard line break. If no hard line break is found, this is the entire
+    /// containing inline formatting context's text.
+    HardLineBreak,
 }
 
 /// This trait is part of `layout_api` because it depends on both `script_traits`
@@ -533,13 +506,7 @@ pub enum NodeRenderingType {
     NotRendered,
 }
 
-#[derive(Default)]
-pub struct PhysicalSides {
-    pub left: Au,
-    pub top: Au,
-    pub right: Au,
-    pub bottom: Au,
-}
+pub type PhysicalSides<U> = euclid::SideOffsets2D<U, CSSPixel>;
 
 #[derive(Clone, Default)]
 pub struct OffsetParentResponse {
@@ -575,8 +542,8 @@ impl Default for AxesOverflow {
 impl From<&ComputedValues> for AxesOverflow {
     fn from(style: &ComputedValues) -> Self {
         Self {
-            x: style.clone_overflow_x(),
-            y: style.clone_overflow_y(),
+            x: style.slow_clone_overflow_x(),
+            y: style.slow_clone_overflow_y(),
         }
     }
 }
@@ -599,8 +566,8 @@ impl AxesOverflow {
 
 #[derive(Clone)]
 pub enum ScrollContainerResponse {
-    Viewport(AxesOverflow),
-    Element(UntrustedNodeAddress, AxesOverflow),
+    Viewport(AxesOverflow, WritingMode),
+    Element(UntrustedNodeAddress, AxesOverflow, WritingMode),
 }
 
 #[derive(Debug, PartialEq)]
@@ -622,9 +589,10 @@ pub enum QueryMsg {
     ResolvedStyleQuery(PropertyId),
     ScrollingAreaOrOffsetQuery,
     StyleQuery,
-    TextIndexQuery,
+    TextIndexOrSegmentQuery,
     PaddingQuery,
     FlushForUpdateTheRenderingQuery,
+    AccessKitNodeQuery,
 }
 
 /// The goal of a reflow request.
@@ -704,8 +672,10 @@ pub struct ReflowResult {
     pub changed_web_fonts: WebFontSetDifference,
     /// The LCP candidate during this layout pass, if any.
     pub lcp_candidate: Option<LCPCandidate>,
-    /// The UntrustedNodeAddress for the LCP candidate if any.
-    pub lcp_node_address: Option<UntrustedNodeAddress>,
+    /// Actions which have been requested by assistive technology, if any.
+    pub pending_accessibility_actions: Vec<AccessibilityActionRequest>,
+    /// The containers whose painted area grew during this layout pass, if any.
+    pub container_timing_records: Vec<ContainerTimingRecord>,
 }
 
 bitflags! {
@@ -768,6 +738,20 @@ pub struct ReflowRequestRestyle {
     pub pending_restyles: Vec<(TrustedNodeAddress, PendingRestyle)>,
 }
 
+/// Information needed for a script-initiated reflow that requires the accessibility tree to be
+/// updated.
+#[derive(Debug)]
+pub struct ReflowRequestAccessibility {
+    /// Damage to the accessibility tree from DOM mutations.
+    pub damage: Vec<(TrustedNodeAddress, AccessibilityDamage)>,
+    /// The document's focused element at the time of the reflow, if any.
+    pub focused_element: Option<OpaqueNode>,
+    /// Nodes which were removed from the DOM tree since the last reflow, which were rooted in
+    /// [`AccessibilityData`]. Only set if [`pref::expensive_accessibility_test_assertions_enabled`]
+    /// is set.
+    pub rooted_nodes_for_integrity_check: Option<FxHashSet<OpaqueNode>>,
+}
+
 /// Information needed for a script-initiated reflow.
 #[derive(Debug)]
 pub struct ReflowRequest {
@@ -775,7 +759,7 @@ pub struct ReflowRequest {
     pub document: TrustedNodeAddress,
     /// The current layout [`Epoch`] managed by the script thread.
     pub epoch: Epoch,
-    /// If a restyle is necessary, all of the informatio needed to do that restyle.
+    /// If a restyle is necessary, all of the information needed to do that restyle.
     pub restyle: Option<ReflowRequestRestyle>,
     /// The current [`ViewportDetails`] to use for this reflow.
     pub viewport_details: ViewportDetails,
@@ -791,18 +775,23 @@ pub struct ReflowRequest {
     pub animating_images: Arc<RwLock<AnimatingImages>>,
     /// The node highlighted by the devtools, if any
     pub highlighted_dom_node: Option<OpaqueNode>,
+    /// Whether or not this document has system focus and is the focused frame
+    /// in the frame tree.
+    pub frame_focused: bool,
     /// Whether LCP computation should be halted for this reflow.
     /// From <https://www.w3.org/TR/largest-contentful-paint/#limitations>:
     /// > The LargestContentfulPaint ... algorithm halts ... inputs.
     pub halt_lcp: bool,
+    /// Whether the document's browsing context is paint-timing eligible.
+    /// <https://www.w3.org/TR/paint-timing/#paint-timing-eligible>
+    pub paint_timing_eligible: bool,
+    /// The [`PaintTimingInfo`] for this reflow.
+    /// <https://www.w3.org/TR/paint-timing/#paint-timing-info>
+    pub paint_timing_info: PaintTimingInfo,
     /// The current font context.
     pub document_context: WebFontDocumentContext,
-    /// Damage to the accessibility tree from DOM mutations.
-    pub accessibility_damage: Option<Vec<(TrustedNodeAddress, AccessibilityDamage)>>,
-    /// Nodes which were removed from the DOM tree since the last reflow, which were rooted in
-    /// [`AccessibilityData`]. Only set if [`pref::expensive_accessibility_test_assertions_enabled`]
-    /// is set.
-    pub rooted_nodes_for_accessibility_integrity_check: Option<FxHashSet<OpaqueNode>>,
+    /// If an accessibility tree update is necessary, all the information needed to do the update.
+    pub accessibility: Option<ReflowRequestAccessibility>,
 }
 
 impl ReflowRequest {
@@ -1095,48 +1084,6 @@ mod test {
     use crate::ImageAnimationState;
 
     #[test]
-    fn test_parse_view_box() {
-        use crate::parse_view_box;
-
-        let approximately_equal = |result: Option<[f32; 4]>, expected: Option<[f32; 4]>| {
-            match (result, expected) {
-                (Some(result), Some(expected)) => result
-                    .iter()
-                    .zip(expected.iter())
-                    .all(|(result, expected)| (result - expected).abs() < 1e-4),
-                (None, None) => true,
-                _ => false,
-            }
-        };
-
-        for (input, expected) in [
-            // The App Store's badge icons use fractional numbers, which the HTML
-            // integer parsers this used to rely on could not read.
-            ("0 0 114.778 100", Some([0., 0., 114.778, 100.])),
-            ("0 0 115 100", Some([0., 0., 115., 100.])),
-            ("0, 0, 115, 100", Some([0., 0., 115., 100.])),
-            ("  -5 -5.5 115 100  ", Some([-5., -5.5, 115., 100.])),
-            ("+0 +0 +115 +100", Some([0., 0., 115., 100.])),
-            ("0 0 1e2 50", Some([0., 0., 100., 50.])),
-            ("0 0 .5 .25", Some([0., 0., 0.5, 0.25])),
-            ("0 0 -115 100", Some([0., 0., -115., 100.])),
-            ("0 0 1e 50", None),
-            ("0 0 115 100 5", None),
-            ("0 0 115", None),
-            ("1 2 34", None),
-            ("0 0 115 abc", None),
-            ("0,0,115,100,", None),
-            ("", None),
-        ] {
-            assert!(
-                approximately_equal(parse_view_box(input), expected),
-                "parse_view_box({input:?}) was {:?}, expected {expected:?}",
-                parse_view_box(input),
-            );
-        }
-    }
-
-    #[test]
     fn test_animated_image_update() {
         let image_frames: Vec<ImageFrame> = std::iter::repeat_with(|| ImageFrame {
             delay: Some(Duration::from_millis(100)),
@@ -1156,6 +1103,7 @@ mod test {
             bytes: Arc::new(vec![1]),
             frames: image_frames,
             cors_status: CorsStatus::Unsafe,
+            load_time: None,
             loop_count: Some(Repeat::Infinite),
             is_opaque: false,
         };
@@ -1197,6 +1145,7 @@ mod test {
             bytes: Arc::new(vec![1]),
             frames: image_frames,
             cors_status: CorsStatus::Unsafe,
+            load_time: None,
             loop_count: Some(Repeat::Finite(NonZeroU32::new(1).unwrap())),
             is_opaque: false,
         };

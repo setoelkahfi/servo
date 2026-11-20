@@ -1,4 +1,4 @@
-html {
+:root {
   color: CanvasText;
 }
 
@@ -7,7 +7,7 @@ input[type="hidden"] {
 }
 
 /* Textual inputs */
-input:not([type="file"]),
+input:not([type="file"], [type="image"]),
 textarea {
   background-color: Field;
   border: solid grey 1px;
@@ -22,7 +22,7 @@ textarea {
     padding: 2px;
 }
 
-input {
+input:not([type="image"]) {
     padding: 1px 2px;
 }
 
@@ -267,9 +267,9 @@ input[type="range"]::slider-thumb {
   border-radius: 50%;
   background: #007aff;
 
-  /* Vertically centered, adjust inline direction by width so thumb
-     is centered on range value. */
-  transform: translate(-8px, -50%);
+  /* The thumb is placed by setting `inset-inline-start` to the value's position within the
+     input's padding box. Adjust inline direction by width so thumb is centered on range value. */
+  margin-inline-start: -8px;
 }
 
 input[type="range"]:disabled::slider-fill,
@@ -550,8 +550,8 @@ progress {
   border-radius: 3px;
   border: 1px solid rgba(0, 0, 0, 0.5);
 }
-/* FIXME: This should use ::-moz-progress-bar */
-progress #-servo-progress-bar {
+
+progress::-moz-progress-bar {
   display: block;
   height: 100%;
   background-color: #7a3;
@@ -563,4 +563,20 @@ slot {
 
 *::selection {
   background: rgba(176, 214, 255, 1.0);
+}
+
+/* Ensure the entire document uses the same writing mode, until we support orthogonal flows. */
+:not(:root, html:root > body:first-of-type),
+::before,
+::after,
+::backdrop,
+::file-selector-button,
+::marker,
+::details-content,
+::color-swatch,
+::slider-fill,
+::slider-thumb,
+::slider-track,
+::-moz-progress-bar {
+  writing-mode: inherit !important;
 }

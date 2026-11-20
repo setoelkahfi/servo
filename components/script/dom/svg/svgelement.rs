@@ -18,7 +18,7 @@ use style::values::specified;
 use style_traits::ParsingMode;
 use stylo_dom::ElementState;
 
-use crate::dom::bindings::codegen::Bindings::HTMLOrSVGElementBinding::FocusOptions;
+use crate::dom::bindings::codegen::Bindings::HTMLOrSVGOrMathMLElementBinding::FocusOptions;
 use crate::dom::bindings::codegen::Bindings::SVGElementBinding::SVGElementMethods;
 use crate::dom::bindings::inheritance::Castable;
 use crate::dom::bindings::root::{Dom, DomRoot, LayoutDom, MutNullableDom};
@@ -27,6 +27,7 @@ use crate::dom::css::cssstyledeclaration::{
 };
 use crate::dom::document::Document;
 use crate::dom::document::focus::FocusableArea;
+use crate::dom::domstringmap::DOMStringMap;
 use crate::dom::element::attributes::storage::AttrRef;
 use crate::dom::element::{AttributeMutation, Element};
 use crate::dom::node::focus::FocusTrigger;
@@ -44,6 +45,7 @@ use crate::dom::window::scrolling_box::{ScrollAxisState, ScrollRequirement};
 pub(crate) struct SVGElement {
     element: Element,
     style_decl: MutNullableDom<CSSStyleDeclaration>,
+    dataset: MutNullableDom<DOMStringMap>,
 }
 
 impl SVGElement {
@@ -64,6 +66,7 @@ impl SVGElement {
         SVGElement {
             element: Element::new_inherited_with_state(state, tag_name, ns!(svg), prefix, document),
             style_decl: Default::default(),
+            dataset: Default::default(),
         }
     }
 
@@ -104,7 +107,7 @@ impl VirtualMethods for SVGElement {
         let element = self.as_element();
         if let (&local_name!("nonce"), mutation) = (attr.local_name(), mutation) {
             match mutation {
-                AttributeMutation::Set(..) => {
+                AttributeMutation::Set(_) => {
                     let nonce = &**attr.value();
                     element.update_nonce_internal_slot(nonce.to_owned(), cx.no_gc());
                 },
@@ -167,6 +170,12 @@ impl SVGElementMethods<crate::DomTypeHolder> for SVGElement {
     // https://html.spec.whatwg.org/multipage/#globaleventhandlers
     global_event_handlers!();
 
+    /// <https://html.spec.whatwg.org/multipage/#dom-dataset>
+    fn Dataset(&self, cx: &mut JSContext) -> DomRoot<DOMStringMap> {
+        self.dataset
+            .or_init(|| DOMStringMap::new(cx, self.upcast()))
+    }
+
     /// <https://html.spec.whatwg.org/multipage/#dom-noncedelement-nonce>
     fn Nonce(&self) -> DOMString {
         self.as_element().nonce_value().into()
@@ -197,7 +206,7 @@ impl SVGElementMethods<crate::DomTypeHolder> for SVGElement {
         // 2. Run the focusing steps for this.
         if !self
             .upcast::<Node>()
-            .run_the_focusing_steps(cx, None, FocusTrigger::Other)
+            .run_the_focusing_steps(cx, None, FocusTrigger::Script)
         {
             // The specification seems to imply we should scroll into view even if this element
             // is not a focusable area. No browser does this, so we return early in that case.
@@ -236,9 +245,11 @@ impl SVGElementMethods<crate::DomTypeHolder> for SVGElement {
             return;
         }
         // <https://html.spec.whatwg.org/multipage/#unfocusing-steps>
-        self.owner_document()
-            .focus_handler()
-            .focus(cx, &FocusableArea::Viewport);
+        self.owner_document().focus_handler().focus(
+            cx,
+            &FocusableArea::Viewport,
+            FocusTrigger::Script,
+        );
     }
 
     /// <https://html.spec.whatwg.org/multipage/#dom-tabindex>
@@ -437,8 +448,7 @@ impl<'dom> LayoutDom<'dom, SVGElement> {
             // Wrap the raw path data in `path("...")` so the CSS parser can handle it.
             if let Some(value) = element.get_attr_val_for_layout(&ns!(), &local_name!("d")) {
                 if value.eq_ignore_ascii_case("none") {
-                    let mut input = cssparser::ParserInput::new(value);
-                    let mut parser = cssparser::Parser::new(&mut input);
+                    let mut parser = cssparser::Parser::new(value);
                     if let Ok(property) =
                         parser.parse_entirely(|i| longhands::d::parse_declared(&parser_context, i))
                     {
@@ -446,8 +456,7 @@ impl<'dom> LayoutDom<'dom, SVGElement> {
                     }
                 } else {
                     let wrapped = format!("path(\"{}\")", value);
-                    let mut input = cssparser::ParserInput::new(&wrapped);
-                    let mut parser = cssparser::Parser::new(&mut input);
+                    let mut parser = cssparser::Parser::new(&wrapped);
                     if let Ok(property) = parser.parse_entirely(|parse_input| {
                         longhands::d::parse_declared(&parser_context, parse_input)
                     }) {
@@ -465,15 +474,14 @@ impl<'dom> LayoutDom<'dom, SVGElement> {
         parse: F,
         push: &mut impl FnMut(PropertyDeclaration),
     ) where
-        F: for<'i, 't> FnOnce(
+        F: for<'i> FnOnce(
             &ParserContext,
-            &mut cssparser::Parser<'i, 't>,
-        ) -> Result<PropertyDeclaration, style_traits::ParseError<'i>>,
+            &mut cssparser::Parser<'i>,
+        ) -> Result<PropertyDeclaration, style_traits::ParseError>,
     {
         let element = self.upcast::<Element>();
         if let Some(value) = element.get_attr_val_for_layout(&ns!(), &LocalName::from(attr_name)) {
-            let mut input = cssparser::ParserInput::new(value);
-            let mut parser = cssparser::Parser::new(&mut input);
+            let mut parser = cssparser::Parser::new(value);
             if let Ok(property) =
                 parser.parse_entirely(|parse_input| parse(parser_context, parse_input))
             {

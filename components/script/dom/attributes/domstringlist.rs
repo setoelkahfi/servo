@@ -5,7 +5,8 @@
 use dom_struct::dom_struct;
 use itertools::Itertools;
 use js::context::JSContext;
-use script_bindings::reflector::{Reflector, reflect_dom_object_with_cx};
+use script_bindings::domstring::TracedDOMString;
+use script_bindings::reflector::{Reflector, reflect_dom_object};
 
 use crate::dom::bindings::codegen::Bindings::DOMStringListBinding::DOMStringListMethods;
 use crate::dom::bindings::root::DomRoot;
@@ -15,14 +16,17 @@ use crate::dom::globalscope::GlobalScope;
 #[dom_struct]
 pub(crate) struct DOMStringList {
     reflector_: Reflector,
-    strings: Vec<DOMString>,
+    strings: Vec<TracedDOMString>,
 }
 
 impl DOMStringList {
     pub(crate) fn new_inherited(strings: Vec<DOMString>) -> DOMStringList {
         DOMStringList {
             reflector_: Reflector::new(),
-            strings,
+            strings: strings
+                .into_iter()
+                .map(|domstring| domstring.traced())
+                .collect(),
         }
     }
 
@@ -31,14 +35,14 @@ impl DOMStringList {
         global: &GlobalScope,
         strings: Vec<DOMString>,
     ) -> DomRoot<DOMStringList> {
-        reflect_dom_object_with_cx(Box::new(DOMStringList::new_inherited(strings)), global, cx)
+        reflect_dom_object(cx, Box::new(DOMStringList::new_inherited(strings)), global)
     }
 
     /// <https://www.w3.org/TR/IndexedDB-3/#sorted-name-list>
     pub(crate) fn new_sorted<'a>(
         cx: &mut JSContext,
         global: &GlobalScope,
-        strings: impl IntoIterator<Item = &'a DOMString>,
+        strings: impl IntoIterator<Item = &'a TracedDOMString>,
     ) -> DomRoot<DOMStringList> {
         let sorted = strings
             .into_iter()
@@ -63,7 +67,10 @@ impl DOMStringListMethods<crate::DomTypeHolder> for DOMStringList {
 
     /// <https://html.spec.whatwg.org/multipage/#dom-domstringlist-item>
     fn Item(&self, index: u32) -> Option<DOMString> {
-        self.strings.get(index as usize).cloned()
+        self.strings
+            .get(index as usize)
+            .cloned()
+            .map(|domstring| domstring.root())
     }
 
     /// <https://html.spec.whatwg.org/multipage/#dom-domstringlist-contains>

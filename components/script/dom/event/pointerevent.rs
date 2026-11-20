@@ -11,7 +11,9 @@ use js::context::JSContext;
 use js::rust::HandleObject;
 use keyboard_types::Modifiers;
 use script_bindings::cell::DomRefCell;
+use script_bindings::domstring::TracedDOMString;
 use script_bindings::reflector::reflect_dom_object_with_proto;
+use script_bindings::root::DomSlice;
 use script_traits::MouseButtons;
 use style::Atom;
 use style_traits::CSSPixel;
@@ -48,7 +50,7 @@ pub(crate) struct PointerEvent {
     twist: Cell<i32>,
     altitude_angle: Cell<f64>,
     azimuth_angle: Cell<f64>,
-    pointer_type: DomRefCell<DOMString>,
+    pointer_type: DomRefCell<TracedDOMString>,
     is_primary: Cell<bool>,
     coalesced_events: DomRefCell<Vec<Dom<PointerEvent>>>,
     predicted_events: DomRefCell<Vec<Dom<PointerEvent>>>,
@@ -68,7 +70,7 @@ impl PointerEvent {
             twist: Cell::new(0),
             altitude_angle: Cell::new(0.),
             azimuth_angle: Cell::new(0.),
-            pointer_type: DomRefCell::new(DOMString::new()),
+            pointer_type: DomRefCell::new(DOMString::new().traced()),
             is_primary: Cell::new(false),
             coalesced_events: DomRefCell::new(Vec::new()),
             predicted_events: DomRefCell::new(Vec::new()),
@@ -112,8 +114,8 @@ impl PointerEvent {
         azimuth_angle: f64,
         pointer_type: DOMString,
         is_primary: bool,
-        coalesced_events: Vec<DomRoot<PointerEvent>>,
-        predicted_events: Vec<DomRoot<PointerEvent>>,
+        coalesced_events: &[&PointerEvent],
+        predicted_events: &[&PointerEvent],
     ) -> DomRoot<PointerEvent> {
         Self::new_with_proto(
             cx,
@@ -179,8 +181,8 @@ impl PointerEvent {
         azimuth_angle: f64,
         pointer_type: DOMString,
         is_primary: bool,
-        coalesced_events: Vec<DomRoot<PointerEvent>>,
-        predicted_events: Vec<DomRoot<PointerEvent>>,
+        coalesced_events: &[&PointerEvent],
+        predicted_events: &[&PointerEvent],
     ) -> DomRoot<PointerEvent> {
         let ev = PointerEvent::new_uninitialized_with_proto(cx, window, proto);
         ev.mouseevent.initialize_mouse_event(
@@ -208,15 +210,15 @@ impl PointerEvent {
         ev.twist.set(twist);
         ev.altitude_angle.set(altitude_angle);
         ev.azimuth_angle.set(azimuth_angle);
-        *ev.pointer_type.borrow_mut() = pointer_type;
+        *ev.pointer_type.safe_borrow_mut(cx.no_gc()) = pointer_type.traced();
         ev.is_primary.set(is_primary);
-        *ev.coalesced_events.borrow_mut() = coalesced_events
-            .into_iter()
-            .map(|event| event.as_traced())
+        *ev.coalesced_events.safe_borrow_mut(cx.no_gc()) = coalesced_events
+            .iter()
+            .map(|&event| Dom::from_ref(event))
             .collect();
-        *ev.predicted_events.borrow_mut() = predicted_events
-            .into_iter()
-            .map(|event| event.as_traced())
+        *ev.predicted_events.safe_borrow_mut(cx.no_gc()) = predicted_events
+            .iter()
+            .map(|&event| Dom::from_ref(event))
             .collect();
         ev
     }
@@ -233,7 +235,7 @@ impl PointerEventMethods<crate::DomTypeHolder> for PointerEvent {
     ) -> DomRoot<PointerEvent> {
         let bubbles = EventBubbles::from(init.parent.parent.parent.parent.bubbles);
         let cancelable = EventCancelable::from(init.parent.parent.parent.parent.cancelable);
-        let scroll_offset = window.scroll_offset();
+        let scroll_offset = window.scroll_offset(cx);
         let page_point = Point2D::new(
             scroll_offset.x as i32 + init.parent.clientX,
             scroll_offset.y as i32 + init.parent.clientY,
@@ -267,8 +269,8 @@ impl PointerEventMethods<crate::DomTypeHolder> for PointerEvent {
             *init.azimuthAngle.unwrap_or_default(),
             init.pointerType.clone(),
             init.isPrimary,
-            init.coalescedEvents.clone(),
-            init.predictedEvents.clone(),
+            init.coalescedEvents.as_ref_slice(),
+            init.predictedEvents.as_ref_slice(),
         )
     }
 
@@ -324,7 +326,7 @@ impl PointerEventMethods<crate::DomTypeHolder> for PointerEvent {
 
     /// <https://w3c.github.io/pointerevents/#dom-pointerevent-pointertype>
     fn PointerType(&self) -> DOMString {
-        self.pointer_type.borrow().clone()
+        self.pointer_type.borrow().clone().root()
     }
 
     /// <https://w3c.github.io/pointerevents/#dom-pointerevent-isprimary>

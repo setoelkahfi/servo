@@ -9,7 +9,7 @@ use js::context::JSContext;
 use js::conversions::ToJSValConvertible;
 use js::jsval::NullValue;
 use js::rust::HandleValue;
-use script_bindings::reflector::{Reflector, reflect_dom_object_with_cx};
+use script_bindings::reflector::{Reflector, reflect_dom_object};
 
 use crate::conversions::Convert;
 use crate::dom::bindings::codegen::Bindings::TrustedTypePolicyFactoryBinding::{
@@ -49,10 +49,12 @@ pub(crate) static DEFAULT_SCRIPT_SINK_GROUP: &str = "'script'";
 impl Convert<DOMString> for TrustedTypeOrString {
     fn convert(self) -> DOMString {
         match self {
-            TrustedTypeOrString::TrustedHTML(trusted_html) => trusted_html.data().clone(),
-            TrustedTypeOrString::TrustedScript(trusted_script) => trusted_script.data().clone(),
+            TrustedTypeOrString::TrustedHTML(trusted_html) => trusted_html.data().clone().root(),
+            TrustedTypeOrString::TrustedScript(trusted_script) => {
+                trusted_script.data().clone().root()
+            },
             TrustedTypeOrString::TrustedScriptURL(trusted_script_url) => {
-                trusted_script_url.data().clone()
+                trusted_script_url.data().clone().root()
             },
             TrustedTypeOrString::String(str_) => str_,
         }
@@ -69,7 +71,7 @@ impl TrustedTypePolicyFactory {
     }
 
     pub(crate) fn new(cx: &mut JSContext, global: &GlobalScope) -> DomRoot<Self> {
-        reflect_dom_object_with_cx(Box::new(Self::new_inherited()), global, cx)
+        reflect_dom_object(cx, Box::new(Self::new_inherited()), global)
     }
 
     /// <https://www.w3.org/TR/trusted-types/#create-trusted-type-policy-algorithm>
@@ -86,9 +88,14 @@ impl TrustedTypePolicyFactory {
             // Content Security Policy? algorithm with global, policyName and factory’s created policy names value.
             let policy_names = self.policy_names.borrow();
             let policy_names: Vec<&str> = policy_names.iter().map(String::as_ref).collect();
-            let allowed_by_csp = global
-                .get_csp_list()
-                .is_trusted_type_policy_creation_allowed(cx, global, &policy_name, &policy_names);
+            let allowed_by_csp = global.call_on_csp_list(|csp_list| {
+                csp_list.is_trusted_type_policy_creation_allowed(
+                    cx,
+                    global,
+                    &policy_name,
+                    &policy_names,
+                )
+            });
 
             // Step 2: If allowedByCSP is "Blocked", throw a TypeError and abort further steps.
             if !allowed_by_csp {
@@ -298,9 +305,9 @@ impl TrustedTypePolicyFactory {
     ) -> Fallible<DOMString> {
         // Step 2: Let requireTrustedTypes be the result of executing Does sink type require trusted types?
         // algorithm, passing global, sinkGroup, and true.
-        let require_trusted_types = global
-            .get_csp_list()
-            .does_sink_type_require_trusted_types(sink_group, true);
+        let require_trusted_types = global.call_on_csp_list(|csp_list| {
+            csp_list.does_sink_type_require_trusted_types(sink_group, true)
+        });
         // Step 3: If requireTrustedTypes is false, return stringified input and abort these steps.
         if !require_trusted_types {
             return Ok(input);
@@ -321,15 +328,15 @@ impl TrustedTypePolicyFactory {
                 // Step 6.1: Let disposition be the result of executing Should sink type mismatch violation
                 // be blocked by Content Security Policy? algorithm, passing global,
                 // stringified input as source, sinkGroup and sink.
-                let is_blocked = global
-                    .get_csp_list()
-                    .should_sink_type_mismatch_violation_be_blocked_by_csp(
+                let is_blocked = global.call_on_csp_list(|csp_list| {
+                    csp_list.should_sink_type_mismatch_violation_be_blocked_by_csp(
                         cx,
                         global,
                         sink,
                         sink_group,
                         &input.str(),
-                    );
+                    )
+                });
                 // Step 6.2: If disposition is “Allowed”, return stringified input and abort further steps.
                 if !is_blocked {
                     Ok(input)

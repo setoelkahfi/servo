@@ -10,6 +10,7 @@ use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 use std::{mem, thread_local};
 
+use embedder_traits::resources::ResourceBytes;
 use imsz::imsz_from_reader;
 use log::{debug, error, warn};
 use malloc_size_of::{MallocConditionalSizeOf, MallocSizeOf as MallocSizeOfTrait, MallocSizeOfOps};
@@ -18,10 +19,10 @@ use mime::Mime;
 use net_traits::image_cache::{
     FontResolver, Image, ImageCache, ImageCacheFactory, ImageCacheResponseCallback,
     ImageCacheResponseMessage, ImageCacheResult, ImageLoadListener, ImageOrMetadataAvailable,
-    ImageResponse, PendingImageId, RasterizationCompleteResponse, VectorImage,
+    ImageResponse, PendingImageId, RasterizationCompleteResponse, RasterizationResult, VectorImage,
 };
 use net_traits::request::CorsSettings;
-use net_traits::{FetchMetadata, FetchResponseMsg, FilteredMetadata, NetworkError};
+use net_traits::{FetchResponseMsg, Metadata, NetworkError};
 use paint_api::{CrossProcessPaintApi, ImageUpdate, SerializableImageData};
 use parking_lot::Mutex;
 use pixels::{CorsStatus, ImageFrame, ImageMetadata, PixelFormat, RasterImage, load_from_memory};
@@ -30,12 +31,17 @@ use profile_traits::path;
 use resvg::tiny_skia;
 use resvg::usvg::{self, fontdb};
 use rustc_hash::{FxHashMap, FxHashSet};
+use servo_base::cross_process_instant::CrossProcessInstant;
 use servo_base::id::{PipelineId, WebViewId};
 use servo_base::threadpool::ThreadPool;
 use servo_url::{ImmutableOrigin, ServoUrl};
 use uuid::Uuid;
 use webrender_api::ImageKey as WebRenderImageKey;
 use webrender_api::units::DeviceIntSize;
+
+use crate::image_cache::KeyCacheState::PipelineClosed;
+
+const MAX_SVG_DEPTH: u32 = 500;
 
 thread_local! {
     pub static SUPPRESS_ABORT_IN_PANIC_HOOK: Cell<bool> = const { Cell::new(false) };
@@ -147,7 +153,7 @@ type ImageKey = (ServoUrl, ImmutableOrigin, Option<CorsSettings>);
 
 // Represents all the currently pending loads/decodings. For
 // performance reasons, loads are indexed by a dedicated load key.
-#[derive(MallocSizeOf)]
+#[derive(Default, MallocSizeOf)]
 struct AllPendingLoads {
     // The loads, indexed by a load key. Used during most operations,
     // for performance reasons.
@@ -190,7 +196,7 @@ impl AllPendingLoads {
     fn get_cached(
         &mut self,
         url: ServoUrl,
-        origin: ImmutableOrigin,
+        origin: &ImmutableOrigin,
         cors_status: Option<CorsSettings>,
     ) -> CacheResult<'_> {
         match self
@@ -205,7 +211,7 @@ impl AllPendingLoads {
                 let load_key = self.keygen.next();
                 url_entry.insert(load_key);
 
-                let pending_load = PendingLoad::new(url, origin, cors_status);
+                let pending_load = PendingLoad::new(url, origin.clone(), cors_status);
                 match self.loads.entry(load_key) {
                     Occupied(_) => unreachable!(),
                     Vacant(load_entry) => {
@@ -281,13 +287,14 @@ impl ImageBytes {
     }
 
     fn mark_complete(&mut self) -> Arc<Vec<u8>> {
-        let bytes = {
+        let mut bytes = {
             let own_bytes = match *self {
                 ImageBytes::InProgress(ref mut bytes) => bytes,
                 ImageBytes::Complete(_) => panic!("attempted modification of complete image bytes"),
             };
             mem::take(own_bytes)
         };
+        bytes.shrink_to_fit();
         let bytes = Arc::new(bytes);
         *self = ImageBytes::Complete(bytes.clone());
         bytes
@@ -302,7 +309,7 @@ impl ImageBytes {
 
     fn set_capacity(&mut self, size: usize) {
         match self {
-            ImageBytes::InProgress(items) => items.reserve(size - items.len()),
+            ImageBytes::InProgress(items) => items.reserve(size.saturating_sub(items.len())),
             ImageBytes::Complete(_) => error!("Want to set capacity on already completed image."),
         }
     }
@@ -311,7 +318,7 @@ impl ImageBytes {
 // A key used to communicate during loading.
 type LoadKey = PendingImageId;
 
-#[derive(MallocSizeOf)]
+#[derive(Default, MallocSizeOf)]
 struct LoadKeyGenerator {
     counter: u64,
 }
@@ -347,6 +354,9 @@ struct PendingLoad {
     /// Once loading is complete, the result of the operation.
     result: Option<Result<(), NetworkError>>,
 
+    /// The time when the response finished loading.
+    response_end: Option<CrossProcessInstant>,
+
     /// The listeners that are waiting for this response to complete.
     listeners: Vec<ImageLoadListener>,
 
@@ -380,6 +390,7 @@ impl PendingLoad {
             bytes: ImageBytes::InProgress(vec![]),
             metadata: None,
             result: None,
+            response_end: None,
             listeners: vec![],
             url,
             load_origin,
@@ -410,7 +421,7 @@ enum PendingKey {
 }
 
 /// The state of the `WebRenderImageKey`` cache
-#[derive(Debug, MallocSizeOf)]
+#[derive(Debug, Default, MallocSizeOf)]
 enum KeyCacheState {
     /// We already requested a batch of keys.
     PendingBatch,
@@ -418,12 +429,17 @@ enum KeyCacheState {
     Ready(Vec<WebRenderImageKey>),
     /// Currently filling images from the KeyCache. No new keys will be requested.
     Processing,
+    /// We will not process any images anymore because the pipeline is shut down.
+    #[default]
+    PipelineClosed,
 }
 
 impl KeyCacheState {
     fn size(&self) -> usize {
         match self {
-            KeyCacheState::PendingBatch | KeyCacheState::Processing => 0,
+            KeyCacheState::PendingBatch |
+            KeyCacheState::Processing |
+            KeyCacheState::PipelineClosed => 0,
             KeyCacheState::Ready(items) => items.len(),
         }
     }
@@ -432,7 +448,7 @@ impl KeyCacheState {
 /// As getting new keys takes a round trip over the constellation, we keep a small cache of them.
 /// Additionally, this cache will store image resources that do not have a key yet because those
 /// are needed to complete the load.
-#[derive(MallocSizeOf)]
+#[derive(Default, MallocSizeOf)]
 struct KeyCache {
     /// A cache of `WebRenderImageKey`.
     cache: KeyCacheState,
@@ -577,6 +593,7 @@ impl ImageCacheStore {
                     self.fetch_more_image_keys();
                 },
             },
+            KeyCacheState::PipelineClosed => {},
         }
     }
 
@@ -598,29 +615,33 @@ impl ImageCacheStore {
 
     /// Insert received keys into the cache and complete the loading of images.
     fn insert_keys_and_load_images(&mut self, image_keys: Vec<WebRenderImageKey>) {
-        if let KeyCacheState::Processing = self.key_cache.cache {
-            // We can set this now to ready as we have the exclusive write access.
-            self.key_cache.cache = KeyCacheState::Ready(image_keys);
-            let len = min(
-                self.key_cache.cache.size(),
-                self.key_cache.images_pending_keys.len(),
-            );
-            let images = self
-                .key_cache
-                .images_pending_keys
-                .drain(0..len)
-                .collect::<Vec<PendingKey>>();
-            for key in images {
-                self.load_image_with_keycache(key);
-            }
-            // It is important to fetch new image keys as we might have missed previous returns.
-            if !self.key_cache.images_pending_keys.is_empty() {
-                self.paint_api
-                    .generate_image_key_async(self.webview_id, self.pipeline_id);
-                self.key_cache.cache = KeyCacheState::PendingBatch
-            }
-        } else {
-            unreachable!("A batch was received while we didn't request one")
+        match &mut self.key_cache.cache {
+            KeyCacheState::Processing => {
+                // We can set this now to ready as we have the exclusive write access.
+                self.key_cache.cache = KeyCacheState::Ready(image_keys);
+                let len = min(
+                    self.key_cache.cache.size(),
+                    self.key_cache.images_pending_keys.len(),
+                );
+                let images = self
+                    .key_cache
+                    .images_pending_keys
+                    .drain(0..len)
+                    .collect::<Vec<PendingKey>>();
+                for key in images {
+                    self.load_image_with_keycache(key);
+                }
+                // It is important to fetch new image keys as we might have missed previous returns.
+                if !self.key_cache.images_pending_keys.is_empty() {
+                    self.paint_api
+                        .generate_image_key_async(self.webview_id, self.pipeline_id);
+                    self.key_cache.cache = KeyCacheState::PendingBatch
+                }
+            },
+            KeyCacheState::PendingBatch | KeyCacheState::Ready(_) => {
+                unreachable!("A batch was received while we didn't request one")
+            },
+            PipelineClosed => {},
         }
     }
 
@@ -660,10 +681,11 @@ impl ImageCacheStore {
             Some(load) => load,
             None => return,
         };
-        let url = pending_load.final_url.clone();
+        let url = pending_load.final_url;
         let image_response = match load_result {
-            LoadResult::LoadedRasterImage(raster_image) => {
+            LoadResult::LoadedRasterImage(mut raster_image) => {
                 assert!(raster_image.id.is_some());
+                raster_image.load_time = pending_load.response_end;
                 ImageResponse::Loaded(Image::Raster(Arc::new(raster_image)), url.unwrap())
             },
             LoadResult::LoadedVectorImage(vector_image) => {
@@ -679,6 +701,7 @@ impl ImageCacheStore {
                     svg_id: None,
                     metadata,
                     cors_status: vector_image.cors_status,
+                    load_time: pending_load.response_end,
                 };
                 ImageResponse::Loaded(Image::Vector(vector_image), url.unwrap())
             },
@@ -786,13 +809,13 @@ impl ImageCacheStore {
 
 pub struct ImageCacheFactoryImpl {
     /// The data to use for the broken image icon used when images cannot load.
-    broken_image_icon_data: Arc<Vec<u8>>,
+    broken_image_icon_data: Arc<ResourceBytes>,
     /// Thread pool for image decoding
     thread_pool: Arc<ThreadPool>,
 }
 
 impl ImageCacheFactoryImpl {
-    pub fn new(broken_image_icon_data: Vec<u8>) -> Self {
+    pub fn new(broken_image_icon_data: ResourceBytes) -> Self {
         debug!("Creating new ImageCacheFactoryImpl");
 
         Self {
@@ -830,6 +853,7 @@ impl ImageCacheFactory for ImageCacheFactoryImpl {
             },
             font_resolver: usvg_font_resolver,
             fontdb: Arc::new(fontdb::Database::new()),
+            max_depth: MAX_SVG_DEPTH,
             ..usvg::Options::default()
         };
 
@@ -861,7 +885,7 @@ pub struct ImageCacheImpl {
     /// Maps an SVGElement uuid to a pending image id in the store
     svg_id_image_id_map: Arc<Mutex<FxHashMap<Uuid, PendingImageId>>>,
     /// The data to use for the broken image icon used when images cannot load.
-    broken_image_icon_data: Arc<Vec<u8>>,
+    broken_image_icon_data: Arc<ResourceBytes>,
     /// Thread pool for image decoding. This is shared with other [`ImageCache`]s in the
     /// same process.
     thread_pool: Arc<ThreadPool>,
@@ -946,7 +970,7 @@ impl ImageCache for ImageCacheImpl {
     fn get_cached_image_status(
         &self,
         url: ServoUrl,
-        origin: ImmutableOrigin,
+        origin: &ImmutableOrigin,
         cors_setting: Option<CorsSettings>,
     ) -> ImageCacheResult {
         let mut store = self.store.lock();
@@ -1037,11 +1061,11 @@ impl ImageCache for ImageCacheImpl {
         image_id: PendingImageId,
         requested_size: DeviceIntSize,
         svg_id: Option<Uuid>,
-    ) -> Option<RasterImage> {
+    ) -> RasterizationResult {
         let mut store = self.store.lock();
         let Some(vector_image) = store.vector_images.get(&image_id).cloned() else {
             warn!("Unknown image id {image_id:?} requested for rasterization");
-            return None;
+            return RasterizationResult::InvalidSvgParameters;
         };
 
         // This early return relies on the fact that the result of image rasterization cannot
@@ -1052,7 +1076,7 @@ impl ImageCache for ImageCacheImpl {
             .entry((image_id, requested_size))
             .or_default();
         if let Some(result) = entry.result.as_ref() {
-            return Some(result.clone());
+            return RasterizationResult::Image(result.clone());
         }
 
         if let Some(svg_id) = svg_id &&
@@ -1069,14 +1093,12 @@ impl ImageCache for ImageCacheImpl {
                 .remove_all_for_id(old_mapped_image_id);
         }
 
-        if store
-            .svg_rasterization_task_store
-            .is_or_set_being_rasterized(image_id, requested_size)
-        {
-            return None;
-        }
-
         let natural_size = vector_image.svg_tree.size().to_int_size();
+        let natural_tinyskia_size = {
+            let width = natural_size.width().min(MAX_SVG_PIXMAP_DIMENSION);
+            let height = natural_size.height().min(MAX_SVG_PIXMAP_DIMENSION);
+            tiny_skia::IntSize::from_wh(width, height)
+        };
         let tinyskia_requested_size = {
             let width = requested_size
                 .width
@@ -1088,19 +1110,26 @@ impl ImageCache for ImageCacheImpl {
                 .try_into()
                 .unwrap_or(0)
                 .min(MAX_SVG_PIXMAP_DIMENSION);
-            tiny_skia::IntSize::from_wh(width, height).unwrap_or(natural_size)
+            tiny_skia::IntSize::from_wh(width, height).or(natural_tinyskia_size)
+        };
+        let Some(tinyskia_requested_size) = tinyskia_requested_size else {
+            debug!(
+                "Asked for requested size {:?} which has zero size, and natural size {:?} has zero dimension. Not returning image",
+                requested_size, natural_size
+            );
+            return RasterizationResult::InvalidSvgParameters;
         };
 
-        // Requirements from tiny_skia::Pixmap::new
-        if tinyskia_requested_size.width() == 0 ||
-            tinyskia_requested_size.width() > (i32::MAX / 4).try_into().unwrap() ||
-            tinyskia_requested_size.height() == 0
+        if natural_tinyskia_size.is_none() {
+            debug!("SVG natural size has zero dimension. Not returning image");
+            return RasterizationResult::InvalidSvgParameters;
+        }
+
+        if store
+            .svg_rasterization_task_store
+            .is_or_set_being_rasterized(image_id, requested_size)
         {
-            debug!(
-                "Asked for requested size {:?} which has zero size. Not returning image",
-                requested_size
-            );
-            return None;
+            return RasterizationResult::PendingRasterization;
         }
 
         let store = self.store.clone();
@@ -1149,6 +1178,7 @@ impl ImageCache for ImageCacheImpl {
                     bytes: Arc::new(bytes),
                     id: None,
                     cors_status: vector_image.cors_status,
+                    load_time: None,
                     is_opaque: false,
                     loop_count: None,
                 }
@@ -1184,7 +1214,7 @@ impl ImageCache for ImageCacheImpl {
                 },
             }
         });
-        None
+        RasterizationResult::PendingRasterization
     }
 
     /// Add a new listener for the given pending image id. If the image is already present,
@@ -1230,29 +1260,23 @@ impl ImageCache for ImageCacheImpl {
                 debug!("Received {:?} for {:?}", response.as_ref().map(|_| ()), id);
                 let mut store = self.store.lock();
                 if let Some(pending_load) = store.pending_loads.get_by_key_mut(&id) {
-                    let (cors_status, metadata) = match response {
-                        Ok(meta) => match meta {
-                            FetchMetadata::Unfiltered(m) => (CorsStatus::Safe, Some(m)),
-                            FetchMetadata::Filtered { unsafe_, filtered } => (
-                                match filtered {
-                                    FilteredMetadata::Basic(_) | FilteredMetadata::Cors(_) => {
-                                        CorsStatus::Safe
-                                    },
-                                    FilteredMetadata::Opaque |
-                                    FilteredMetadata::OpaqueRedirect(_) => CorsStatus::Unsafe,
-                                },
-                                Some(unsafe_),
-                            ),
+                    let (cors_status, metadata): (_, Option<Metadata>) = match response {
+                        Ok(fetch_metadata) => {
+                            (fetch_metadata.cors_status(), Some(fetch_metadata.into()))
                         },
                         Err(_) => (CorsStatus::Unsafe, None),
                     };
-                    let final_url = metadata.as_ref().map(|m| m.final_url.clone());
+                    let (final_url, content_type) = metadata.map_or((None, None), |metadata| {
+                        (
+                            Some(metadata.final_url),
+                            metadata
+                                .content_type
+                                .map(|content_type| content_type.into_inner().into()),
+                        )
+                    });
                     pending_load.final_url = final_url;
+                    pending_load.content_type = content_type;
                     pending_load.cors_status = cors_status;
-                    pending_load.content_type = metadata
-                        .as_ref()
-                        .and_then(|metadata| metadata.content_type.clone())
-                        .map(|content_type| content_type.into_inner().into());
                 } else {
                     debug!("Pending load for id {:?} already evicted from cache", id);
                 }
@@ -1281,7 +1305,7 @@ impl ImageCache for ImageCacheImpl {
                     debug!("Pending load for id {:?} already evicted from cache", id);
                 }
             },
-            (FetchResponseMsg::ProcessResponseEOF(_, result, _), key) => {
+            (FetchResponseMsg::ProcessResponseEOF(_, result, timing), key) => {
                 debug!("Received EOF for {:?}", key);
                 match result {
                     Ok(_) => {
@@ -1289,6 +1313,9 @@ impl ImageCache for ImageCacheImpl {
                             let mut store = self.store.lock();
                             if let Some(pending_load) = store.pending_loads.get_by_key_mut(&id) {
                                 pending_load.result = Some(Ok(()));
+                                pending_load.response_end = Some(
+                                    timing.response_end.unwrap_or_else(CrossProcessInstant::now),
+                                );
                                 debug!("Async decoding {} ({:?})", pending_load.url, key);
                                 (
                                     pending_load.bytes.mark_complete(),
@@ -1347,6 +1374,7 @@ impl ImageCache for ImageCacheImpl {
 
     fn clear(&self) {
         self.store.lock().clear();
+        *self.svg_id_image_id_map.lock() = Default::default();
     }
 
     fn get_broken_image_icon(&self) -> Option<Arc<RasterImage>> {
@@ -1354,8 +1382,11 @@ impl ImageCache for ImageCacheImpl {
         store
             .broken_image_icon_image
             .get_or_init(|| {
-                let mut image = load_from_memory(&self.broken_image_icon_data, CorsStatus::Unsafe)
-                    .or_else(|| load_from_memory(FALLBACK_RIPPY, CorsStatus::Unsafe))?;
+                let mut image = load_from_memory(
+                    self.broken_image_icon_data.as_ref().as_ref(),
+                    CorsStatus::Unsafe,
+                )
+                .or_else(|| load_from_memory(FALLBACK_RIPPY, CorsStatus::Unsafe))?;
                 let image_key = store
                     .paint_api
                     .generate_image_key_blocking(store.webview_id)
@@ -1369,6 +1400,7 @@ impl ImageCache for ImageCacheImpl {
 
 impl ImageCacheStore {
     /// Clear the image cache.
+    // Webrender currently does not care about keys that are loaded but do not have an image attached to it.
     fn clear(&mut self) {
         let deletions: smallvec::SmallVec<_> = self
             .completed_loads
@@ -1399,8 +1431,13 @@ impl ImageCacheStore {
         // Clear these fields, since `clear()` will be called multiple times,
         // explicitly on pipeline close, and again on Drop (as a safeguard,
         // since we could forget to explicitly clear).
-        self.completed_loads.clear();
-        self.rasterized_vector_images.clear();
+        self.completed_loads = Default::default();
+        self.vector_images = Default::default();
+        self.rasterized_vector_images = Default::default();
+        self.svg_rasterization_task_store = Default::default();
+        self.pending_loads = Default::default();
+        self.key_cache = Default::default();
+
         let _ = self.broken_image_icon_image.take();
     }
 }

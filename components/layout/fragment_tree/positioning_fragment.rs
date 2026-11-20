@@ -8,13 +8,14 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use app_units::Au;
 use malloc_size_of_derive::MallocSizeOf;
 use servo_arc::Arc as ServoArc;
+use servo_base::id::AtomicOptionScrollTreeNodeId;
 use servo_base::print_tree::PrintTree;
 use style::properties::ComputedValues;
 
 use super::{BaseFragment, BaseFragmentInfo, Fragment};
 use crate::SharedStyle;
-use crate::fragment_tree::ContainingBlockCalculation;
-use crate::geom::{PhysicalRect, SyncPhysicalRectAu};
+use crate::fragment_tree::{CumulativeContentRectCalculation, FragmentChildren};
+use crate::geom::{LogicalVec2, PhysicalRect, SyncPhysicalRectAu};
 
 /// Can contain child fragments with relative coordinates, but does not contribute to painting
 /// itself. [`PositioningFragment`]s may be completely anonymous, or just non-painting Fragments
@@ -32,21 +33,32 @@ pub(crate) struct PositioningFragment {
     scrollable_overflow: SyncPhysicalRectAu,
     scrollable_overflow_is_up_to_date: AtomicBool,
 
-    /// This [`PositioningFragment`]'s containing block rectangle in coordinates relative to
-    /// the initial containing block, but not taking into account any transforms.
-    pub cumulative_containing_block_rect: SyncPhysicalRectAu,
+    /// The cumulative content rect of this [`PositioningFragment`]'s parent in
+    /// coordinates relative to the initial containing block, but not taking into account
+    /// any transforms.
+    pub cumulative_parent_content_rect: SyncPhysicalRectAu,
 
     /// Whether or not this [`PositioningFragment`] is a line box.
     is_line_box: bool,
+
+    /// The containing spatial tree node of this [`PositioningFragment`]. This is assigned
+    /// during `StackingContextTree` construction, so isn't available before that time.
+    /// This is used to for determining final viewport size and position of this node and
+    /// will also be used in the future for hit testing.
+    pub spatial_tree_node: AtomicOptionScrollTreeNodeId,
 }
 
 impl PositioningFragment {
     pub fn new_anonymous(
         style: ServoArc<ComputedValues>,
         rect: PhysicalRect<Au>,
-        children: Vec<Fragment>,
+        children: FragmentChildren,
         is_line_box: bool,
     ) -> Arc<Self> {
+        let children = children.into_physical_fragments(
+            style.writing_mode,
+            LogicalVec2::from_physical_size(&rect.size, style.writing_mode),
+        );
         Self::new_with_base_fragment_info(
             BaseFragmentInfo::anonymous(),
             style,
@@ -77,23 +89,24 @@ impl PositioningFragment {
             children,
             scrollable_overflow: Default::default(),
             scrollable_overflow_is_up_to_date: AtomicBool::new(false),
-            cumulative_containing_block_rect: Default::default(),
+            cumulative_parent_content_rect: Default::default(),
             is_line_box,
+            spatial_tree_node: Default::default(),
         })
     }
 
     #[inline]
-    pub(crate) fn set_containing_block(&self, containing_block: &PhysicalRect<Au>) {
-        self.cumulative_containing_block_rect.set(*containing_block);
+    pub(crate) fn set_cumulative_content_rect(&self, content_rect: &PhysicalRect<Au>) {
+        self.cumulative_parent_content_rect.set(*content_rect);
     }
 
     pub fn offset_by_containing_block(
         &self,
         rect: &PhysicalRect<Au>,
-        containing_block_computation: ContainingBlockCalculation<'_>,
+        cumulative_content_rect_calculation: CumulativeContentRectCalculation<'_>,
     ) -> PhysicalRect<Au> {
-        containing_block_computation.ensure();
-        rect.translate(self.cumulative_containing_block_rect.origin().to_vector())
+        cumulative_content_rect_calculation.ensure();
+        rect.translate(self.cumulative_parent_content_rect.origin().to_vector())
     }
 
     /// Get the scrollable overflow for this [`PositioningFragment`] relative to its

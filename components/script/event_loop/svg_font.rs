@@ -9,6 +9,7 @@ use fonts::{
     FallbackFontSelectionOptions, FontContext, FontDescriptor, FontFamilyDescriptor,
     FontSearchScope, fallback_font_families,
 };
+use icu_locale_core::subtags::Language;
 use net_traits::image_cache::FontResolver;
 use resvg::usvg::{Font, FontFamily, FontStretch, FontStyle, fontdb};
 use rustc_hash::FxHashMap;
@@ -18,7 +19,7 @@ use style::values::computed::font::{
     FamilyName, FontFamilyNameSyntax, GenericFontFamily, SingleFontFamily,
 };
 use style::values::computed::{
-    FontStretch as ServoFontStretch, FontStyle as ServoFontStyle, FontSynthesis, FontWeight,
+    FontStyle as ServoFontStyle, FontSynthesis, FontWeight, FontWidth as ServoFontWidth,
 };
 use webrender_api::FontVariation;
 
@@ -74,9 +75,9 @@ impl SvgFontResolver {
             let Ok(data_and_index) = font_ref.font_data_and_index() else {
                 continue;
             };
-            let ids = Arc::make_mut(database).load_font_source(fontdb::Source::Binary(
-                data_and_index.data.as_ipc_shared_memory(),
-            ));
+            let ids = Arc::make_mut(database).load_font_source(fontdb::Source::Binary(Arc::new(
+                data_and_index.data.clone(),
+            )));
 
             if let Some(id) = ids.get(data_and_index.index as usize).copied() {
                 self.font_id_cache.lock().unwrap().insert(font.clone(), id);
@@ -95,16 +96,16 @@ fn font_to_fontdescriptor(font: &Font) -> FontDescriptor {
         FontStyle::Oblique => ServoFontStyle::OBLIQUE,
     };
 
-    let stretch = match font.stretch() {
-        FontStretch::UltraCondensed => ServoFontStretch::ULTRA_CONDENSED,
-        FontStretch::ExtraCondensed => ServoFontStretch::EXTRA_CONDENSED,
-        FontStretch::Condensed => ServoFontStretch::CONDENSED,
-        FontStretch::SemiCondensed => ServoFontStretch::SEMI_CONDENSED,
-        FontStretch::Normal => ServoFontStretch::NORMAL,
-        FontStretch::SemiExpanded => ServoFontStretch::SEMI_EXPANDED,
-        FontStretch::Expanded => ServoFontStretch::EXPANDED,
-        FontStretch::ExtraExpanded => ServoFontStretch::EXTRA_EXPANDED,
-        FontStretch::UltraExpanded => ServoFontStretch::ULTRA_EXPANDED,
+    let width = match font.stretch() {
+        FontStretch::UltraCondensed => ServoFontWidth::ULTRA_CONDENSED,
+        FontStretch::ExtraCondensed => ServoFontWidth::EXTRA_CONDENSED,
+        FontStretch::Condensed => ServoFontWidth::CONDENSED,
+        FontStretch::SemiCondensed => ServoFontWidth::SEMI_CONDENSED,
+        FontStretch::Normal => ServoFontWidth::NORMAL,
+        FontStretch::SemiExpanded => ServoFontWidth::SEMI_EXPANDED,
+        FontStretch::Expanded => ServoFontWidth::EXPANDED,
+        FontStretch::ExtraExpanded => ServoFontWidth::EXTRA_EXPANDED,
+        FontStretch::UltraExpanded => ServoFontWidth::ULTRA_EXPANDED,
     };
 
     let variation_settings = font
@@ -118,7 +119,7 @@ fn font_to_fontdescriptor(font: &Font) -> FontDescriptor {
 
     FontDescriptor {
         weight: FontWeight::from_float(font.weight() as f32),
-        stretch,
+        width,
         style,
         variant: FontVariantCaps::Normal,
         pt_size: Au::from_px(16),
@@ -131,7 +132,7 @@ fn font_to_fontdescriptor(font: &Font) -> FontDescriptor {
 fn fallback_descriptor() -> FontDescriptor {
     FontDescriptor {
         weight: FontWeight::normal(),
-        stretch: ServoFontStretch::hundred(),
+        width: ServoFontWidth::hundred(),
         style: ServoFontStyle::normal(),
         variant: FontVariantCaps::Normal,
         pt_size: Au::from_px(16),
@@ -181,11 +182,9 @@ impl FontResolver for SvgFontResolver {
                 return Some(*font_id);
             }
         }
-        let fallback_options = FallbackFontSelectionOptions::new(
-            character,
-            None,
-            icu_locale_core::subtags::Language::UNKNOWN,
-        );
+        let fallback_options =
+            FallbackFontSelectionOptions::new(character, None, Language::UNKNOWN);
+
         for family in fallback_font_families(fallback_options) {
             let family = FontFamilyDescriptor::new(
                 SingleFontFamily::FamilyName(FamilyName {
@@ -213,7 +212,7 @@ impl FontResolver for SvgFontResolver {
                 };
 
                 let ids = Arc::make_mut(database).load_font_source(fontdb::Source::Binary(
-                    data_and_index.data.as_ipc_shared_memory(),
+                    Arc::new(data_and_index.data.clone()),
                 ));
 
                 let Some(id) = ids.get(data_and_index.index as usize) else {

@@ -18,13 +18,17 @@
     color: blue;
   }
 </style>
-<canvas id=canvas width="200" height="200" layoutsubtree>
-  <div id="child">
+<canvas id=canvas width="200" height="200" content=drawable>
+  <div drawable id="child">
     <div>Match with more</div>
   </div>
 </canvas>
 <script>
   onload = async () => {
+    if (!failIfNot('requestPaint' in HTMLCanvasElement.prototype,
+                   'Missing canvas.requestPaint (reference)')) {
+      return;
+    }
     let r = new Range();
     r.setStart(document.body, 0);
     r.setEnd(document.body, 1);

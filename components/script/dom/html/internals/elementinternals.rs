@@ -6,9 +6,11 @@ use std::cell::Cell;
 
 use dom_struct::dom_struct;
 use html5ever::local_name;
-use js::context::JSContext;
+use js::context::{JSContext, NoGC};
 use script_bindings::cell::DomRefCell;
+use script_bindings::domstring::TracedDOMString;
 use script_bindings::reflector::{Reflector, reflect_dom_object};
+use stylo_dom::ElementState;
 
 use crate::dom::bindings::codegen::Bindings::ElementInternalsBinding::{
     ElementInternalsMethods, ValidityStateFlags,
@@ -27,7 +29,7 @@ use crate::dom::html::htmlformelement::{
 use crate::dom::html::internals::customstateset::CustomStateSet;
 use crate::dom::node::{Node, NodeTraits};
 use crate::dom::nodelist::NodeList;
-use crate::dom::shadowroot::ShadowRoot;
+use crate::dom::shadowroot::shadowroot::ShadowRoot;
 use crate::dom::validation::{Validatable, is_barred_by_datalist_ancestor};
 use crate::dom::validitystate::{ValidationFlags, ValidityState};
 
@@ -70,8 +72,8 @@ pub(crate) struct ElementInternals {
     attached: Cell<bool>,
     target_element: Dom<HTMLElement>,
     validity_state: MutNullableDom<ValidityState>,
-    validation_message: DomRefCell<DOMString>,
-    custom_validity_error_message: DomRefCell<DOMString>,
+    validation_message: DomRefCell<TracedDOMString>,
+    custom_validity_error_message: DomRefCell<TracedDOMString>,
     validation_anchor: MutNullableDom<HTMLElement>,
     submission_value: DomRefCell<SubmissionValue>,
     state: DomRefCell<SubmissionValue>,
@@ -89,8 +91,8 @@ impl ElementInternals {
             attached: Cell::new(false),
             target_element: Dom::from_ref(target_element),
             validity_state: Default::default(),
-            validation_message: DomRefCell::new(DOMString::new()),
-            custom_validity_error_message: DomRefCell::new(DOMString::new()),
+            validation_message: DomRefCell::new(DOMString::new().traced()),
+            custom_validity_error_message: DomRefCell::new(DOMString::new().traced()),
             validation_anchor: MutNullableDom::new(None),
             submission_value: DomRefCell::new(SubmissionValue::None),
             state: DomRefCell::new(SubmissionValue::None),
@@ -114,11 +116,11 @@ impl ElementInternals {
     }
 
     fn set_validation_message(&self, message: DOMString) {
-        *self.validation_message.borrow_mut() = message;
+        *self.validation_message.borrow_mut() = message.traced();
     }
 
     fn set_custom_validity_error_message(&self, message: DOMString) {
-        *self.custom_validity_error_message.borrow_mut() = message;
+        *self.custom_validity_error_message.borrow_mut() = message.traced();
     }
 
     pub(crate) fn set_form_owner(&self, form: Option<&HTMLFormElement>) {
@@ -145,10 +147,20 @@ impl ElementInternals {
         {
             warn!("We are in perform_entry_construction on an element with disabled attribute!");
         }
-        if self.target_element.upcast::<Element>().disabled_state() {
+        if self
+            .target_element
+            .upcast::<Element>()
+            .state()
+            .contains(ElementState::DISABLED)
+        {
             warn!("We are in perform_entry_construction on an element with disabled bit!");
         }
-        if !self.target_element.upcast::<Element>().enabled_state() {
+        if !self
+            .target_element
+            .upcast::<Element>()
+            .state()
+            .contains(ElementState::ENABLED)
+        {
             warn!("We are in perform_entry_construction on an element without enabled bit!");
         }
 
@@ -185,10 +197,10 @@ impl ElementInternals {
         }
     }
 
-    pub(crate) fn is_invalid(&self, cx: &mut JSContext) -> bool {
+    pub(crate) fn is_invalid(&self, no_gc: &NoGC) -> bool {
         self.is_target_form_associated() &&
-            self.is_instance_validatable() &&
-            !self.satisfies_constraints(cx)
+            self.is_instance_validatable(no_gc) &&
+            !self.satisfies_constraints()
     }
 
     pub(crate) fn custom_states_for_layout<'a>(&'a self) -> Option<LayoutDom<'a, CustomStateSet>> {
@@ -284,7 +296,7 @@ impl ElementInternalsMethods<crate::DomTypeHolder> for ElementInternals {
         // message to element's validation message. Otherwise, set element's custom validity error
         // message to the empty string.
         if bits.contains(ValidationFlags::CUSTOM_ERROR) {
-            self.set_custom_validity_error_message(self.validation_message.borrow().clone());
+            self.set_custom_validity_error_message(self.validation_message.borrow().clone().root());
         } else {
             self.set_custom_validity_error_message(DOMString::new());
         }
@@ -323,7 +335,7 @@ impl ElementInternalsMethods<crate::DomTypeHolder> for ElementInternals {
                 "The target element is not a form-associated custom element".to_owned(),
             )));
         }
-        Ok(self.validation_message.borrow().clone())
+        Ok(self.validation_message.borrow().clone().root())
     }
 
     /// <https://html.spec.whatwg.org/multipage#dom-elementinternals-validity>
@@ -353,13 +365,13 @@ impl ElementInternalsMethods<crate::DomTypeHolder> for ElementInternals {
     }
 
     /// <https://html.spec.whatwg.org/multipage#dom-elementinternals-willvalidate>
-    fn GetWillValidate(&self) -> Fallible<bool> {
+    fn GetWillValidate(&self, no_gc: &NoGC) -> Fallible<bool> {
         if !self.is_target_form_associated() {
             return Err(Error::NotSupported(Some(
                 "The target element is not a form-associated custom element".to_owned(),
             )));
         }
-        Ok(self.is_instance_validatable())
+        Ok(self.is_instance_validatable(no_gc))
     }
 
     /// <https://html.spec.whatwg.org/multipage#dom-elementinternals-form>
@@ -422,8 +434,15 @@ impl Validatable for ElementInternals {
         })
     }
 
+    fn satisfies_constraints(&self) -> bool {
+        let Some(validity_state) = self.validity_state.get() else {
+            return true;
+        };
+        validity_state.invalid_flags().is_empty()
+    }
+
     /// <https://html.spec.whatwg.org/multipage#candidate-for-constraint-validation>
-    fn is_instance_validatable(&self) -> bool {
+    fn is_instance_validatable(&self, no_gc: &NoGC) -> bool {
         debug_assert!(self.is_target_form_associated());
         if !self.target_element.is_submittable_element() {
             return false;
@@ -433,7 +452,7 @@ impl Validatable for ElementInternals {
         // if the readonly attribute is specified, the element is disabled,
         // or the element has a datalist element ancestor.
         !self.as_element().read_write_state() &&
-            !self.as_element().disabled_state() &&
-            !is_barred_by_datalist_ancestor(self.target_element.upcast::<Node>())
+            !self.target_element.is_form_element_disabled(no_gc) &&
+            !is_barred_by_datalist_ancestor(no_gc, self.target_element.upcast::<Node>())
     }
 }

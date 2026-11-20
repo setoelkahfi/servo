@@ -204,6 +204,7 @@ class MachCommands(CommandBase):
             "servo-layout-api",
             "servo",
             "servo-metrics",
+            "servo-media-gstreamer",
             "servo-net",
             "servo-net-traits",
             "servo-paint",
@@ -221,10 +222,17 @@ class MachCommands(CommandBase):
             "servo-deny-public-fields",
             "servo-dom-struct",
             "servo-webvtt",
+            "servo-webgl",
         ]
         if not packages:
             packages = set(os.listdir(path.join(self.context.topdir, "tests", "unit"))) - set([".DS_Store"])
             packages |= set(self_contained_tests)
+
+        # Servoshell is meant as an app library and links in NAPI, which
+        # is not available when running unit-tests.
+        if is_openharmony(self.target) and "servoshell" in packages:
+            print("Skipping servoshell unit tests on OpenHarmony.")
+            packages.remove("servoshell")
 
         in_crate_packages = []
         for crate in self_contained_tests:
@@ -259,12 +267,14 @@ class MachCommands(CommandBase):
 
         if nocapture:
             args += ["--nocapture"]
-        args += ["--no-fail-fast"]
+        if "--no-run" not in args:
+            args += ["--no-fail-fast"]
 
         env = self.build_env()
 
         crown_cargo_command: List[str] = ["cargo"]
         cargo_command: str
+        cargo_subcommand: str | None = None
         if bench:
             cargo_command = "bench"
             if code_coverage:
@@ -284,19 +294,20 @@ class MachCommands(CommandBase):
             crown_cargo_command.extend(["llvm-cov", "nextest"])
             crown_cargo_command.extend(cargo_llvm_cov_options)
             cargo_command = "llvm-cov"
-            args.insert(0, "nextest")
+            cargo_subcommand = "nextest"
             args.extend(cargo_llvm_cov_options)
         elif use_nextest:
             crown_cargo_command.extend(["nextest", "run"])
             cargo_command = "nextest"
-            args.insert(0, "run")
+            cargo_subcommand = "run"
         else:
             crown_cargo_command.extend(["test"])
             cargo_command = "test"
-        result = call(crown_cargo_command, cwd="support/crown")
-        if result != 0:
-            return result
-        result = self.run_cargo_build_like_command(cargo_command, args, env=env, **kwargs)
+        if not self.target.is_cross_build():
+            result = call(crown_cargo_command, cwd="support/crown")
+            if result != 0:
+                return result
+        result = self.run_cargo_build_like_command(cargo_command, args, subcommand=cargo_subcommand, env=env, **kwargs)
         assert isinstance(result, int)
         return result
 
@@ -507,12 +518,12 @@ class MachCommands(CommandBase):
 
     @Command(
         "update-manifest",
-        description="Run test-wpt --manifest-update SKIP_TESTS to regenerate MANIFEST.json",
+        description="Update the cached MANIFEST.json files",
         category="testing",
         parser=wpt.manifestupdate.create_parser,
     )
     def update_manifest(self, **kwargs: Any) -> int:
-        return wpt.manifestupdate.update(check_clean=False)
+        return wpt.manifestupdate.update(**kwargs)
 
     @Command("fmt", description="Format Rust, Python, and TOML files", category="testing")
     def format_code(self) -> int:
@@ -624,11 +635,11 @@ class MachCommands(CommandBase):
                 l2 = cur_op.readline()
                 if not l1:
                     break
-                result["Test"].append(str(l1).split("|")[0].strip())
-                result["Prev_Time"].append(float(str(l1).split("|")[1].strip()))
-                result["Cur_Time"].append(float(str(l2).split("|")[1].strip()))
-                a = float(str(l1).split("|")[1].strip())
-                b = float(str(l2).split("|")[1].strip())
+                result["Test"].append(l1.split("|")[0].strip())
+                result["Prev_Time"].append(float(l1.split("|")[1].strip()))
+                result["Cur_Time"].append(float(l2.split("|")[1].strip()))
+                a = float(l1.split("|")[1].strip())
+                b = float(l2.split("|")[1].strip())
                 result["Difference(%)"].append(((b - a) / a) * 100)
 
             width_col1 = max([len(x) for x in result["Test"]])
@@ -992,7 +1003,7 @@ class MachCommands(CommandBase):
 
         Try strings:
 
-          Platforms (combine with modifiers, e.g. linux-wpt):
+          Platforms (combine with modifiers, e.g. linux-wpt, default: linux):
             linux
             mac/macos
             mac-arm/macos-arm64
@@ -1001,13 +1012,14 @@ class MachCommands(CommandBase):
             ohos/openharmony
             lint/tidy
 
-          Modifiers (runs on linux by default if no platform given):
+          Modifiers (runs on checked-release if no profile given):
             unit-tests          Run unit tests
             build-libservo      Build libservo library
             wpt                 Run web-platform-tests
             bencher             Run benchmarking
             coverage            Run code coverage
             capi                Run C API build
+            perf-analysis       Page load benchmarks via perf-analysis-tools (default: release)
             production          Use production build profile
             release             Use release build profile
             debug               Use dev build profile

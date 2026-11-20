@@ -18,9 +18,7 @@
 
 use core::fmt;
 use std::collections::HashMap;
-use std::fmt::Display;
 use std::net::TcpStream;
-use std::str::FromStr;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 pub use embedder_traits::ConsoleLogLevel;
@@ -35,6 +33,7 @@ use serde::de::{Error, Visitor};
 use serde::{Deserialize, Serialize};
 use servo_base::cross_process_instant::CrossProcessInstant;
 use servo_base::generic_channel::GenericSender;
+pub use servo_base::id::WorkerId;
 use servo_base::id::{BrowsingContextId, PipelineId, WebViewId};
 use servo_url::ServoUrl;
 use uuid::Uuid;
@@ -80,7 +79,7 @@ pub enum ChromeToDevtoolsControlMsg {
     ServerExitMsg,
     /// A network event occurred (request, reply, etc.). The actor with the
     /// provided name should be notified.
-    NetworkEvent(String, NetworkEvent),
+    NetworkEvent(Uuid, NetworkEvent),
     /// Perform a memory report.
     CollectMemoryReport(ReportsChan),
 }
@@ -169,7 +168,7 @@ pub struct ObjectPreview {
     pub entries: Option<Vec<(DebuggerValue, DebuggerValue)>>,
     pub own_properties: Option<Vec<PropertyDescriptor>>,
     pub own_properties_length: Option<u32>,
-    pub function: Option<FunctionPreview>,
+    pub function: Option<Box<FunctionPreview>>,
     pub array_length: Option<u32>,
     pub items: Option<Vec<DebuggerValue>>,
 }
@@ -238,6 +237,8 @@ pub enum DebuggerValue {
         class: String,
         own_property_length: Option<u32>,
         preview: Option<Box<ObjectPreview>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        prototype: Option<Box<DebuggerValue>>,
     },
 }
 
@@ -464,10 +465,12 @@ pub enum DevtoolScriptControlMsg {
     GoForward(PipelineId),
     /// Direct the given pipeline to reload the current page.
     Reload(PipelineId),
+    /// Retrieve the favicon bytes for the given pipeline.
+    GetFavicon(PipelineId, GenericSender<Option<Vec<u8>>>),
     /// Gets the list of all allowed CSS rules and possible values.
     GetCssDatabase(GenericSender<HashMap<String, CssDatabaseProperty>>),
     /// Simulates a light or dark color scheme for the given pipeline
-    SimulateColorScheme(PipelineId, Theme),
+    SimulateColorScheme(PipelineId, Option<Theme>),
     /// Highlight the given DOM node
     HighlightDomNode(PipelineId, Option<String>),
 
@@ -581,11 +584,20 @@ pub struct HttpRequest {
 }
 
 #[derive(Debug, PartialEq, MallocSizeOf)]
+pub struct HttpResponseBody {
+    pub data: bytes::Bytes,
+    pub truncated: bool,
+    /// Total number of (decompressed) bytes received from the network,
+    /// including any bytes that were dropped due to the truncation limit.
+    /// When `truncated` is false this equals `data.len()`.
+    pub content_size: usize,
+}
+
+#[derive(Debug, PartialEq, MallocSizeOf)]
 pub struct HttpResponse {
-    #[ignore_malloc_size_of = "Http type"]
     pub headers: Option<HeaderMap>,
     pub status: HttpStatus,
-    pub body: Option<bytes::Bytes>,
+    pub body: Option<HttpResponseBody>,
     pub from_cache: bool,
     pub pipeline_id: PipelineId,
     pub browsing_context_id: BrowsingContextId,
@@ -637,21 +649,6 @@ impl StartedTimelineMarker {
         }
     }
 }
-#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, MallocSizeOf, PartialEq, Serialize)]
-pub struct WorkerId(pub Uuid);
-impl Display for WorkerId {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.0)
-    }
-}
-impl FromStr for WorkerId {
-    type Err = uuid::Error;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        Ok(Self(s.parse()?))
-    }
-}
-
 #[derive(Debug, Deserialize, Serialize, MallocSizeOf)]
 #[serde(rename_all = "camelCase")]
 pub struct CssDatabaseProperty {

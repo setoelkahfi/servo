@@ -43,17 +43,21 @@
 
   function generateMarkup(isAudioOnly) {
     return `
-      <div class="controls">
-        <button id="play-pause-button"></button>
-        <input id="progress" type="range" value="0" min="0" max="100" step="1"></input>
-        <span id="position-duration-box" class="hidden">
-          <span id="position-text">#1</span>
-          <span id="duration"> / #2</span>
-        </span>
-        <button id="volume-switch"></button>
-        <input id="volume-level" type="range" value="100" min="0" max="100" step="1"></input>
-        ${isAudioOnly ? "" : '<button id="fullscreen-switch" class="fullscreen"></button>'}
+      <button id="play-pause-button" class="button playPauseButton" paused="true"></button>
+      <div id="scrubber-stack" class="scrubberStack">
+        <div class="progressStack">
+          <progress id="buffer-bar" class="bufferBar" value="0" max="100"></progress>
+          <progress id="progress-bar" class="progressBar" value="0" max="100"></progress>
+        </div>
+        <input type="range" id="scrubber" class="scrubber" value="0" min="0" max="100" step="1">
       </div>
+      <span id="position-duration-box" class="positionDurationBox">
+        <span id="position-text">#1</span>
+        <span id="duration" class="duration"> / #2</span>
+      </span>
+      <button id="mute-button" class="button muteButton"></button>
+      <input type="range" id="volume-level" class="volumeLevel" value="100" min="0" max="100" step="1">
+      ${isAudioOnly ? "" : '<button id="fullscreen-switch" class="button fullscreenSwitch"></button>'}
     `;
   }
 
@@ -92,14 +96,19 @@
         for (const mutation of mutations) {
           // Here we handle the `controls` attribute removal.
           if (mutation.type === "attributes") {
-            this.cleanup();
+            if (this.media.hasAttribute('controls')) {
+              this.initializeDom();
+            } else {
+              this.cleanupDom();
+            }
             return;
           }
           // Here we handle element removal from DOM.
           if (mutation.type === "childList") {
             for (const node of mutation.removedNodes) {
               if (node === this.media) {
-                this.cleanup();
+                this.cleanupDom();
+                this.cleanupCompleteControls();
                 return;
               }
             }
@@ -117,26 +126,39 @@
 
       this.isAudioOnly = this.media.localName == "audio";
 
+      // We also render the shadowtree for cues, which means that the
+      // controls scripts run, but we don't want to show anything.
+      // The above mutation observer then ensures that the controls do
+      // render if at a later stage these controls should be shown.
+      if (this.media.hasAttribute('controls')) {
+        this.initializeDom();
+      }
+    }
+
+    initializeDom() {
+      // Do not reinitialize twice
+      if (this.root) {
+        return;
+      }
+
       // Create root element and load markup.
       this.root = document.createElement("div");
-      this.root.classList.add("root");
+      this.root.classList.add("controls-container");
       this.root.innerHTML = generateMarkup(this.isAudioOnly);
-      this.controls.appendChild(this.root);
+      this.controls.firstChild.appendChild(this.root);
 
 
       const elementNames = [
-        "duration",
         "play-pause-button",
+        "buffer-bar",
+        "progress-bar",
+        "scrubber",
         "position-duration-box",
         "position-text",
-        "progress",
-        "volume-switch",
+        "duration",
+        "mute-button",
         "volume-level"
       ];
-
-      if (!this.isAudioOnly) {
-        elementNames.push("fullscreen-switch");
-      }
 
       // Import elements.
       this.elements = {};
@@ -150,7 +172,6 @@
       const durationFormat = durationSpan.textContent;
       const positionFormat = positionTextNode.textContent;
 
-      durationSpan.classList.add("duration");
       durationSpan.setAttribute("role", "none");
 
       Object.defineProperties(this.elements.positionDurationBox, {
@@ -182,7 +203,6 @@
             if (self.duration != duration) {
               self.duration = duration;
             }
-            self.classList.remove("hidden");
           }
         }
       });
@@ -214,13 +234,10 @@
 
       this.controlEvents = [
         { el: this.elements.playPauseButton, type: "click" },
-        { el: this.elements.volumeSwitch, type: "click" },
+        { el: this.elements.muteButton, type: "click" },
+        { el: this.elements.scrubber, type: "input" },
         { el: this.elements.volumeLevel, type: "input" }
       ];
-
-      if (!this.isAudioOnly) {
-        this.controlEvents.push({ el: this.elements.fullscreenSwitch, type: "click" });
-      }
 
       this.controlEvents.forEach(({ el, type }) => {
         el.addEventListener(type, this);
@@ -253,68 +270,98 @@
 
           // Transition to the next state.
           this.state = to;
-          this.onStateChange(from);
+          this.onStateChange();
         };
       }
 
       // Set initial state.
       this.state = this.media.paused ? PAUSED : PLAYING;
-      this.onStateChange(null);
+      this.onStateChange();
     }
 
-    cleanup() {
-      this.mutationObserver.disconnect();
-      this.mutationObserver = null;
+    cleanupDom() {
+      if (!this.root) {
+        return;
+      }
       this.mediaEvents.forEach(event => {
         this.media.removeEventListener(event, this);
       });
       this.controlEvents.forEach(({ el, type }) => {
         el.removeEventListener(type, this);
       });
+      this.root.remove();
+      this.root = null;
+    }
+
+    cleanupCompleteControls() {
+      this.mutationObserver.disconnect();
+      this.mutationObserver = null;
       this.media = null;
       this.controls = null;
     }
 
     // State change handler
-    onStateChange(from) {
-      this.render(from);
+    onStateChange() {
+      this.render();
     }
 
-    render(from = this.state) {
+    render() {
       // Error
       if (this.state == ERRORED) {
         // XXX render errored state
         return;
       }
 
-      if (this.state != from) {
-        // Play/Pause button.
-        const playPauseButton = this.elements.playPauseButton;
-        playPauseButton.classList.remove(from);
-        playPauseButton.classList.add(this.state);
+      // Play button: show the play icon when paused or ended, the pause icon
+      // otherwise
+      const paused = this.state == PAUSED || this.state == ENDED;
+      if (paused) {
+        this.elements.playPauseButton.setAttribute("paused", "");
+      } else {
+        this.elements.playPauseButton.removeAttribute("paused");
       }
 
-      // Progress.
-      const positionPercent =
-        (this.media.currentTime / this.media.duration) * 100;
-      if (Number.isFinite(positionPercent)) {
-        this.elements.progress.value = positionPercent;
-      } else {
-        this.elements.progress.value = 0;
+      // Buffered and Playing progress
+      const duration = this.media.duration;
+      const currentTime = this.media.currentTime;
+      const positionPercent = duration
+        ? (currentTime / duration) * 100
+        : 0;
+      this.elements.progressBar.value = Number.isFinite(positionPercent)
+        ? positionPercent
+        : 0;
+
+      // TODO: Don't update the scrubber if the user is dragging it.
+      this.elements.scrubber.value = Number.isFinite(positionPercent)
+        ? positionPercent
+        : 0;
+
+      let bufferedEnd = 0;
+      if (this.media.buffered && this.media.buffered.length > 0) {
+        // Only use the last buffered range.
+        bufferedEnd = this.media.buffered.end(this.media.buffered.length - 1);
       }
+      const bufferedPercent = duration ? (bufferedEnd / duration) * 100 : 0;
+      this.elements.bufferBar.value = Number.isFinite(bufferedPercent)
+        ? bufferedPercent
+        : 0;
 
       // Current time and duration.
-      let currentTime = formatTime(0);
-      let duration = formatTime(0);
-      if (!isNaN(this.media.currentTime) && !isNaN(this.media.duration)) {
-        currentTime = formatTime(Math.round(this.media.currentTime * 1000));
-        duration = formatTime(Math.round(this.media.duration * 1000));
+      let currentTimeText = formatTime(0);
+      let durationText = formatTime(0);
+      if ( !isNaN(currentTime) && !isNaN(duration)) {
+        currentTimeText = formatTime(currentTime * 1000);
+        durationText = formatTime(duration * 1000);
       }
-      this.elements.positionDurationBox.show(currentTime, duration);
+      this.elements.positionDurationBox.show(currentTimeText, durationText);
+      const muted = this.media.muted || this.media.volume == 0;
+      if (muted) {
+        this.elements.muteButton.setAttribute("muted","");
+      } else {
+        this.elements.muteButton.removeAttribute("muted");
+      }
 
-      // Volume.
-      this.elements.volumeSwitch.className =
-        this.media.muted || !this.media.volume ? "muted" : "volumeup";
+      // Volume slider.
       const volumeLevelValue = this.media.muted
         ? 0
         : Math.round(this.media.volume * 100);
@@ -343,12 +390,12 @@
             case this.elements.playPauseButton:
               this.playOrPause();
               break;
-            case this.elements.volumeSwitch:
+            case this.elements.muteButton:
               this.toggleMuted();
               break;
             case this.elements.fullscreenSwitch:
-                this.toggleFullscreen();
-                break;
+              this.toggleFullscreen();
+              break;
           }
           break;
         case "input":
@@ -377,9 +424,12 @@
         case "volumechange":
         case "timeupdate":
         case "resize":
-          this.render();
-          break;
+        case "loadeddata":
         case "loadedmetadata":
+        case "progress":
+        case "playing":
+        case "suspend":
+          this.render();
           break;
       }
     }
@@ -406,19 +456,19 @@
     }
 
     toggleFullscreen() {
-        const { fullscreenEnabled, fullscreenElement } = document;
+      const { fullscreenEnabled, fullscreenElement } = document;
 
-        const isElementFullscreen = fullscreenElement && fullscreenElement === this.media;
+      const isElementFullscreen = fullscreenElement && fullscreenElement === this.media;
 
-        if (fullscreenEnabled && isElementFullscreen) {
-            document.exitFullscreen().then(() => {
-                this.elements.fullscreenSwitch.classList.remove("fullscreen-active");
-            });
-        } else {
-            this.media.requestFullscreen().then(() => {
-                this.elements.fullscreenSwitch.classList.add("fullscreen-active");
-            });
-        }
+      if (fullscreenEnabled && isElementFullscreen) {
+        document.exitFullscreen().then(() => {
+          this.elements.fullscreenSwitch.removeAttribute("fullscreen-active");
+        });
+      } else {
+        this.media.requestFullscreen().then(() => {
+          this.elements.fullscreenSwitch.setAttribute("fullscreen-active","");
+        });
+      }
     }
 
     changeVolume() {
@@ -431,4 +481,3 @@
 
   new MediaControls();
 })();
-

@@ -12,6 +12,7 @@ use embedder_traits::{
     WebViewPoint, WheelDelta, WheelEvent, WheelMode,
 };
 use euclid::Point2D;
+use keyboard_types::Modifiers;
 use keyboard_types::webdriver::KeyInputState;
 use log::info;
 use rustc_hash::FxHashSet;
@@ -59,7 +60,10 @@ pub(crate) type ActionsByTick = Vec<TickActions>;
 /// <https://w3c.github.io/webdriver/#dfn-input-source-state>
 pub(crate) enum InputSourceState {
     Null,
-    Key(KeyInputState),
+    Key {
+        state: KeyInputState,
+        modifiers: Modifiers,
+    },
     Pointer(PointerInputState),
     Wheel,
 }
@@ -148,6 +152,23 @@ fn touch_pointer_type_for(subtype: PointerType) -> TouchPointerType {
     }
 }
 
+/// <https://w3c.github.io/webdriver/#dfn-maximum-safe-integer>
+/// <https://262.ecma-international.org/6.0/#sec-number.max_safe_integer>
+fn exceeds_maximum_safe_integer(value: u64) -> bool {
+    value > MAXIMUM_SAFE_INTEGER
+}
+
+/// <https://w3c.github.io/webdriver/#dfn-maximum-safe-integer>
+/// <https://262.ecma-international.org/6.0/#sec-number.max_safe_integer>
+fn outside_safe_integer_range(value: i64) -> bool {
+    value.unsigned_abs() > MAXIMUM_SAFE_INTEGER
+}
+
+fn pause_action_has_invalid_duration(action: &GeneralAction) -> bool {
+    let GeneralAction::Pause(action) = action;
+    action.duration.is_some_and(exceeds_maximum_safe_integer)
+}
+
 fn compute_tick_duration(tick_actions: &TickActions) -> u64 {
     // Step 1. Let max duration be 0.
     // Step 2. For each action in tick actions:
@@ -200,12 +221,6 @@ impl Handler {
             // computing the tick duration with argument tick actions.
             let tick_duration = compute_tick_duration(tick_actions);
 
-            // FIXME: This is out of spec, but the test `perform_actions/invalid.py` requires
-            // that duration more than `MAXIMUM_SAFE_INTEGER` is considered invalid.
-            if tick_duration > MAXIMUM_SAFE_INTEGER {
-                return Err(ErrorStatus::InvalidArgument);
-            }
-
             let tick_start = Instant::now();
 
             // Step 1.3. Try to dispatch tick actions
@@ -237,6 +252,19 @@ impl Handler {
         // Step 2. Return success with data null.
         info!("Dispatch actions completed successfully");
         Ok(())
+    }
+
+    /// <https://w3c.github.io/webdriver/#dfn-dispatch-a-list-of-actions>
+    pub(crate) fn dispatch_a_list_of_actions(
+        &mut self,
+        actions: TickActions,
+        browsing_context: BrowsingContextId,
+    ) -> Result<(), ErrorStatus> {
+        // Step 1. Let tick actions be the list «actions».
+        // Step 2. Let actions by tick be the list «tick actions».
+        // Step 3. Return the result of dispatch actions with input state,
+        // actions by tick, browsing context, and actions options.
+        self.dispatch_actions(vec![actions], browsing_context)
     }
 
     /// <https://w3c.github.io/webdriver/#dfn-perform-a-pointer-move>
@@ -395,12 +423,14 @@ impl Handler {
     /// <https://w3c.github.io/webdriver/#dfn-dispatch-a-keydown-action>
     fn dispatch_keydown_action(&mut self, input_id: &str, action: &KeyDownAction) {
         let raw_key = action.value.chars().next().unwrap();
-        let key_input_state = match self.input_state_table_mut().get_mut(input_id).unwrap() {
-            InputSourceState::Key(key_input_state) => key_input_state,
-            _ => unreachable!(),
-        };
+        let (key_input_state, key_input_modifiers) =
+            match self.input_state_table_mut().get_mut(input_id).unwrap() {
+                InputSourceState::Key { state, modifiers } => (state, modifiers),
+                _ => unreachable!(),
+            };
 
         let keyboard_event = key_input_state.dispatch_keydown(raw_key);
+        *key_input_modifiers = keyboard_event.modifiers;
 
         // Step 12: Perform implementation-specific action dispatch steps on browsing
         // context equivalent to pressing a key on the keyboard in accordance with the
@@ -431,10 +461,11 @@ impl Handler {
         }
 
         let raw_key = action.value.chars().next().unwrap();
-        let key_input_state = match session.input_state_table.get_mut(input_id).unwrap() {
-            InputSourceState::Key(key_input_state) => key_input_state,
-            _ => unreachable!(),
-        };
+        let (key_input_state, key_input_modifiers) =
+            match session.input_state_table.get_mut(input_id).unwrap() {
+                InputSourceState::Key { state, modifiers } => (state, modifiers),
+                _ => unreachable!(),
+            };
 
         // Step 12: Perform implementation-specific action dispatch steps on browsing
         // context equivalent to releasing a key on the keyboard in accordance with the
@@ -442,6 +473,8 @@ impl Handler {
         let Some(keyboard_event) = key_input_state.dispatch_keyup(raw_key) else {
             return;
         };
+        *key_input_modifiers = keyboard_event.modifiers;
+
         self.send_blocking_input_event_to_embedder(InputEvent::Keyboard(KeyboardEvent::new(
             keyboard_event,
         )));
@@ -879,7 +912,11 @@ impl Handler {
                 mode: WheelMode::DeltaPixel,
             };
             let point = WebViewPoint::Page(Point2D::new(x as f32, y as f32));
-            let input_event = InputEvent::Wheel(WheelEvent::new(delta, point));
+            let input_event = InputEvent::Wheel(WheelEvent::new(
+                delta,
+                point,
+                self.current_keyboard_modifiers(),
+            ));
 
             self.send_blocking_input_event_to_embedder(input_event);
 
@@ -1005,18 +1042,18 @@ impl Handler {
     pub(crate) fn extract_an_action_sequence(
         &mut self,
         actions: Vec<ActionSequence>,
-    ) -> ActionsByTick {
+    ) -> Result<ActionsByTick, ErrorStatus> {
         // Step 3. Let "actions by tick" be an empty list.
         let mut actions_by_tick: ActionsByTick = Vec::new();
 
-        // Step 4. For each value "action sequence" corresponding to an indexed property in actions
+        // Step 4. For each value "action sequence" corresponding to an indexed property in actions:
         for action_sequence in actions {
             let id = action_sequence.id.clone();
             // Step 4.1. Let "source actions" be the result of trying to process an input source action sequence
             // given "action sequence".
-            let source_actions = self.process_an_input_source_action_sequence(action_sequence);
+            let source_actions = self.process_an_input_source_action_sequence(action_sequence)?;
 
-            // Step 4.2.2. Ensure we have enough ticks to hold all actions
+            // Step 4.2.2. Ensure we have enough ticks to hold all actions.
             if actions_by_tick.len() < source_actions.len() {
                 actions_by_tick.resize_with(source_actions.len(), Vec::new);
             }
@@ -1028,14 +1065,14 @@ impl Handler {
             }
         }
 
-        actions_by_tick
+        Ok(actions_by_tick)
     }
 
     /// <https://w3c.github.io/webdriver/#dfn-process-an-input-source-action-sequence>
     fn process_an_input_source_action_sequence(
         &mut self,
         action_sequence: ActionSequence,
-    ) -> Vec<ActionItem> {
+    ) -> Result<Vec<ActionItem>, ErrorStatus> {
         // Step 2. Let id be the value of the id property of action sequence.
         let id = action_sequence.id;
         match action_sequence.actions {
@@ -1045,22 +1082,52 @@ impl Handler {
                 self.input_state_table_mut()
                     .entry(id)
                     .or_insert(InputSourceState::Null);
-                null_actions.into_iter().map(ActionItem::Null).collect()
+                // <https://w3c.github.io/webdriver/#dfn-process-a-null-action>
+                null_actions
+                    .into_iter()
+                    .map(|action_item| {
+                        let NullActionItem::General(action) = &action_item;
+                        if pause_action_has_invalid_duration(action) {
+                            Err(ErrorStatus::InvalidArgument)
+                        } else {
+                            Ok(ActionItem::Null(action_item))
+                        }
+                    })
+                    .collect()
             },
             ActionsType::Key {
                 actions: key_actions,
             } => {
                 self.input_state_table_mut()
                     .entry(id)
-                    .or_insert(InputSourceState::Key(KeyInputState::new()));
-                key_actions.into_iter().map(ActionItem::Key).collect()
+                    .or_insert(InputSourceState::Key {
+                        state: KeyInputState::new(),
+                        modifiers: Default::default(),
+                    });
+                // <https://w3c.github.io/webdriver/#dfn-process-a-key-action>
+                key_actions
+                    .into_iter()
+                    .map(|action_item| {
+                        let is_invalid = match &action_item {
+                            KeyActionItem::General(action) => {
+                                pause_action_has_invalid_duration(action)
+                            },
+                            KeyActionItem::Key(_) => false,
+                        };
+                        if is_invalid {
+                            Err(ErrorStatus::InvalidArgument)
+                        } else {
+                            Ok(ActionItem::Key(action_item))
+                        }
+                    })
+                    .collect()
             },
             ActionsType::Pointer {
                 parameters,
                 actions: pointer_actions,
             } => {
                 let pointer_ids = self.session().unwrap().pointer_ids();
-                // Get or create a pointer input source with subtype, and other iterms
+                // Get or create a pointer input source with subtype, and other items
                 // set to default values.
                 self.input_state_table_mut()
                     .entry(id)
@@ -1070,9 +1137,37 @@ impl Handler {
                         0.0,
                         0.0,
                     )));
+                // <https://w3c.github.io/webdriver/#dfn-process-a-pointer-action>
                 pointer_actions
                     .into_iter()
-                    .map(ActionItem::Pointer)
+                    .map(|action_item| {
+                        let is_invalid = match &action_item {
+                            PointerActionItem::General(action) => {
+                                pause_action_has_invalid_duration(action)
+                            },
+                            PointerActionItem::Pointer(PointerAction::Down(action)) => {
+                                exceeds_maximum_safe_integer(action.button) ||
+                                    action.width.is_some_and(exceeds_maximum_safe_integer) ||
+                                    action.height.is_some_and(exceeds_maximum_safe_integer)
+                            },
+                            PointerActionItem::Pointer(PointerAction::Up(action)) => {
+                                exceeds_maximum_safe_integer(action.button) ||
+                                    action.width.is_some_and(exceeds_maximum_safe_integer) ||
+                                    action.height.is_some_and(exceeds_maximum_safe_integer)
+                            },
+                            PointerActionItem::Pointer(PointerAction::Move(action)) => {
+                                action.duration.is_some_and(exceeds_maximum_safe_integer) ||
+                                    action.width.is_some_and(exceeds_maximum_safe_integer) ||
+                                    action.height.is_some_and(exceeds_maximum_safe_integer)
+                            },
+                            PointerActionItem::Pointer(PointerAction::Cancel) => false,
+                        };
+                        if is_invalid {
+                            Err(ErrorStatus::InvalidArgument)
+                        } else {
+                            Ok(ActionItem::Pointer(action_item))
+                        }
+                    })
                     .collect()
             },
             ActionsType::Wheel {
@@ -1081,13 +1176,45 @@ impl Handler {
                 self.input_state_table_mut()
                     .entry(id)
                     .or_insert(InputSourceState::Wheel);
-                wheel_actions.into_iter().map(ActionItem::Wheel).collect()
+                // <https://w3c.github.io/webdriver/#dfn-process-a-wheel-action>
+                wheel_actions
+                    .into_iter()
+                    .map(|action_item| {
+                        let is_invalid = match &action_item {
+                            WheelActionItem::General(action) => {
+                                pause_action_has_invalid_duration(action)
+                            },
+                            WheelActionItem::Wheel(WheelAction::Scroll(action)) => {
+                                action.duration.is_some_and(exceeds_maximum_safe_integer) ||
+                                    action.x.is_some_and(outside_safe_integer_range) ||
+                                    action.y.is_some_and(outside_safe_integer_range) ||
+                                    action.deltaX.is_some_and(outside_safe_integer_range) ||
+                                    action.deltaY.is_some_and(outside_safe_integer_range)
+                            },
+                        };
+                        if is_invalid {
+                            Err(ErrorStatus::InvalidArgument)
+                        } else {
+                            Ok(ActionItem::Wheel(action_item))
+                        }
+                    })
+                    .collect()
             },
         }
     }
 
     fn input_state_table_mut(&mut self) -> &mut HashMap<String, InputSourceState> {
         &mut self.session_mut().unwrap().input_state_table
+    }
+
+    fn current_keyboard_modifiers(&self) -> Modifiers {
+        self.session().unwrap().input_state_table.values().fold(
+            Modifiers::empty(),
+            |global_modifiers, source| match source {
+                InputSourceState::Key { modifiers, .. } => global_modifiers.union(*modifiers),
+                _ => global_modifiers,
+            },
+        )
     }
 
     fn get_pointer_input_state_mut(&mut self, input_id: &str) -> &mut PointerInputState {

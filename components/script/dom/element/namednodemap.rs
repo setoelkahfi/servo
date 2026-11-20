@@ -5,7 +5,8 @@
 use dom_struct::dom_struct;
 use html5ever::LocalName;
 use js::context::{JSContext, NoGC};
-use script_bindings::reflector::{Reflector, reflect_dom_object_with_cx};
+use rustc_hash::FxHashSet;
+use script_bindings::reflector::{Reflector, reflect_dom_object};
 
 use crate::dom::attr::Attr;
 use crate::dom::bindings::codegen::Bindings::ElementBinding::ElementMethods;
@@ -36,7 +37,7 @@ impl NamedNodeMap {
         window: &Window,
         elem: &Element,
     ) -> DomRoot<NamedNodeMap> {
-        reflect_dom_object_with_cx(Box::new(NamedNodeMap::new_inherited(elem)), window, cx)
+        reflect_dom_object(cx, Box::new(NamedNodeMap::new_inherited(elem)), window)
     }
 }
 
@@ -88,7 +89,9 @@ impl NamedNodeMapMethods<crate::DomTypeHolder> for NamedNodeMap {
         let name = self.owner.parsed_name(name);
         self.owner
             .remove_attribute_by_name(cx, &name)
-            .ok_or(Error::NotFound(None))
+            .ok_or(Error::NotFound(Some(
+                "No attribute with the given name".into(),
+            )))
     }
 
     /// <https://dom.spec.whatwg.org/#dom-namednodemap-removenameditemns>
@@ -101,7 +104,9 @@ impl NamedNodeMapMethods<crate::DomTypeHolder> for NamedNodeMap {
         let ns = namespace_from_domstring(namespace);
         self.owner
             .remove_attribute(cx, &ns, &LocalName::from(local_name))
-            .ok_or(Error::NotFound(None))
+            .ok_or(Error::NotFound(Some(
+                "No attribute with the given namespace and local name".into(),
+            )))
     }
 
     /// <https://dom.spec.whatwg.org/#dom-namednodemap-item>
@@ -117,15 +122,16 @@ impl NamedNodeMapMethods<crate::DomTypeHolder> for NamedNodeMap {
     /// <https://heycam.github.io/webidl/#dfn-supported-property-names>
     fn SupportedPropertyNames(&self, _: &NoGC) -> Vec<DOMString> {
         let mut names = vec![];
+        let mut seen: FxHashSet<&LocalName> = FxHashSet::default();
         let html_element_in_html_document = self.owner.html_element_in_html_document();
         for attr in self.owner.attrs().borrow().iter() {
-            let s = &**attr.name();
-            if html_element_in_html_document && !s.bytes().all(|b| b.to_ascii_lowercase() == b) {
+            let name = attr.name();
+            if html_element_in_html_document && !name.bytes().all(|b| b.to_ascii_lowercase() == b) {
                 continue;
             }
 
-            if !names.iter().any(|name| name == s) {
-                names.push(DOMString::from(s));
+            if seen.insert(name) {
+                names.push(DOMString::from(&**name));
             }
         }
         names

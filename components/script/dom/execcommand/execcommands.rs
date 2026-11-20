@@ -15,7 +15,7 @@ use crate::dom::bindings::str::DOMString;
 use crate::dom::comment::Comment;
 use crate::dom::document::Document;
 use crate::dom::event::Event;
-use crate::dom::event::inputevent::InputEvent;
+use crate::dom::event::inputevent::{InputEvent, InputEventFlags};
 use crate::dom::execcommand::basecommand::CommandName;
 use crate::dom::execcommand::commands::fontsize::maybe_normalize_pixels;
 use crate::dom::html::htmlelement::HTMLElement;
@@ -169,6 +169,7 @@ impl Document {
             "insertparagraph" => CommandName::InsertParagraph,
             "inserttext" => CommandName::InsertText,
             "italic" => CommandName::Italic,
+            "outdent" => CommandName::Outdent,
             "removeformat" => CommandName::RemoveFormat,
             "strikethrough" => CommandName::Strikethrough,
             "stylewithcss" => CommandName::StyleWithCss,
@@ -296,13 +297,11 @@ impl DocumentExecCommandSupport for Document {
                 window,
                 None,
                 atom!("beforeinput"),
-                true,
-                true,
+                InputEventFlags::BUBBLES | InputEventFlags::CANCELABLE,
                 Some(window),
                 0,
                 None,
-                false,
-                "".into(),
+                mapped_value_of_command(command),
             );
             let event = event.upcast::<Event>();
             // Step 4.3. If the value returned by the previous step is false, return false.
@@ -349,12 +348,10 @@ impl DocumentExecCommandSupport for Document {
                 window,
                 None,
                 atom!("input"),
-                true,
-                false,
+                InputEventFlags::BUBBLES,
                 Some(window),
                 0,
                 None,
-                false,
                 mapped_value_of_command(command),
             );
             let event = event.upcast::<Event>();

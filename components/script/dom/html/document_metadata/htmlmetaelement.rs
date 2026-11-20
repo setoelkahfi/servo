@@ -8,7 +8,7 @@ use content_security_policy::{Policy, PolicyDisposition, PolicySource};
 use dom_struct::dom_struct;
 use embedder_traits::Theme;
 use html5ever::{LocalName, Prefix, local_name};
-use js::context::JSContext;
+use js::context::{JSContext, NoGC};
 use js::rust::HandleObject;
 use net_traits::ReferrerPolicy;
 use paint_api::viewport_description::ViewportDescription;
@@ -71,16 +71,19 @@ impl HTMLMetaElement {
             if name.eq_ignore_ascii_case("viewport") {
                 self.parse_and_send_viewport_if_necessary(cx);
             }
+        }
         // https://html.spec.whatwg.org/multipage/#attr-meta-http-equiv
-        } else if !self.HttpEquiv().is_empty() {
+        if !self.HttpEquiv().is_empty() {
             // TODO: Implement additional http-equiv candidates
             if self.HttpEquiv().eq_ignore_ascii_case("refresh") {
-                self.declarative_refresh();
+                self.declarative_refresh(cx.no_gc());
             } else if self
                 .HttpEquiv()
                 .eq_ignore_ascii_case("content-security-policy")
             {
                 self.apply_csp_list();
+            } else if self.HttpEquiv().eq_ignore_ascii_case("content-language") {
+                self.pragma_set_default_language();
             }
         }
     }
@@ -118,9 +121,10 @@ impl HTMLMetaElement {
         // empty string, then return.
         if let Some(content) = self
             .upcast::<Element>()
-            .get_attribute_string_value(&local_name!("content"))
+            .get_attribute_string_ref(&local_name!("content"))
             .filter(|value| !value.is_empty())
         {
+            let content = content.as_attr_ref().value();
             // Step 4. Let value be the value of element's content attribute, converted to ASCII
             // lowercase.
             // Step 5. If value is one of the values given in the first column of the following
@@ -165,7 +169,7 @@ impl HTMLMetaElement {
             .upcast::<Node>()
             // Do not traverse shadow trees for optimization, which also implies:
             // > the element is in a document tree;
-            .traverse_preorder_non_rooting(cx.no_gc(), ShadowIncluding::No)
+            .traverse_preorder_unrooted(cx.no_gc(), ShadowIncluding::No)
             .filter_map(UnrootedDom::downcast::<HTMLMetaElement>)
             .filter_map(|meta| {
                 let element = UnrootedDom::upcast::<Element>(meta);
@@ -237,7 +241,7 @@ impl HTMLMetaElement {
     }
 
     /// <https://html.spec.whatwg.org/multipage/#shared-declarative-refresh-steps>
-    fn declarative_refresh(&self) {
+    fn declarative_refresh(&self, no_gc: &NoGC) {
         if !self.upcast::<Node>().is_in_a_document_tree() {
             return;
         }
@@ -248,10 +252,39 @@ impl HTMLMetaElement {
         if !content.is_empty() {
             // Step 3. Run the shared declarative refresh steps with the meta element's node document, input, and the meta element.
             self.owner_document().shared_declarative_refresh_steps(
-                &content.as_bytes(),
+                &content.as_bytes(no_gc),
                 /* from_meta_element */ true,
             );
         }
+    }
+
+    /// <https://html.spec.whatwg.org/multipage/#pragma-set-default-language>
+    fn pragma_set_default_language(&self) {
+        // Step 3. Let input be the value of the element's content attribute.
+        let input = self.Content();
+        let input = input.str();
+        // Step 2. If the element's content attribute contains
+        // a U+002C COMMA character (,), then return.
+        let candidate = if input.contains('\u{002C}') {
+            None
+        } else {
+            // Step 1. If the meta element has no content attribute, then return.
+            // Step 4. Let position point at the first character of input.
+            // Step 5. Skip ASCII whitespace within input given position.
+            // Step 6. Collect a sequence of code points that are
+            // not ASCII whitespace from input given position.
+            // Step 7. Let candidate be the string that resulted from the previous step.
+            // Step 8. If candidate is the empty string, return.
+            input
+                .trim_start()
+                .split_ascii_whitespace()
+                .next()
+                .filter(|candidate| !candidate.is_empty())
+                .map(|candidate| candidate.to_owned())
+        };
+
+        // Step 9. Set the pragma-set default language to candidate.
+        self.owner_document().set_default_language(candidate);
     }
 }
 

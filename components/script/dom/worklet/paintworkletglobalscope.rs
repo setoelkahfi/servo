@@ -4,7 +4,6 @@
 
 use std::cell::Cell;
 use std::ptr::{NonNull, null_mut};
-use std::rc::Rc;
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -17,14 +16,14 @@ use js::context::JSContext;
 use js::jsapi::{HandleValueArray, Heap, IsCallable, IsConstructor, JSObject, Value};
 use js::jsval::{JSVal, ObjectValue, UndefinedValue};
 use js::realm::AutoRealm;
-use js::rust::wrappers2::{
-    Call, Construct1, JS_ClearPendingException, JS_IsExceptionPending, NewArrayObject,
-};
+use js::rust::wrappers2::{Call, Construct1, JS_ClearPendingException, NewArrayObject};
 use js::rust::{HandleValue, MutableHandle};
 use net_traits::image_cache::ImageCache;
 use pixels::PixelFormat;
+use script_bindings::callback::{HasCallbackHolder, RootedCallback};
 use script_bindings::cell::DomRefCell;
 use script_bindings::interfaces::HasOrigin;
+use script_bindings::js::JS_IsExceptionPending;
 use script_bindings::reflector::DomObject;
 use script_traits::{DrawAPaintImageResult, PaintWorkletError, Painter};
 use servo_base::id::PipelineId;
@@ -34,7 +33,6 @@ use style_traits::{CSSPixel, SpeculativePainter};
 use stylo_atoms::Atom;
 use webrender_api::units::DevicePixel;
 
-use crate::dom::bindings::callback::CallbackContainer;
 use crate::dom::bindings::codegen::Bindings::PaintWorkletGlobalScopeBinding;
 use crate::dom::bindings::codegen::Bindings::PaintWorkletGlobalScopeBinding::PaintWorkletGlobalScopeMethods;
 use crate::dom::bindings::codegen::Bindings::VoidFunctionBinding::VoidFunction;
@@ -50,7 +48,6 @@ use crate::dom::paintrenderingcontext2d::PaintRenderingContext2D;
 use crate::dom::paintsize::PaintSize;
 use crate::dom::worklet::WorkletExecutor;
 use crate::dom::workletglobalscope::{WorkletGlobalScope, WorkletGlobalScopeInit};
-use crate::runtime::microtask::MicrotaskQueue;
 
 /// <https://drafts.css-houdini.org/css-paint-api/#paintworkletglobalscope>
 #[dom_struct]
@@ -95,7 +92,6 @@ impl PaintWorkletGlobalScope {
         executor: WorkletExecutor,
         init: &WorkletGlobalScopeInit,
         closing: Arc<AtomicBool>,
-        microtask_queue: Rc<MicrotaskQueue>,
     ) -> DomRoot<PaintWorkletGlobalScope> {
         debug!(
             "Creating paint worklet global scope for pipeline {}.",
@@ -109,7 +105,6 @@ impl PaintWorkletGlobalScope {
                 executor,
                 init,
                 closing,
-                microtask_queue,
             ),
             image_cache: init.image_cache.clone(),
             paint_definitions: Default::default(),
@@ -224,7 +219,7 @@ impl PaintWorkletGlobalScope {
             Construct1(cx, class_constructor, &args, result.handle_mut());
         }
         paint_instance.set(ObjectValue(result.get()));
-        if unsafe { JS_IsExceptionPending(cx) } {
+        if JS_IsExceptionPending(cx) {
             debug!("Paint constructor threw an exception {}.", name);
             unsafe {
                 JS_ClearPendingException(cx);
@@ -351,7 +346,7 @@ impl PaintWorkletGlobalScope {
         let missing_image_urls = rendering_context.take_missing_image_urls();
 
         // Step 13.
-        if unsafe { JS_IsExceptionPending(cx) } {
+        if JS_IsExceptionPending(cx) {
             debug!("Paint function threw an exception {}.", name);
             unsafe {
                 JS_ClearPendingException(cx);
@@ -575,7 +570,7 @@ impl PaintWorkletGlobalScopeMethods<crate::DomTypeHolder> for PaintWorkletGlobal
         &self,
         cx: &mut JSContext,
         name: DOMString,
-        paint_ctor: Rc<VoidFunction>,
+        paint_ctor: RootedCallback<VoidFunction>,
     ) -> Fallible<()> {
         let name = Atom::from(name);
         rooted!(&in(cx) let paint_obj = paint_ctor.callback_holder().get());
@@ -647,7 +642,7 @@ impl PaintWorkletGlobalScopeMethods<crate::DomTypeHolder> for PaintWorkletGlobal
         // Step 20.
         debug!("Registering definition {}.", name);
         self.paint_definitions
-            .borrow_mut()
+            .safe_borrow_mut(cx.no_gc())
             .insert(name.clone(), definition);
 
         // TODO: Step 21.

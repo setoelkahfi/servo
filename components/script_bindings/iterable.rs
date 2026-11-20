@@ -6,7 +6,6 @@
 
 use std::cell::Cell;
 use std::marker::PhantomData;
-use std::ptr;
 
 use dom_struct::dom_struct;
 use js::context::JSContext;
@@ -14,18 +13,22 @@ use js::conversions::ToJSValConvertible;
 use js::jsapi::Heap;
 use js::jsval::UndefinedValue;
 use js::realm::CurrentRealm;
-use js::rust::wrappers2::JS_NewObject;
 use js::rust::{HandleObject, HandleValue, MutableHandleObject};
 
 use crate::codegen::GenericBindings::IterableIteratorBinding::{
     IterableKeyAndValueResult, IterableKeyOrValueResult,
 };
+use crate::codegen::PrototypeList;
 use crate::conversions::IDLInterface;
 use crate::error::Fallible;
 use crate::interfaces::{DomHelpers, GlobalScopeHelpers};
-use crate::reflector::{DomGlobalGeneric, DomObjectIteratorWrap, DomObjectWrap, Reflector};
+use crate::js::JS_NewObject;
+use crate::reflector::{
+    DomGlobalGeneric, DomObjectIteratorWrap, DomObjectWrap, HasPrototype, PrototypeInitializer,
+    Reflector,
+};
 use crate::root::{Dom, DomRoot, Root};
-use crate::trace::{NoTrace, RootedTraceableBox};
+use crate::trace::NoTrace;
 use crate::utils::DOMClass;
 use crate::{DomTypes, JSTraceable};
 
@@ -76,6 +79,28 @@ pub struct IterableIterator<
     _marker: NoTrace<PhantomData<D>>,
 }
 
+impl<D, T> HasPrototype for IterableIterator<D, T>
+where
+    D: DomTypes,
+    T: DomObjectIteratorWrap<D> + JSTraceable + Iterable + DomGlobalGeneric<D> + HasPrototype,
+{
+    const PROTOTYPE_ID: PrototypeList::ID = T::PROTOTYPE_ID;
+}
+
+impl<D, T> PrototypeInitializer for IterableIterator<D, T>
+where
+    D: DomTypes,
+    T: DomObjectIteratorWrap<D>
+        + JSTraceable
+        + Iterable
+        + DomGlobalGeneric<D>
+        + PrototypeInitializer,
+{
+    fn set_proto_id(&mut self, id: PrototypeList::ID) {
+        self.reflector.set_proto_id(id);
+    }
+}
+
 impl<
     D: DomTypes,
     T: DomObjectIteratorWrap<D>
@@ -89,6 +114,8 @@ impl<
     fn derives(class: &'static DOMClass) -> bool {
         <T as IteratorDerives>::derives(class)
     }
+
+    const PROTO_ID: crate::codegen::PrototypeList::ID = crate::codegen::PrototypeList::ID::Last;
 }
 
 impl<D: DomTypes, T: DomObjectIteratorWrap<D> + JSTraceable + Iterable + DomGlobalGeneric<D>>
@@ -108,7 +135,7 @@ impl<D: DomTypes, T: DomObjectIteratorWrap<D> + JSTraceable + Iterable + DomGlob
             _marker: NoTrace(PhantomData),
         });
         let global = D::GlobalScope::from_current_realm(realm);
-        <D as DomHelpers<D>>::reflect_dom_object_with_cx(realm, iterator, &*global)
+        <D as DomHelpers<D>>::reflect_dom_object(realm, iterator, &*global)
     }
 
     /// Return the next value from the iterable object.
@@ -170,7 +197,7 @@ fn dict_return(
     dict.done = done;
     dict.value.set(value.get());
 
-    unsafe { result.set(JS_NewObject(cx, ptr::null())) };
+    result.set(JS_NewObject(cx, None));
     dict.to_jsobject(cx, result);
     Ok(())
 }
@@ -186,11 +213,11 @@ fn key_and_value_return(
     dict.value = Some(
         vec![key, value]
             .into_iter()
-            .map(|handle| RootedTraceableBox::from_box(Heap::boxed(handle.get())))
+            .map(|handle| Heap::boxed(handle.get()))
             .collect(),
     );
 
-    unsafe { result.set(JS_NewObject(cx, ptr::null())) };
+    result.set(JS_NewObject(cx, None));
     dict.to_jsobject(cx, result);
     Ok(())
 }

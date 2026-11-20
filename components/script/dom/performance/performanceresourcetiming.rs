@@ -5,10 +5,12 @@
 use dom_struct::dom_struct;
 use js::context::JSContext;
 use net_traits::ResourceFetchTiming;
+use script_bindings::domstring::TracedDOMString;
 use script_bindings::reflector::reflect_dom_object;
 use servo_base::cross_process_instant::CrossProcessInstant;
 use servo_url::ServoUrl;
 use time::Duration;
+use xml5ever::LocalName;
 
 use super::performanceentry::{EntryType, PerformanceEntry};
 use crate::dom::bindings::codegen::Bindings::PerformanceBinding::DOMHighResTimeStamp;
@@ -29,7 +31,7 @@ use crate::dom::globalscope::GlobalScope;
 pub(crate) enum InitiatorType {
     Beacon,
     Css,
-    LocalName(String),
+    LocalName(#[no_trace] LocalName),
     Navigation,
     XMLHttpRequest,
     Fetch,
@@ -41,7 +43,7 @@ pub(crate) enum InitiatorType {
 pub(crate) struct PerformanceResourceTiming {
     entry: PerformanceEntry,
     initiator_type: InitiatorType,
-    next_hop: Option<DOMString>,
+    next_hop: Option<TracedDOMString>,
     #[no_trace]
     worker_start: Option<CrossProcessInstant>,
     #[no_trace]
@@ -72,7 +74,6 @@ pub(crate) struct PerformanceResourceTiming {
 }
 
 // TODO(#21269): next_hop
-// TODO(#21264): worker_start
 // TODO(#21260): domain_lookup_end
 impl PerformanceResourceTiming {
     pub(crate) fn new_inherited(
@@ -85,20 +86,16 @@ impl PerformanceResourceTiming {
         } else {
             (EntryType::Resource, resource_timing.start_time)
         };
-        let duration = match (resource_timing.start_time, resource_timing.response_end) {
-            (Some(start_time), Some(end_time)) => end_time - start_time,
-            _ => Duration::ZERO,
-        };
         PerformanceResourceTiming {
             entry: PerformanceEntry::new_inherited(
-                DOMString::from(url.into_string()),
+                url.into(),
                 entry_type,
                 start_time,
-                duration,
+                Duration::ZERO, // duration is calculated dynamically in PerformanceEntry::Duration
             ),
             initiator_type,
             next_hop: None,
-            worker_start: None,
+            worker_start: resource_timing.final_service_worker_start_time,
             redirect_start: resource_timing.redirect_start,
             redirect_end: resource_timing.redirect_end,
             fetch_start: resource_timing.fetch_start,
@@ -155,7 +152,7 @@ impl PerformanceResourceTimingMethods<crate::DomTypeHolder> for PerformanceResou
         match self.initiator_type {
             InitiatorType::Beacon => DOMString::from_static("beacon"),
             InitiatorType::Css => DOMString::from_static("css"),
-            InitiatorType::LocalName(ref n) => DOMString::from(n.clone()),
+            InitiatorType::LocalName(ref n) => TracedDOMString::from(n.clone()).root(),
             InitiatorType::Navigation => DOMString::from_static("navigation"),
             InitiatorType::XMLHttpRequest => DOMString::from_static("xmlhttprequest"),
             InitiatorType::Fetch => DOMString::from_static("fetch"),
@@ -169,7 +166,7 @@ impl PerformanceResourceTimingMethods<crate::DomTypeHolder> for PerformanceResou
     // when a proxy is configured
     fn NextHopProtocol(&self) -> DOMString {
         match self.next_hop {
-            Some(ref protocol) => protocol.clone(),
+            Some(ref protocol) => protocol.clone().root(),
             None => DOMString::new(),
         }
     }
@@ -242,5 +239,12 @@ impl PerformanceResourceTimingMethods<crate::DomTypeHolder> for PerformanceResou
     /// <https://w3c.github.io/resource-timing/#dom-performanceresourcetiming-responseend>
     fn ResponseEnd(&self, cx: &mut JSContext) -> DOMHighResTimeStamp {
         self.to_dom_high_res_time_stamp(cx, self.response_end)
+    }
+
+    /// <https://w3c.github.io/resource-timing/#dom-performanceresourcetiming-workerstart>
+    /// > The workerStart getter steps are to convert fetch timestamp for this’s timing
+    /// > info’s final service worker start time and the relevant global object for this.
+    fn WorkerStart(&self, cx: &mut JSContext) -> DOMHighResTimeStamp {
+        self.to_dom_high_res_time_stamp(cx, self.worker_start)
     }
 }

@@ -13,7 +13,26 @@ use hyper::{Request as HyperRequest, Response as HyperResponse};
 use net::test_util::{make_body, make_server};
 use servo::{CacheEntry, WebViewBuilder};
 
-use crate::common::{ServoTest, WebViewDelegateImpl};
+use crate::common::{ServoTest, WebViewDelegateImpl, evaluate_javascript};
+
+fn cacheable_response_handler(
+    request: HyperRequest<Incoming>,
+    response: &mut HyperResponse<BoxBody<Bytes, hyper::Error>>,
+) {
+    static MESSAGE: &'static [u8] = b"<!DOCTYPE html>\nHello";
+    // Don't cache response for fallback fetch for `favicon`.
+    if request.uri().path() == "/favicon.ico" {
+        response
+            .headers_mut()
+            .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+        return;
+    }
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("max-age=3600"),
+    );
+    *response.body_mut() = make_body(MESSAGE.to_vec());
+}
 
 #[test]
 fn test_cache_entries() {
@@ -31,18 +50,7 @@ fn test_cache_entries() {
     let cache_entries = network_manager.cache_entries();
     assert_eq!(cache_entries.len(), 0);
 
-    static MESSAGE: &'static [u8] = b"<!DOCTYPE html>\nHello";
-    let handler =
-        move |_: HyperRequest<Incoming>,
-              response: &mut HyperResponse<BoxBody<Bytes, hyper::Error>>| {
-            response.headers_mut().insert(
-                header::CACHE_CONTROL,
-                HeaderValue::from_static("max-age=3600"),
-            );
-            *response.body_mut() = make_body(MESSAGE.to_vec());
-        };
-
-    let (server, url) = make_server(handler);
+    let (server, url) = make_server(cacheable_response_handler);
     let port = url.port().unwrap();
 
     delegate.reset();
@@ -63,18 +71,7 @@ fn test_cache_entries() {
 fn test_clear_cache() {
     let servo_test = ServoTest::new();
 
-    static MESSAGE: &'static [u8] = b"<!DOCTYPE html>\nHello";
-
-    let handler =
-        move |_: HyperRequest<Incoming>,
-              response: &mut HyperResponse<BoxBody<Bytes, hyper::Error>>| {
-            response.headers_mut().insert(
-                header::CACHE_CONTROL,
-                HeaderValue::from_static("max-age=3600"),
-            );
-            *response.body_mut() = make_body(MESSAGE.to_vec());
-        };
-    let (server, url) = make_server(handler);
+    let (server, url) = make_server(cacheable_response_handler);
 
     let delegate = Rc::new(WebViewDelegateImpl::default());
 
@@ -96,4 +93,45 @@ fn test_clear_cache() {
 
     let cache_entries = network_manager.cache_entries();
     assert_eq!(cache_entries.len(), 0);
+}
+
+#[test]
+fn test_set_network_online() {
+    let servo_test = ServoTest::new();
+    let delegate = Rc::new(WebViewDelegateImpl::default());
+
+    let webview = WebViewBuilder::new(servo_test.servo(), servo_test.rendering_context.clone())
+        .delegate(delegate.clone())
+        .build();
+
+    evaluate_javascript(
+        &servo_test,
+        webview.clone(),
+        "addEventListener('online', () => console.log('online'))",
+    )
+    .unwrap();
+    evaluate_javascript(
+        &servo_test,
+        webview.clone(),
+        "addEventListener('offline', () => console.log('offline'))",
+    )
+    .unwrap();
+
+    let network_manager = servo_test.servo().network_manager();
+    network_manager.set_online_state(false);
+    network_manager.set_online_state(true);
+
+    servo_test.spin({
+        let delegate = delegate.clone();
+        move || delegate.console_messages.borrow().len() < 2
+    });
+    assert_eq!(
+        delegate
+            .console_messages
+            .borrow()
+            .iter()
+            .map(|p| p.1.clone())
+            .collect::<Vec<_>>(),
+        vec!["offline".to_string(), "online".to_string(),]
+    );
 }

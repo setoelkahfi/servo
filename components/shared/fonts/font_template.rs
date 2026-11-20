@@ -10,11 +10,14 @@ use atomic_refcell::{AtomicRef, AtomicRefCell};
 use malloc_size_of_derive::MallocSizeOf;
 use serde::{Deserialize, Serialize};
 use servo_arc::Arc as ServoArc;
-use style::computed_values::font_stretch::T as FontStretch;
+use skrifa::Font as SkrifaFont;
+use skrifa::font::attribute::Style;
 use style::computed_values::font_style::T as FontStyle;
-use style::font_face::{ComputedFontStretchRange, ComputedFontStyleRange, ComputedFontWeightRange};
+use style::computed_values::font_width::T as FontWidth;
+use style::font_face::{ComputedFontStyleRange, ComputedFontWeightRange, ComputedFontWidthRange};
 use style::values::computed::font::FontWeight;
 
+use crate::tag::{WDTH, WGHT};
 use crate::{CSSFontFaceDescriptors, FontDescriptor, FontFaceRuleInfo, FontIdentifier};
 
 /// A reference to a [`FontTemplate`] with shared ownership and mutability.
@@ -41,23 +44,60 @@ impl Deref for FontTemplateRef {
 #[derive(Clone, Debug, Deserialize, Hash, MallocSizeOf, PartialEq, Serialize)]
 pub struct FontTemplateDescriptor {
     pub weight: ComputedFontWeightRange,
-    pub stretch: ComputedFontStretchRange,
+    pub width: ComputedFontWidthRange,
     pub style: ComputedFontStyleRange,
     pub unicode_range: Option<Vec<RangeInclusive<u32>>>,
 }
 
 impl Default for FontTemplateDescriptor {
     fn default() -> Self {
-        Self::new(FontWeight::normal(), FontStretch::NORMAL, FontStyle::NORMAL)
+        Self::new(FontWeight::normal(), FontWidth::NORMAL, FontStyle::NORMAL)
     }
 }
 
 impl FontTemplateDescriptor {
+    /// Create a [`FontTemplateDescriptor`] given a [`SkrifaFont`]. This is used during the
+    /// creation of web fonts and is aware of font variations.
+    pub fn from_skrifa_font(font: &SkrifaFont) -> FontTemplateDescriptor {
+        let attributes = font.default_attributes();
+
+        let mut descriptor = Self::new(
+            FontWeight::from_float(attributes.weight.value()),
+            FontWidth::from_percentage(attributes.width.ratio()),
+            match attributes.style {
+                Style::Normal => FontStyle::NORMAL,
+                Style::Oblique(Some(degrees)) => FontStyle::oblique(degrees),
+                Style::Oblique(None) => FontStyle::OBLIQUE,
+                Style::Italic => FontStyle::ITALIC,
+            },
+        );
+
+        for axis in font.axes().iter() {
+            match axis.tag() {
+                WDTH => {
+                    descriptor.width = ComputedFontWidthRange(
+                        FontWidth::from_percentage(axis.min_value() / 100.0),
+                        FontWidth::from_percentage(axis.max_value() / 100.0),
+                    )
+                },
+                WGHT => {
+                    descriptor.weight = ComputedFontWeightRange(
+                        FontWeight::from_float(axis.min_value()),
+                        FontWeight::from_float(axis.max_value()),
+                    )
+                },
+                _ => {},
+            }
+        }
+
+        descriptor
+    }
+
     #[inline]
-    pub fn new(weight: FontWeight, stretch: FontStretch, style: FontStyle) -> Self {
+    pub fn new(weight: FontWeight, width: FontWidth, style: FontStyle) -> Self {
         Self {
             weight: ComputedFontWeightRange(weight, weight),
-            stretch: ComputedFontStretchRange(stretch, stretch),
+            width: ComputedFontWidthRange(width, width),
             style: ComputedFontStyleRange(style, style),
             unicode_range: None,
         }
@@ -65,7 +105,7 @@ impl FontTemplateDescriptor {
 
     pub fn is_variation_font(&self) -> bool {
         self.weight.0 != self.weight.1 ||
-            self.stretch.0 != self.stretch.1 ||
+            self.width.0 != self.width.1 ||
             self.style.0 != self.style.1
     }
 
@@ -77,29 +117,29 @@ impl FontTemplateDescriptor {
     /// be commutative (distance(A, B) == distance(B, A)).
     #[inline]
     fn distance_from(&self, target: &FontDescriptor) -> f32 {
-        let stretch_distance = target.stretch.match_distance(&self.stretch);
+        let width_distance = target.width.match_distance(&self.width);
         let style_distance = target.style.match_distance(&self.style);
         let weight_distance = target.weight.match_distance(&self.weight);
 
         // Sanity-check that the distances are within the expected range
         // (update if implementation of the distance functions is changed).
-        assert!((0.0..=2000.0).contains(&stretch_distance));
+        assert!((0.0..=2000.0).contains(&width_distance));
         assert!((0.0..=500.0).contains(&style_distance));
         assert!((0.0..=1600.0).contains(&weight_distance));
 
         // Factors used to weight the distances between the available and target font
         // properties during font-matching. These ensure that we respect the CSS-fonts
-        // requirement that font-stretch >> font-style >> font-weight; and in addition,
+        // requirement that font-width >> font-style >> font-weight; and in addition,
         // a mismatch between the desired and actual glyph presentation (emoji vs text)
         // will take precedence over any of the style attributes.
         //
         // Also relevant for font selection is the emoji presentation preference, but this
         // is handled later when filtering fonts based on the glyphs they contain.
-        const STRETCH_FACTOR: f32 = 1.0e8;
+        const WIDTH_FACTOR: f32 = 1.0e8;
         const STYLE_FACTOR: f32 = 1.0e4;
         const WEIGHT_FACTOR: f32 = 1.0e0;
 
-        stretch_distance * STRETCH_FACTOR +
+        width_distance * WIDTH_FACTOR +
             style_distance * STYLE_FACTOR +
             weight_distance * WEIGHT_FACTOR
     }
@@ -109,8 +149,8 @@ impl FontTemplateDescriptor {
             self.weight.1 >= descriptor_to_match.weight &&
             self.style.0 <= descriptor_to_match.style &&
             self.style.1 >= descriptor_to_match.style &&
-            self.stretch.0 <= descriptor_to_match.stretch &&
-            self.stretch.1 >= descriptor_to_match.stretch
+            self.width.0 <= descriptor_to_match.width &&
+            self.width.1 >= descriptor_to_match.width
     }
 
     pub fn override_values_with_css_font_template_descriptors(
@@ -123,8 +163,8 @@ impl FontTemplateDescriptor {
         if let Some(ref style) = css_font_template_descriptors.style {
             self.style = style.clone();
         }
-        if let Some(ref stretch) = css_font_template_descriptors.stretch {
-            self.stretch = stretch.clone();
+        if let Some(ref width) = css_font_template_descriptors.width {
+            self.width = width.clone();
         }
         if let Some(ref unicode_range) = css_font_template_descriptors.unicode_range {
             self.unicode_range = Some(unicode_range.clone());
@@ -260,31 +300,31 @@ trait FontMatchDistanceMethod<T>: Sized {
     fn to_float(&self) -> f32;
 }
 
-impl FontMatchDistanceMethod<ComputedFontStretchRange> for FontStretch {
-    fn match_distance(&self, range: &ComputedFontStretchRange) -> f32 {
-        // stretch distance ==> [0,2000]
+impl FontMatchDistanceMethod<ComputedFontWidthRange> for FontWidth {
+    fn match_distance(&self, range: &ComputedFontWidthRange) -> f32 {
+        // width distance ==> [0,2000]
         const REVERSE_DISTANCE: f32 = 1000.0;
 
-        let min_stretch = range.0;
-        let max_stretch = range.1;
+        let min_width = range.0;
+        let max_width = range.1;
 
-        // The stretch value is a (non-negative) percentage; currently we support
+        // The width value is a (non-negative) percentage; currently we support
         // values in the range 0 .. 1000. (If the upper limit is ever increased,
         // the kReverseDistance value used here may need to be adjusted.)
-        // If aTargetStretch is >100, we prefer larger values if available;
+        // If aTargetWidth is >100, we prefer larger values if available;
         // if <=100, we prefer smaller values if available.
-        if *self < min_stretch {
-            if *self > FontStretch::NORMAL {
-                return min_stretch.to_float() - self.to_float();
+        if *self < min_width {
+            if *self > FontWidth::NORMAL {
+                return min_width.to_float() - self.to_float();
             }
-            return (min_stretch.to_float() - self.to_float()) + REVERSE_DISTANCE;
+            return (min_width.to_float() - self.to_float()) + REVERSE_DISTANCE;
         }
 
-        if *self > max_stretch {
-            if *self <= FontStretch::NORMAL {
-                return self.to_float() - max_stretch.to_float();
+        if *self > max_width {
+            if *self <= FontWidth::NORMAL {
+                return self.to_float() - max_width.to_float();
             }
-            return (self.to_float() - max_stretch.to_float()) + REVERSE_DISTANCE;
+            return (self.to_float() - max_width.to_float()) + REVERSE_DISTANCE;
         }
         0.0
     }

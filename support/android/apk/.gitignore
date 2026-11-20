@@ -1,9 +1,5 @@
 .gradle/
-/assets/
-/bin/
-/gen/
-/libs/
+.kotlin
 /local.properties
 /obj/
-/proguard-project.txt
 build

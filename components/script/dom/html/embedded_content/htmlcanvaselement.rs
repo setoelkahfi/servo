@@ -2,14 +2,13 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
-use std::cell::{Cell, RefCell};
+use std::cell::Cell;
 use std::rc::Rc;
 
 use dom_struct::dom_struct;
 use euclid::default::Size2D;
 use html5ever::{LocalName, Prefix, local_name, ns};
 use js::context::NoGC;
-#[cfg(feature = "webgl")]
 use js::error::throw_type_error;
 use js::rust::{HandleObject, HandleValue};
 use layout_api::HTMLCanvasData;
@@ -33,7 +32,8 @@ use webrender_api::ImageKey;
 use crate::canvas_context::{CanvasContext, RenderingContext};
 #[cfg(feature = "webgl")]
 use crate::conversions::Convert;
-use crate::dom::bindings::callback::ExceptionHandling;
+use crate::dom::bindings::callback::{ExceptionHandling, RootedCallback, TracedCallback};
+use crate::dom::bindings::codegen::Bindings::CanvasRenderingContext2DBinding::CanvasRenderingContext2DSettings;
 use crate::dom::bindings::codegen::Bindings::HTMLCanvasElementBinding::{
     BlobCallback, HTMLCanvasElementMethods, RenderingContext as RootedRenderingContext,
 };
@@ -41,7 +41,6 @@ use crate::dom::bindings::codegen::Bindings::MediaStreamBinding::MediaStreamMeth
 #[cfg(feature = "webgl")]
 use crate::dom::bindings::codegen::Bindings::WebGLRenderingContextBinding::WebGLContextAttributes;
 use crate::dom::bindings::codegen::UnionTypes::HTMLCanvasElementOrOffscreenCanvas as RootedHTMLCanvasElementOrOffscreenCanvas;
-#[cfg(feature = "webgl")]
 use crate::dom::bindings::conversions::ConversionResult;
 use crate::dom::bindings::error::{Error, Fallible};
 use crate::dom::bindings::inheritance::Castable;
@@ -55,8 +54,6 @@ use crate::dom::canvasrenderingcontext2d::CanvasRenderingContext2D;
 use crate::dom::document::Document;
 use crate::dom::element::attributes::storage::AttrRef;
 use crate::dom::element::{AttributeMutation, Element};
-#[cfg(not(feature = "webgpu"))]
-use crate::dom::gpucanvascontext::GPUCanvasContext;
 use crate::dom::html::htmlelement::HTMLElement;
 use crate::dom::imagebitmaprenderingcontext::ImageBitmapRenderingContext;
 use crate::dom::mediastream::MediaStream;
@@ -87,8 +84,7 @@ pub(crate) struct HTMLCanvasElement {
     callback_id: Cell<u32>,
 
     /// This hashmap along with [`Self::callback_id`] are used to keep track of ongoing toBlob() calls.
-    #[conditional_malloc_size_of]
-    blob_callbacks: RefCell<FxHashMap<u32, Rc<BlobCallback>>>,
+    blob_callbacks: DomRefCell<FxHashMap<u32, TracedCallback<BlobCallback>>>,
 
     /// The [`ImageKey`] used to render this [`HTMLCanvasElement`] to the WebRender scene, if it
     /// has a `RenderingContext`, otherwise `None`. Note that this key is owned by the `RenderingContext`
@@ -107,7 +103,7 @@ impl HTMLCanvasElement {
             htmlelement: HTMLElement::new_inherited(local_name, prefix, document),
             context_mode: DomRefCell::new(None),
             callback_id: Cell::new(0),
-            blob_callbacks: RefCell::new(FxHashMap::default()),
+            blob_callbacks: DomRefCell::new(FxHashMap::default()),
             image_key: Default::default(),
         }
     }
@@ -202,7 +198,7 @@ impl HTMLCanvasElement {
         self.upcast::<Node>()
             .dirty(no_gc, NodeDamage::ContentOrHeritage);
         self.context_mode
-            .borrow_mut()
+            .safe_borrow_mut(no_gc)
             .replace(make_rendering_context());
 
         let Some(rendering_context) = &*self.context_mode.borrow() else {
@@ -227,9 +223,11 @@ impl HTMLCanvasElement {
         }
     }
 
+    /// <https://html.spec.whatwg.org/multipage/#2d-context-creation-algorithm>
     fn get_or_init_2d_context(
         &self,
         cx: &mut js::context::JSContext,
+        options: HandleValue,
     ) -> Option<DomRoot<CanvasRenderingContext2D>> {
         if let Some(ctx) = self.context() {
             return match *ctx {
@@ -240,7 +238,19 @@ impl HTMLCanvasElement {
 
         let window = self.owner_window();
         let size = self.get_size();
-        let context = CanvasRenderingContext2D::new(cx, window.as_global_scope(), self, size)?;
+
+        // Step 1. Let settings be the result of converting options to the dictionary type
+        // CanvasRenderingContext2DSettings. (This can throw an exception.)
+        let settings = match CanvasRenderingContext2DSettings::new(cx, options) {
+            Ok(ConversionResult::Success(settings)) => settings,
+            Ok(ConversionResult::Failure(error)) => {
+                throw_type_error(cx, &error);
+                return None;
+            },
+            Err(()) => return None,
+        };
+        let context =
+            CanvasRenderingContext2D::new(cx, window.as_global_scope(), self, size, &settings)?;
         self.set_rendering_context(cx.no_gc(), || {
             RenderingContext::Context2d(Dom::from_ref(&*context))
         });
@@ -328,11 +338,6 @@ impl HTMLCanvasElement {
             RenderingContext::WebGL2(Dom::from_ref(&*context))
         });
         Some(context)
-    }
-
-    #[cfg(not(feature = "webgpu"))]
-    fn get_or_init_webgpu_context(&self) -> Option<DomRoot<GPUCanvasContext>> {
-        None
     }
 
     #[cfg(feature = "webgpu")]
@@ -493,6 +498,13 @@ impl HTMLCanvasElementMethods<crate::DomTypeHolder> for HTMLCanvasElement {
         id: DOMString,
         options: HandleValue,
     ) -> Fallible<Option<RootedRenderingContext>> {
+        // Step 1. If options is not an object, then set options to null.
+        let options = if options.get().is_object() {
+            options
+        } else {
+            HandleValue::null()
+        };
+
         // Always throw an InvalidState exception when the canvas is in Placeholder mode (See table in the spec).
         if let Some(RenderingContext::Placeholder(_)) = *self.context_mode.borrow() {
             return Err(Error::InvalidState(Some(
@@ -502,7 +514,7 @@ impl HTMLCanvasElementMethods<crate::DomTypeHolder> for HTMLCanvasElement {
 
         Ok(match &*id.str() {
             "2d" => self
-                .get_or_init_2d_context(cx)
+                .get_or_init_2d_context(cx, options)
                 .map(RootedRenderingContext::CanvasRenderingContext2D),
             "bitmaprenderer" => self
                 .get_or_init_bitmaprenderer_context(cx)
@@ -570,7 +582,7 @@ impl HTMLCanvasElementMethods<crate::DomTypeHolder> for HTMLCanvasElement {
     /// <https://html.spec.whatwg.org/multipage/#dom-canvas-toblob>
     fn ToBlob(
         &self,
-        callback: Rc<BlobCallback>,
+        callback: RootedCallback<BlobCallback>,
         mime_type: DOMString,
         quality: HandleValue,
     ) -> Fallible<()> {
@@ -597,7 +609,7 @@ impl HTMLCanvasElementMethods<crate::DomTypeHolder> for HTMLCanvasElement {
 
         self.blob_callbacks
             .borrow_mut()
-            .insert(callback_id, callback);
+            .insert(callback_id, callback.to_traced());
         let quality = Self::maybe_quality(quality);
         let image_type = EncodedImageType::from(&mime_type.str() as &str);
 
@@ -606,7 +618,7 @@ impl HTMLCanvasElementMethods<crate::DomTypeHolder> for HTMLCanvasElement {
             .canvas_blob_task_source()
             .queue(task!(to_blob: move |cx| {
                 let this = this.root();
-                let Some(callback) = &this.blob_callbacks.borrow_mut().remove(&callback_id) else {
+                let Some(callback) = &this.blob_callbacks.safe_borrow_mut(cx.no_gc()).remove(&callback_id) else {
                     return error!("Expected blob callback, but found none!");
                 };
 

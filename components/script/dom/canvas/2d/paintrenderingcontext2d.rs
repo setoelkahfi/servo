@@ -7,7 +7,7 @@ use std::cell::Cell;
 use dom_struct::dom_struct;
 use euclid::{Scale, Size2D};
 use js::context::JSContext;
-use script_bindings::reflector::{Reflector, reflect_dom_object_with_cx};
+use script_bindings::reflector::{Reflector, reflect_dom_object};
 use servo_url::ServoUrl;
 use style_traits::CSSPixel;
 use webrender_api::ImageKey;
@@ -19,7 +19,10 @@ use crate::dom::bindings::codegen::Bindings::CanvasRenderingContext2DBinding::{
 };
 use crate::dom::bindings::codegen::Bindings::DOMMatrixBinding::DOMMatrix2DInit;
 use crate::dom::bindings::codegen::Bindings::PaintRenderingContext2DBinding::PaintRenderingContext2DMethods;
-use crate::dom::bindings::codegen::UnionTypes::StringOrCanvasGradientOrCanvasPattern;
+use crate::dom::bindings::codegen::UnionTypes::{
+    StringOrCanvasGradientOrCanvasPattern,
+    UnrestrictedDoubleOrDOMPointInitOrUnrestrictedDoubleOrDOMPointInitSequence,
+};
 use crate::dom::bindings::error::{ErrorResult, Fallible};
 use crate::dom::bindings::inheritance::Castable;
 use crate::dom::bindings::num::Finite;
@@ -64,10 +67,10 @@ impl PaintRenderingContext2D {
         cx: &mut JSContext,
         global: &PaintWorkletGlobalScope,
     ) -> Option<DomRoot<PaintRenderingContext2D>> {
-        Some(reflect_dom_object_with_cx(
+        Some(reflect_dom_object(
+            cx,
             Box::new(PaintRenderingContext2D::new_inherited(global)?),
             global,
-            cx,
         ))
     }
 
@@ -300,6 +303,18 @@ impl PaintRenderingContext2DMethods<crate::DomTypeHolder> for PaintRenderingCont
         self.canvas_state.rect(x, y, width, height)
     }
 
+    /// <https://html.spec.whatwg.org/multipage/#dom-context-2d-roundrect>
+    fn RoundRect(
+        &self,
+        x: f64,
+        y: f64,
+        width: f64,
+        height: f64,
+        radii: UnrestrictedDoubleOrDOMPointInitOrUnrestrictedDoubleOrDOMPointInitSequence,
+    ) -> ErrorResult {
+        self.canvas_state.round_rect(x, y, width, height, radii)
+    }
+
     /// <https://html.spec.whatwg.org/multipage/#dom-context-2d-quadraticcurveto>
     fn QuadraticCurveTo(&self, cpx: f64, cpy: f64, x: f64, y: f64) {
         self.canvas_state.quadratic_curve_to(cpx, cpy, x, y)
@@ -353,8 +368,8 @@ impl PaintRenderingContext2DMethods<crate::DomTypeHolder> for PaintRenderingCont
     }
 
     /// <https://html.spec.whatwg.org/multipage/#dom-context-2d-strokestyle>
-    fn SetStrokeStyle(&self, value: StringOrCanvasGradientOrCanvasPattern) {
-        self.canvas_state.set_stroke_style(None, value)
+    fn SetStrokeStyle(&self, cx: &mut JSContext, value: StringOrCanvasGradientOrCanvasPattern) {
+        self.canvas_state.set_stroke_style(cx, None, value)
     }
 
     /// <https://html.spec.whatwg.org/multipage/#dom-context-2d-strokestyle>
@@ -363,8 +378,8 @@ impl PaintRenderingContext2DMethods<crate::DomTypeHolder> for PaintRenderingCont
     }
 
     /// <https://html.spec.whatwg.org/multipage/#dom-context-2d-strokestyle>
-    fn SetFillStyle(&self, value: StringOrCanvasGradientOrCanvasPattern) {
-        self.canvas_state.set_fill_style(None, value)
+    fn SetFillStyle(&self, cx: &mut JSContext, value: StringOrCanvasGradientOrCanvasPattern) {
+        self.canvas_state.set_fill_style(cx, None, value)
     }
 
     /// <https://html.spec.whatwg.org/multipage/#dom-context-2d-createlineargradient>
@@ -502,7 +517,7 @@ impl PaintRenderingContext2DMethods<crate::DomTypeHolder> for PaintRenderingCont
     }
 
     /// <https://html.spec.whatwg.org/multipage/#dom-context-2d-shadowcolor>
-    fn SetShadowColor(&self, value: DOMString) {
-        self.canvas_state.set_shadow_color(None, value)
+    fn SetShadowColor(&self, cx: &mut JSContext, value: DOMString) {
+        self.canvas_state.set_shadow_color(cx, None, value)
     }
 }

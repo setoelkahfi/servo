@@ -31,8 +31,8 @@ use crate::layout_dom::{
 impl fmt::Debug for LayoutDom<'_, Element> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(f, "<{}", self.local_name())?;
-        if let Some(id) = unsafe { (*self.id_attribute()).as_ref() } {
-            write!(f, " id={id}")?;
+        if let Some(id) = self.id_attribute() {
+            write!(f, " id={}", *id)?;
         }
         write!(f, "> ({:#x})", self.upcast::<Node>().opaque().0)
     }
@@ -252,5 +252,9 @@ impl<'dom> LayoutElement<'dom> for ServoLayoutElement<'dom> {
 
     fn is_root(&self) -> bool {
         self.element.is_root()
+    }
+
+    fn ensure_presentational_hints(&self) {
+        self.element.ensure_presentational_hints()
     }
 }

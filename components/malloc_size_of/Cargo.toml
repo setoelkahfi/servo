@@ -22,18 +22,24 @@ crossbeam-channel = { workspace = true }
 data-url = { workspace = true }
 encoding_rs = { workspace = true }
 euclid = { workspace = true }
+font-types = { workspace = true }
+headers = { workspace = true }
 http = { workspace = true }
+hyper_serde = { workspace = true }
 icu_locale_core = { workspace = true }
 indexmap = { workspace = true }
 ipc-channel = { workspace = true }
 keyboard-types = { workspace = true }
 markup5ever = { workspace = true }
 mime = { workspace = true }
+memmap2 = { workspace = true }
 once_cell = { workspace = true }
 parking_lot = { workspace = true }
 resvg = { workspace = true }
+serde_core = { workspace = true }
 servo-allocator = { workspace = true }
 servo_arc = { workspace = true }
+skrifa = { workspace = true }
 smallvec = { workspace = true }
 string_cache = { workspace = true }
 stylo = { workspace = true }
@@ -52,6 +58,9 @@ vello_cpu = { workspace = true }
 webrender = { workspace = true }
 webrender_api = { workspace = true }
 wr_malloc_size_of = { workspace = true }
+
+[dev-dependencies]
+servo-allocator = { workspace = true }
 
 [lints]
 workspace = true

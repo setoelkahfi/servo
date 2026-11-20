@@ -2,6 +2,8 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
+#![cfg_attr(crown, allow(crown::jscontext_first_arg))]
+
 use std::cell::Cell;
 use std::rc::Rc;
 
@@ -10,6 +12,7 @@ use js::jsapi::{AddAssociatedMemory, Heap, JSObject, MemoryUse, RemoveAssociated
 use js::rust::HandleObject;
 use malloc_size_of_derive::MallocSizeOf;
 
+use crate::codegen::PrototypeList;
 use crate::conversions::DerivedFrom;
 use crate::interfaces::GlobalScopeHelpers;
 use crate::iterable::{Iterable, IterableIterator};
@@ -46,11 +49,15 @@ pub struct Reflector<T = ()> {
     /// Associated memory size (of rust side). Used for memory reporting to SM.
     size: T,
     /// Cached prototype ID for fast type checks.
-    proto_id: Cell<u16>,
+    proto_id: u16,
 }
 
 unsafe impl<T> js::gc::Traceable for Reflector<T> {
-    unsafe fn trace(&self, _: *mut js::jsapi::JSTracer) {}
+    unsafe fn trace(&self, tracer: *mut js::jsapi::JSTracer) {
+        unsafe {
+            self.object.trace(tracer);
+        }
+    }
 }
 
 impl<T> PartialEq for Reflector<T> {
@@ -70,13 +77,7 @@ impl<T> Reflector<T> {
     /// Get the cached prototype ID.
     #[inline]
     pub fn proto_id(&self) -> u16 {
-        self.proto_id.get()
-    }
-
-    /// Set the cached prototype ID.
-    #[inline]
-    pub fn set_proto_id(&self, id: u16) {
-        self.proto_id.set(id);
+        self.proto_id
     }
 
     /// Initialize the reflector. (May be called only once.)
@@ -105,7 +106,7 @@ impl<T: AssociatedMemorySize> Reflector<T> {
     pub fn new() -> Reflector<T> {
         Reflector {
             object: Heap::default(),
-            proto_id: Cell::new(u16::MAX),
+            proto_id: u16::MAX,
             size: T::default(),
         }
     }
@@ -133,6 +134,21 @@ impl Reflector<AssociatedMemory> {
             self.size.0.set(new_size);
             AddAssociatedMemory(self.object.get(), self.rust_size(d), MemoryUse::DOMBinding);
         }
+    }
+}
+
+pub trait HasPrototype {
+    const PROTOTYPE_ID: PrototypeList::ID;
+}
+
+pub trait PrototypeInitializer {
+    fn set_proto_id(&mut self, id: PrototypeList::ID);
+}
+
+impl<T: AssociatedMemorySize> PrototypeInitializer for Reflector<T> {
+    #[inline]
+    fn set_proto_id(&mut self, id: PrototypeList::ID) {
+        self.proto_id = id as u16;
     }
 }
 
@@ -261,7 +277,7 @@ pub trait WeakReferenceableDomObjectWrap<D: DomTypes>:
     /// Function pointer to the general wrap function type
     #[expect(clippy::type_complexity)]
     const WRAP: unsafe fn(
-        &mut js::context::JSContext,
+        &mut JSContext,
         &D::GlobalScope,
         Option<HandleObject>,
         Rc<Self>,
@@ -310,23 +326,6 @@ where
 
 /// Create the reflector for a new DOM object and yield ownership to the
 /// reflector.
-/// Deprecated, use `reflect_dom_object` instead.
-pub fn reflect_dom_object_with_cx<D, T, U>(
-    obj: Box<T>,
-    global: &U,
-    cx: &mut JSContext,
-) -> DomRoot<T>
-where
-    D: DomTypes,
-    T: DomObject + DomObjectWrap<D>,
-    U: DerivedFrom<D::GlobalScope>,
-{
-    let global_scope = global.upcast();
-    unsafe { T::WRAP(cx, global_scope, None, obj) }
-}
-
-/// Create the reflector for a new DOM object and yield ownership to the
-/// reflector.
 pub fn reflect_weak_referenceable_dom_object<D, T, U>(
     cx: &mut JSContext,
     obj: Rc<T>,
@@ -357,7 +356,7 @@ where
 }
 
 type WrapFn<D, AbstractType> = unsafe fn(
-    &mut js::context::JSContext,
+    &mut JSContext,
     &<D as DomTypes>::GlobalScope,
     Option<HandleObject>,
     Box<AbstractType>,
@@ -366,10 +365,10 @@ type WrapFn<D, AbstractType> = unsafe fn(
 /// Create the reflector for a new DOM object and yield ownership to the
 /// reflector.
 pub fn reflect_dom_object_with_proto_and_wrap<D, AbstractType, GlobalType>(
+    cx: &mut JSContext,
     obj: Box<AbstractType>,
     global: &GlobalType,
     proto: Option<HandleObject>,
-    cx: &mut js::context::JSContext,
     wrap: WrapFn<D, AbstractType>,
 ) -> DomRoot<AbstractType>
 where
@@ -386,9 +385,9 @@ where
 /// Create the reflector for a new DOM object and yield ownership to the
 /// reflector.
 pub fn reflect_dom_object_with_wrap<D, AbstractType, GlobalType>(
+    cx: &mut JSContext,
     obj: Box<AbstractType>,
     global: &GlobalType,
-    cx: &mut js::context::JSContext,
     wrap: WrapFn<D, AbstractType>,
 ) -> DomRoot<AbstractType>
 where
@@ -403,7 +402,7 @@ where
 }
 
 type WrapFnRc<D, AbstractType> = unsafe fn(
-    &mut js::context::JSContext,
+    &mut JSContext,
     &<D as DomTypes>::GlobalScope,
     Option<HandleObject>,
     Rc<AbstractType>,
@@ -411,7 +410,7 @@ type WrapFnRc<D, AbstractType> = unsafe fn(
 
 /// Create the reflector for a new DOM object and yield ownership to the
 /// reflector.
-pub fn reflect_weak_referenceable_dom_object_with_cx_and_wrap<D, AbstractType, GlobalType>(
+pub fn reflect_weak_referenceable_dom_object_with_wrap<D, AbstractType, GlobalType>(
     cx: &mut JSContext,
     obj: Rc<AbstractType>,
     global: &GlobalType,

@@ -2,11 +2,9 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
-use cssparser::{Parser, ParserInput, serialize_identifier};
-use dom_struct::dom_struct;
+use cssparser::{Parser, serialize_identifier};
 use js::context::JSContext;
 use script_bindings::codegen::GenericBindings::CSSBinding::PropertyDefinition;
-use script_bindings::reflector::Reflector;
 use style::stylesheets::supports_rule::{Declaration, parse_condition_or_declaration};
 use style::stylesheets::{CssRuleType, UrlExtraData};
 use style::stylist::RegisterCustomPropertyResult;
@@ -21,11 +19,8 @@ use crate::dom::bindings::str::DOMString;
 use crate::dom::window::Window;
 use crate::dom::worklet::Worklet;
 
-#[dom_struct]
 #[expect(clippy::upper_case_acronyms)]
-pub(crate) struct CSS {
-    reflector_: Reflector,
-}
+pub(crate) struct CSS {}
 
 impl CSSMethods<crate::DomTypeHolder> for CSS {
     /// <https://drafts.csswg.org/cssom/#the-css.escape()-method>
@@ -43,31 +38,30 @@ impl CSSMethods<crate::DomTypeHolder> for CSS {
         decl.push_str(&value.str());
         let decl = Declaration(decl);
         let url_data = UrlExtraData(win.Document().url().get_arc());
-        let context = parser_context_for_anonymous_content(
+        let mut context = parser_context_for_anonymous_content(
             CssRuleType::Style,
             ParsingMode::DEFAULT,
             &url_data,
         );
-        decl.eval(&context)
+        decl.eval(&mut context)
     }
 
     /// <https://drafts.csswg.org/css-conditional/#dom-css-supports>
     fn Supports_(win: &Window, condition: DOMString) -> bool {
         let condition = condition.str();
-        let mut input = ParserInput::new(&condition);
-        let mut input = Parser::new(&mut input);
+        let mut input = Parser::new(&condition);
         let cond = match parse_condition_or_declaration(&mut input) {
             Ok(c) => c,
             Err(..) => return false,
         };
 
         let url_data = UrlExtraData(win.Document().url().get_arc());
-        let context = parser_context_for_anonymous_content(
+        let mut context = parser_context_for_anonymous_content(
             CssRuleType::Style,
             ParsingMode::DEFAULT,
             &url_data,
         );
-        cond.eval(&context)
+        cond.eval(&mut context)
     }
 
     /// <https://drafts.css-houdini.org/css-paint-api-1/#paint-worklet>

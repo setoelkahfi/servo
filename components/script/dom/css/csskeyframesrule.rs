@@ -4,9 +4,10 @@
 
 use std::cell::RefCell;
 
-use cssparser::{Parser, ParserInput};
+use cssparser::Parser;
 use dom_struct::dom_struct;
 use js::context::{JSContext, NoGC};
+use script_bindings::domstring::TracedDOMString;
 use script_bindings::reflector::reflect_dom_object;
 use servo_arc::Arc;
 use style::shared_lock::{Locked, SharedRwLockReadGuard, ToCssWithGuard};
@@ -83,8 +84,7 @@ impl CSSKeyframesRule {
     /// Given a keyframe selector, finds the index of the first corresponding rule if any
     fn find_rule(&self, selector: &DOMString) -> Option<usize> {
         let selector = selector.str();
-        let mut input = ParserInput::new(&selector);
-        let mut input = Parser::new(&mut input);
+        let mut input = Parser::new(&selector);
         if let Ok(sel) = KeyframeSelectors::parse(&mut input) {
             let guard = self.css_rule.shared_lock().read();
             // This finds the *last* element matching a selector
@@ -174,14 +174,15 @@ impl CSSKeyframesRuleMethods<crate::DomTypeHolder> for CSSKeyframesRule {
     /// <https://drafts.csswg.org/css-animations/#dom-csskeyframesrule-name>
     fn Name(&self) -> DOMString {
         let guard = self.css_rule.shared_lock().read();
-        DOMString::from(
-            &**self
-                .keyframes_rule
+        TracedDOMString::from(
+            self.keyframes_rule
                 .borrow()
                 .read_with(&guard)
                 .name
-                .as_atom(),
+                .as_atom()
+                .clone(),
         )
+        .root()
     }
 
     /// <https://drafts.csswg.org/css-animations/#dom-csskeyframesrule-name>

@@ -1,10 +1,10 @@
 /* This Source Code Form is subject to the terms of the Mozilla Public
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
-use js::context::JSContext;
+use js::context::{JSContext, NoGC};
 
 use crate::dom::bindings::codegen::Bindings::HTMLElementBinding::HTMLElementMethods;
-use crate::dom::bindings::codegen::Bindings::HTMLOrSVGElementBinding::FocusOptions;
+use crate::dom::bindings::codegen::Bindings::HTMLOrSVGOrMathMLElementBinding::FocusOptions;
 use crate::dom::bindings::inheritance::Castable;
 use crate::dom::bindings::root::DomRoot;
 use crate::dom::bindings::str::DOMString;
@@ -23,7 +23,12 @@ pub(crate) trait Validatable {
     fn validity_state(&self, cx: &mut JSContext) -> DomRoot<ValidityState>;
 
     /// <https://html.spec.whatwg.org/multipage/#candidate-for-constraint-validation>
-    fn is_instance_validatable(&self) -> bool;
+    fn is_instance_validatable(&self, no_gc: &NoGC) -> bool;
+
+    /// <https://html.spec.whatwg.org/multipage/#have-range-limitations>
+    fn has_range_limitations(&self) -> bool {
+        false
+    }
 
     // Check if element satisfies its constraints, excluding custom errors
     fn perform_validation(
@@ -35,13 +40,11 @@ pub(crate) trait Validatable {
     }
 
     /// <https://html.spec.whatwg.org/multipage/#concept-fv-valid>
-    fn satisfies_constraints(&self, cx: &mut JSContext) -> bool {
-        self.validity_state(cx).invalid_flags().is_empty()
-    }
+    fn satisfies_constraints(&self) -> bool;
 
     /// <https://html.spec.whatwg.org/multipage/#check-validity-steps>
     fn check_validity(&self, cx: &mut JSContext) -> bool {
-        if self.is_instance_validatable() && !self.satisfies_constraints(cx) {
+        if self.is_instance_validatable(cx.no_gc()) && !self.satisfies_constraints() {
             self.as_element()
                 .upcast::<EventTarget>()
                 .fire_cancelable_event(cx, atom!("invalid"));
@@ -54,11 +57,11 @@ pub(crate) trait Validatable {
     /// <https://html.spec.whatwg.org/multipage/#report-validity-steps>
     fn report_validity(&self, cx: &mut JSContext) -> bool {
         // Step 1.
-        if !self.is_instance_validatable() {
+        if !self.is_instance_validatable(cx.no_gc()) {
             return true;
         }
 
-        if self.satisfies_constraints(cx) {
+        if self.satisfies_constraints() {
             return true;
         }
 
@@ -89,7 +92,7 @@ pub(crate) trait Validatable {
 
     /// <https://html.spec.whatwg.org/multipage/#dom-cva-validationmessage>
     fn validation_message(&self, cx: &mut JSContext) -> DOMString {
-        if self.is_instance_validatable() {
+        if self.is_instance_validatable(cx.no_gc()) {
             let flags = self.validity_state(cx).invalid_flags();
             validation_message_for_flags(&self.validity_state(cx), flags)
         } else {
@@ -99,16 +102,16 @@ pub(crate) trait Validatable {
 }
 
 /// <https://html.spec.whatwg.org/multipage/#the-datalist-element%3Abarred-from-constraint-validation>
-pub(crate) fn is_barred_by_datalist_ancestor(elem: &Node) -> bool {
+pub(crate) fn is_barred_by_datalist_ancestor(no_gc: &NoGC, elem: &Node) -> bool {
     elem.upcast::<Node>()
-        .ancestors()
+        .ancestors_unrooted(no_gc)
         .any(|node| node.is::<HTMLDataListElement>())
 }
 
 // Get message for given validation flags or custom error message
 fn validation_message_for_flags(state: &ValidityState, failed_flags: ValidationFlags) -> DOMString {
     if failed_flags.contains(ValidationFlags::CUSTOM_ERROR) {
-        state.custom_error_message().clone()
+        state.custom_error_message().clone().root()
     } else {
         DOMString::from(failed_flags.to_string())
     }

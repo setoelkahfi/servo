@@ -56,7 +56,7 @@ impl WheelEvent {
         reflect_dom_object_with_proto(cx, Box::new(WheelEvent::new_inherited()), window, proto)
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     pub(crate) fn new(
         cx: &mut JSContext,
         window: &Window,
@@ -102,7 +102,7 @@ impl WheelEvent {
         )
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     fn new_with_proto(
         cx: &mut JSContext,
         window: &Window,
@@ -149,7 +149,7 @@ impl WheelEvent {
         ev
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     pub(crate) fn intitialize_wheel_event(
         &self,
         event_type: Atom,
@@ -207,7 +207,7 @@ impl WheelEventMethods<crate::DomTypeHolder> for WheelEvent {
     ) -> Fallible<DomRoot<WheelEvent>> {
         let bubbles = EventBubbles::from(init.parent.parent.parent.parent.bubbles);
         let cancelable = EventCancelable::from(init.parent.parent.parent.parent.cancelable);
-        let scroll_offset = window.scroll_offset();
+        let scroll_offset = window.scroll_offset(cx);
 
         let page_point = Point2D::<i32, CSSPixel>::new(
             scroll_offset.x as i32 + init.parent.clientX,
@@ -263,6 +263,7 @@ impl WheelEventMethods<crate::DomTypeHolder> for WheelEvent {
     /// <https://w3c.github.io/uievents/#widl-WheelEvent-initWheelEvent>
     fn InitWheelEvent(
         &self,
+        cx: &mut JSContext,
         type_arg: DOMString,
         can_bubble_arg: bool,
         cancelable_arg: bool,
@@ -278,6 +279,7 @@ impl WheelEventMethods<crate::DomTypeHolder> for WheelEvent {
         }
 
         self.upcast::<MouseEvent>().InitMouseEvent(
+            cx,
             type_arg,
             can_bubble_arg,
             cancelable_arg,

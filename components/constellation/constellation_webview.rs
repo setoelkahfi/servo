@@ -2,21 +2,23 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, VecDeque};
+use std::rc::Rc;
 
 use embedder_traits::user_contents::UserContentManagerId;
 use embedder_traits::{InputEvent, MouseLeftViewportEvent, Theme, ViewportDetails};
-use euclid::{Point2D, Size2D};
+use euclid::Size2D;
 use log::{debug, warn};
 use paint_api::{PaintMessage, PaintProxy};
 use rustc_hash::{FxHashMap, FxHashSet};
-use script_traits::{ConstellationInputEvent, ScriptThreadMessage};
+use script_traits::{ConstellationInputEvent, ScriptThreadMessage, WebViewState};
 use servo_base::Epoch;
 use servo_base::id::{BrowsingContextId, PipelineId, WebViewId};
 use servo_constellation_traits::{ScreenshotReadinessResponse, SessionHistoryTraversalRequest};
-use style_traits::CSSPixel;
 
 use crate::browsingcontext::{BrowsingContext, FullyActiveBrowsingContextsIterator};
+use crate::constellation::BrowsingContextGroup;
 use crate::pipeline::Pipeline;
 use crate::screenshot_readiness_request::{ScreenshotReadinessRequest, ScreenshotRequestState};
 use crate::session_history::{JointSessionHistory, SessionHistoryChange};
@@ -40,6 +42,11 @@ pub(crate) struct ConstellationWebView {
     /// we store a `SessionHistoryChange` object for the navigation in progress.
     pub pending_changes: Vec<SessionHistoryChange>,
 
+    /// The [`BrowsingContextGroup`] associated with this [`ConstellationWebView`]. Every
+    /// `WebView` has a single [`BrowsingContextGroup`], but that group may be shared amongst
+    /// multiple `WebView`s in the case of `window.open()`.
+    browsing_context_group: Rc<RefCell<BrowsingContextGroup>>,
+
     /// The currently focused browsing context in this webview for key events.
     /// The focused pipeline is the current entry of the focused browsing
     /// context.
@@ -48,10 +55,6 @@ pub(crate) struct ConstellationWebView {
     /// The [`BrowsingContextId`] of the currently hovered browsing context, to use for
     /// knowing which frame is currently receiving cursor events.
     pub hovered_browsing_context_id: Option<BrowsingContextId>,
-
-    /// The last mouse move point in the coordinate space of the Pipeline that it
-    /// happened int.
-    pub last_mouse_move_point: Point2D<f32, CSSPixel>,
 
     /// The joint session history for this webview.
     pub session_history: JointSessionHistory,
@@ -79,6 +82,15 @@ pub(crate) struct ConstellationWebView {
     /// `ScriptThread`s so that they know how to render the contents of a particular `WebView.
     theme: Theme,
 
+    /// Whether or not this entire [`ConstellationWebView`] is hidden. `WebView`s that
+    /// are hidden will be throttled.
+    hidden: bool,
+
+    /// Whether or not this [`ConstellationWebView`] has system focus. This is
+    /// a distinct piece of state from [`Self::focused_browsing_context_id`] which
+    /// tracks the frame with focus regardless of system focus state.
+    has_system_focus: bool,
+
     /// Whether accessibility is active for this webview.
     ///
     /// Set by [`crate::Constellation::set_accessibility_active()`], and forwarded to the
@@ -96,6 +108,7 @@ pub(crate) struct ConstellationWebView {
 impl ConstellationWebView {
     pub(crate) fn new(
         webview_id: WebViewId,
+        browsing_context_group: Rc<RefCell<BrowsingContextGroup>>,
         focused_browsing_context_id: BrowsingContextId,
         user_content_manager_id: Option<UserContentManagerId>,
     ) -> Self {
@@ -105,17 +118,23 @@ impl ConstellationWebView {
             active_top_level_pipeline_id: None,
             active_top_level_pipeline_epoch: Epoch::default(),
             pending_changes: Default::default(),
+            browsing_context_group,
             focused_browsing_context_id,
             hovered_browsing_context_id: None,
-            last_mouse_move_point: Default::default(),
             session_history: JointSessionHistory::new(),
             session_history_traversal_request_queue: Default::default(),
             ongoing_history_traversal_request: None,
             pending_viewport_details: Default::default(),
             theme: Theme::Light,
+            hidden: false,
+            has_system_focus: true,
             accessibility_active: false,
             screenshot_readiness_requests: Default::default(),
         }
+    }
+
+    pub(crate) fn browsing_context_group(&self) -> Rc<RefCell<BrowsingContextGroup>> {
+        self.browsing_context_group.clone()
     }
 
     /// Set the [`Theme`] on this [`ConstellationWebView`] returning true if the theme changed.
@@ -127,6 +146,35 @@ impl ConstellationWebView {
     /// Get the [`Theme`] of this [`ConstellationWebView`].
     pub(crate) fn theme(&self) -> Theme {
         self.theme
+    }
+
+    /// Whether or not the [`ConstellationWebView`] is hidden.
+    pub(crate) fn hidden(&self) -> bool {
+        self.hidden
+    }
+
+    /// Create a [`WebViewState`] for this [`ConstellationWebView`] to pass during pipeline
+    /// creation.
+    pub(crate) fn state(&self) -> WebViewState {
+        WebViewState {
+            id: self.webview_id,
+            theme: Cell::new(self.theme),
+            has_system_focus: Cell::new(self.has_system_focus),
+        }
+    }
+
+    /// Set whether or not this [`ConstellationWebView`] is hidden, returning true if the
+    /// value changed.
+    pub(crate) fn set_hidden(&mut self, hidden: bool) -> bool {
+        let old_hidden = std::mem::replace(&mut self.hidden, hidden);
+        old_hidden != self.hidden
+    }
+
+    /// Set whether or not this [`ConstellationWebView`] has system focus, returning true
+    /// if the value changed.
+    pub(crate) fn set_has_system_focus(&mut self, has_system_focus: bool) -> bool {
+        let old_has_system_focus = std::mem::replace(&mut self.has_system_focus, has_system_focus);
+        old_has_system_focus != self.has_system_focus
     }
 
     fn target_pipeline_id_for_input_event(
@@ -209,11 +257,6 @@ impl ConstellationWebView {
 
         if let InputEvent::MouseMove(_) = &event.event.event {
             update_hovered_browsing_context(Some(pipeline.browsing_context_id), true);
-            self.last_mouse_move_point = event
-                .hit_test_result
-                .as_ref()
-                .expect("MouseMove events should always have hit tests.")
-                .point_in_viewport;
         }
 
         let _ = pipeline
@@ -267,6 +310,20 @@ impl ConstellationWebView {
         !self.pending_changes.is_empty()
     }
 
+    /// Whether a navigation is in flight in this [`ConstellationWebView`] that will
+    /// report its own end: a queued or ongoing history traversal,
+    /// or a `top_level_pipeline` has not finished loading,
+    /// or a top-level pending change.
+    pub(crate) fn is_navigating(&self, top_level_pipeline: Option<&Pipeline>) -> bool {
+        let top_level_browsing_context_id = BrowsingContextId::from(self.webview_id);
+        !self.session_history_traversal_request_queue.is_empty() ||
+            self.ongoing_history_traversal_request.is_some() ||
+            top_level_pipeline.is_some_and(|pipeline| !pipeline.load_finished) ||
+            self.pending_changes
+                .iter()
+                .any(|change| change.browsing_context_id == top_level_browsing_context_id)
+    }
+
     pub(crate) fn pipeline_is_pending(&self, pipeline_id: PipelineId) -> bool {
         self.pending_changes
             .iter()
@@ -294,6 +351,17 @@ impl ConstellationWebView {
             .iter()
             .rposition(|change| change.new_pipeline_id == pipeline_id)?;
         Some(self.pending_changes.swap_remove(pending_index))
+    }
+
+    pub(crate) fn remove_pending_changes_for_browsing_context_id(
+        &mut self,
+        browsing_context_id: BrowsingContextId,
+    ) -> Vec<SessionHistoryChange> {
+        self.pending_changes
+            .extract_if(.., |change| {
+                change.browsing_context_id == browsing_context_id
+            })
+            .collect()
     }
 
     #[servo_tracing::instrument(skip_all)]

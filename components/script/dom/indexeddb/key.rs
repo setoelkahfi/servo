@@ -15,18 +15,18 @@ use js::jsapi::{
 use js::jsval::{DoubleValue, ObjectValue, UndefinedValue};
 use js::rust::wrappers2::{
     GetArrayLength, IsArrayObject, JS_HasOwnPropertyById, JS_IndexToId, JS_IsIdentifier,
-    JS_NewObject, NewDateObject, ObjectIsDate, SameValue,
+    NewDateObject, ObjectIsDate, SameValue,
 };
 use js::rust::{HandleValue, MutableHandleValue};
-use js::typedarray::{ArrayBuffer, ArrayBufferView, CreateWith};
+use js::typedarray::{ArrayBuffer, ArrayBufferU8, ArrayBufferView};
+use script_bindings::js::{JS_GetPropertyById, JS_NewObject};
 use storage_traits::indexeddb::{BackendError, IndexedDBKeyRange, IndexedDBKeyType};
 
+use crate::dom::bindings::buffer_source::create_buffer_source;
 use crate::dom::bindings::codegen::Bindings::BlobBinding::BlobMethods;
 use crate::dom::bindings::codegen::Bindings::FileBinding::FileMethods;
 use crate::dom::bindings::codegen::UnionTypes::StringOrStringSequence as StrOrStringSequence;
-use crate::dom::bindings::conversions::{
-    get_property_jsval, root_from_handlevalue, root_from_object,
-};
+use crate::dom::bindings::conversions::{get_property_jsval, root_from_handlevalue};
 use crate::dom::bindings::error::Error;
 use crate::dom::bindings::str::DOMString;
 use crate::dom::bindings::utils::{define_dictionary_property, has_own_property};
@@ -67,28 +67,21 @@ pub fn key_type_to_jsval(
             date.to_jsval(cx, result);
         },
 
-        IndexedDBKeyType::Binary(b) => unsafe {
+        IndexedDBKeyType::Binary(b) => {
             // Step 3.1. Let len be value’s length.
-            let len = b.len();
 
             // Step 3.2. Let buffer be the result of executing the ECMAScript
             // ArrayBuffer constructor with len.
             rooted!(&in(cx) let mut buffer = ptr::null_mut::<js::jsapi::JSObject>());
-            assert!(
-                ArrayBuffer::create(cx, CreateWith::Length(len), buffer.handle_mut()).is_ok(),
-                "Failed to convert IndexedDB binary key into an ArrayBuffer"
-            );
 
             // Step 3.3. Assert: buffer is not an abrupt completion.
 
             // Step 3.4. Set the entries in buffer’s [[ArrayBufferData]] internal slot to the
             // entries in value.
-            let mut array_buffer = ArrayBuffer::from(buffer.get())
-                .expect("ArrayBuffer::create should create an ArrayBuffer object");
-            array_buffer
-                .as_mut_slice_safe(cx.no_gc())
-                .expect("Can't be detached")
-                .copy_from_slice(b);
+            assert!(
+                create_buffer_source::<ArrayBufferU8>(cx, b, buffer.handle_mut()).is_ok(),
+                "Failed to convert IndexedDB binary key into an ArrayBuffer"
+            );
 
             // Step 3.5. Return buffer.
             result.set(ObjectValue(buffer.get()));
@@ -358,12 +351,7 @@ pub fn convert_value_to_key(
                     }
                     // 3.5.3. Let entry be ? Get(input, index).
                     rooted!(&in(cx) let mut entry = UndefinedValue());
-                    if !js::rust::wrappers2::JS_GetPropertyById(
-                        cx,
-                        object.handle(),
-                        id.handle(),
-                        entry.handle_mut(),
-                    ) {
+                    if !JS_GetPropertyById(cx, object.handle(), id.handle(), entry.handle_mut()) {
                         return Err(Error::JSFailed);
                     }
 
@@ -392,21 +380,15 @@ pub fn convert_value_to_key(
 }
 
 /// <https://www.w3.org/TR/IndexedDB-3/#convert-a-value-to-a-key-range>
-#[expect(unsafe_code)]
 pub fn convert_value_to_key_range(
     cx: &mut JSContext,
     input: HandleValue,
     null_disallowed: Option<bool>,
 ) -> Result<IndexedDBKeyRange, Error> {
     // Step 1. If value is a key range, return value.
-    if input.is_object() {
-        rooted!(&in(cx) let object = input.to_object());
-        unsafe {
-            if let Ok(obj) = root_from_object::<IDBKeyRange>(cx, object.get()) {
-                let obj = obj.inner().clone();
-                return Ok(obj);
-            }
-        }
+    if let Ok(obj) = root_from_handlevalue::<IDBKeyRange>(cx, input) {
+        let obj = obj.inner().clone();
+        return Ok(obj);
     }
 
     // Step 2. If value is undefined or is null, then throw a "DataError" DOMException if null
@@ -467,7 +449,7 @@ pub(crate) fn evaluate_key_path_on_value(
         // Step 1. If keyPath is a list of strings, then:
         KeyPath::StringSequence(key_path) => {
             // Step 1.1. Let result be a new Array object created as if by the expression [].
-            rooted!(&in(cx) let mut result = unsafe { JS_NewObject(cx, ptr::null()) });
+            rooted!(&in(cx) let mut result = JS_NewObject(cx, None));
 
             // Step 1.2. Let i be 0.
             // Step 1.3. For each item in keyPath:
@@ -570,7 +552,10 @@ pub(crate) fn evaluate_key_path_on_value(
                     let Ok(file) = root_from_handlevalue::<File>(cx, current_value.handle())
                 {
                     // Let value be a String equal to value’s name.
-                    file.name().to_jsval(cx, current_value.handle_mut());
+                    file.name()
+                        .clone()
+                        .root()
+                        .to_jsval(cx, current_value.handle_mut());
 
                     continue;
                 }
@@ -706,7 +691,6 @@ pub(crate) fn can_inject_key_into_value(
 }
 
 /// <https://w3c.github.io/IndexedDB/#inject-a-key-into-a-value-using-a-key-path>
-#[expect(unsafe_code)]
 pub(crate) fn inject_key_into_value(
     cx: &mut JSContext,
     value: HandleValue,
@@ -745,7 +729,7 @@ pub(crate) fn inject_key_into_value(
         // Step 4.3 If hop is false, then:
         if !hop {
             // Step 4.3.1 Let o be a new Object created as if by the expression ({}).
-            rooted!(&in(cx) let o = unsafe { JS_NewObject(cx, ptr::null()) });
+            rooted!(&in(cx) let o = JS_NewObject(cx, None));
             rooted!(&in(cx) let mut o_value = UndefinedValue());
             o.to_jsval(cx, o_value.handle_mut());
 

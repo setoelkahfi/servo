@@ -8,6 +8,8 @@ pub mod registry;
 
 use std::any::Any;
 
+use malloc_size_of::MallocSizeOf;
+use malloc_size_of_derive::MallocSizeOf;
 pub use registry::*;
 
 pub trait MediaStream: Any + Send {
@@ -19,7 +21,7 @@ pub trait MediaStream: Any + Send {
 
 /// A MediaSocket is a way for a backend to represent a
 /// yet-to-be-connected source side of a MediaStream
-pub trait MediaSocket: Any + Send {
+pub trait MediaSocket: Any + Send + MallocSizeOf {
     fn as_any(&self) -> &dyn Any;
 }
 
@@ -29,7 +31,7 @@ pub trait MediaOutput: Send {
     fn add_stream(&mut self, stream: &registry::MediaStreamId);
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, MallocSizeOf, PartialEq)]
 pub enum MediaStreamType {
     Video,
     Audio,

@@ -10,9 +10,26 @@
 import os
 import shutil
 import subprocess
-from typing import Optional
+from typing import Optional, Tuple
 
 from .build_target import BuildTarget, OpenHarmonyTarget
+
+
+def clap_tool_already_installed(name: str, minimum_version: Optional[Tuple[int, int, int]] = None) -> bool:
+    """
+    Returns true if the tool `name` is already installed and in PATH.
+    If `minimum_version` is specified, additionally checks if the version tuple is newer than the minimum version.
+    This assumes the CLI uses clap, although other argument parsers that output `name X.Y.Z` for `name --version`
+    will also work.
+    """
+    if not shutil.which(name):
+        return False
+    result = subprocess.run([name, "--version"], encoding="utf-8", capture_output=True)
+    if minimum_version is not None:
+        (major, minor, micro) = result.stdout.strip().split(" ")[1].split(".", 2)
+        return (int(major), int(minor), int(micro)) >= minimum_version
+    else:
+        return True
 
 
 class Base:
@@ -61,15 +78,17 @@ class Base:
         if not skip_platform:
             installed_something |= self._platform_bootstrap(force, yes)
         self.install_rust_toolchain()
+        installed_something |= self.install_cargo_binstall(force)
         if not skip_nextest:
-            installed_something |= self.install_cargo_nextest(force)
+            installed_something |= self.install_cargo_nextest(force, yes)
         if not skip_lints:
-            installed_something |= self.install_taplo(force)
-            installed_something |= self.install_cargo_deny(force)
+            installed_something |= self.install_taplo(force, yes)
+            installed_something |= self.install_cargo_deny(force, yes)
             installed_something |= self.install_crown(force)
         # Optional and non-default, since most people won't be compiling for OpenHarmony
         if install_ohos:
-            installed_something |= self.install_ohos(force)
+            installed_something |= self.install_cargo_ohos(force, yes)
+            installed_something |= self.install_ohos_test_runner(force, yes)
 
         if not installed_something:
             print("Dependencies were already installed!")
@@ -89,50 +108,53 @@ class Base:
             if subprocess.call(["rustup", "toolchain", "install"]) != 0:
                 raise EnvironmentError("Installation of Rust toolchain failed.")
 
-    def install_taplo(self, force: bool) -> bool:
-        if not force and shutil.which("taplo") is not None:
+    def install_cargo_binstall(self, force: bool) -> bool:
+        if not force and shutil.which("cargo-binstall") is not None:
             return False
-
-        print(" * Installing taplo...")
-        if subprocess.call(["cargo", "install", "taplo-cli", "--locked"]) != 0:
-            raise EnvironmentError("Installation of taplo failed.")
-
+        print(" * Installing cargo-binstall...")
+        if subprocess.call(["cargo", "install", "cargo-binstall", "--locked"]) != 0:
+            raise EnvironmentError("Installation of cargo-binstall failed.")
         return True
 
-    def install_ohos(self, force: bool) -> bool:
+    def _cargo_binstall(
+        self, package: str, yes: bool, version: Optional[str] = None, name: Optional[str] = None
+    ) -> bool:
+        display_name = name or package
+        print(f" * Installing {display_name}...")
+        args = ["cargo", "binstall"]
+        if yes:
+            args.append("--no-confirm")
+        args.append(f"{package}@{version}" if version else package)
+        if subprocess.call(args) != 0:
+            raise EnvironmentError(f"Installation of {display_name} failed.")
+        return True
+
+    def install_taplo(self, force: bool, yes: bool) -> bool:
+        if not force and shutil.which("taplo") is not None:
+            return False
+        return self._cargo_binstall("taplo-cli", yes, name="taplo")
+
+    def install_cargo_ohos(self, force: bool, yes: bool) -> bool:
         (is_installed_and_compatible, _reason) = OpenHarmonyTarget.is_cargo_ohos_compatible()
         if is_installed_and_compatible and not force:
             return False
-        print(" * Installing cargo-ohos...")
         requested_version = OpenHarmonyTarget.REQUESTED_CARGO_OHOS_VERSION
-        if subprocess.call(["cargo", "install", f"cargo-ohos@^{requested_version}", "--locked"]) != 0:
-            raise EnvironmentError("Installation of cargo-ohos failed.")
-        return True
+        return self._cargo_binstall("cargo-ohos", yes, version=f"^{requested_version}")
 
-    def install_cargo_deny(self, force: bool) -> bool:
-        def cargo_deny_installed() -> bool:
-            if force or not shutil.which("cargo-deny"):
-                return False
-            # Tidy needs at least version 0.18.6 installed.
-            result = subprocess.run(["cargo-deny", "--version"], encoding="utf-8", capture_output=True)
-            (major, minor, micro) = result.stdout.strip().split(" ")[1].split(".", 2)
-            return (int(major), int(minor), int(micro)) >= (0, 18, 6)
-
-        if cargo_deny_installed():
+    def install_ohos_test_runner(self, force: bool, yes: bool) -> bool:
+        if not force and clap_tool_already_installed("ohos-test-runner", (0, 1, 6)):
             return False
+        return self._cargo_binstall("cargo-ohos", yes)
 
-        print(" * Installing cargo-deny...")
-        if subprocess.call(["cargo", "install", "cargo-deny@0.19.0", "--locked"]) != 0:
-            raise EnvironmentError("Installation of cargo-deny failed.")
-        return True
+    def install_cargo_deny(self, force: bool, yes: bool) -> bool:
+        if not force and clap_tool_already_installed("cargo-deny", (0, 20, 2)):
+            return False
+        return self._cargo_binstall("cargo-deny", yes, version="0.20.2")
 
-    def install_cargo_nextest(self, force: bool) -> bool:
+    def install_cargo_nextest(self, force: bool, yes: bool) -> bool:
         if not force and shutil.which("cargo-nextest") is not None:
             return False
-        print(" * Installing cargo-nextest...")
-        if subprocess.call(["cargo", "install", "cargo-nextest", "--locked"]) != 0:
-            raise EnvironmentError("Installation of cargo-nextest failed.")
-        return True
+        return self._cargo_binstall("cargo-nextest", yes)
 
     def install_crown(self, force: bool) -> bool:
         print(" * Installing crown (the Servo linter)...")

@@ -468,6 +468,16 @@ class MarionetteWindowProtocolPart(WindowProtocolPart):
     def setup(self):
         self.marionette = self.parent.marionette
 
+    def create(self, type_hint=None):
+        # The client's open() always sends "type", which WebDriver:NewWindow
+        # rejects when null, so send the command directly and omit the key
+        # to let Marionette choose the default. focus is Marionette-specific;
+        # False retains focus on the test window.
+        body = {"focus": False}
+        if type_hint is not None:
+            body["type"] = type_hint
+        return self.marionette._send_message("WebDriver:NewWindow", body)["handle"]
+
     def minimize(self):
         return self.marionette.minimize_window()
 
@@ -1198,7 +1208,8 @@ class MarionetteRefTestExecutor(RefTestExecutor):
                 self.has_window = False
 
             if not self.has_window:
-                self.protocol.base.create_window(type="window")
+                test_window = self.protocol.base.create_window(type="window")
+                self.protocol.base.set_window(test_window)
                 # Resize the browser window so that its inner dimensions have
                 # exactly a size of 800x600 pixels, which means ignoring all
                 # visible toolbars and sidebars.
@@ -1488,3 +1499,13 @@ class MarionettePytestExecutor(PytestExecutor):
         for option in ["androidPackage", "androidDeviceSerial", "env"]:
             if hasattr(browser, option):
                 self.capabilities["moz:firefoxOptions"][option] = getattr(browser, option)
+
+    @property
+    def session_config(self):
+        config = super().session_config
+        if hasattr(self.browser, "adb_binary"):
+            config["android"] = {
+                "adb_binary": self.browser.adb_binary,
+                "device_serial": self.browser.androidDeviceSerial,
+            }
+        return config

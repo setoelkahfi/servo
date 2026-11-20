@@ -2,8 +2,6 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
-use std::string::String;
-
 use dom_struct::dom_struct;
 use js::context::{JSContext, NoGC};
 use log::warn;
@@ -15,9 +13,12 @@ use script_bindings::codegen::GenericBindings::WebGPUBinding::{
     GPUTextureMethods, GPUTextureViewDescriptor, GPUTextureWrap,
 };
 use script_bindings::dom::MutNullableDom;
+use script_bindings::interfaces::PromiseHelpers;
 use script_bindings::reflector::{DomGlobalGeneric, Reflector, reflect_dom_object_with_wrap};
-use webgpu_traits::{WebGPU, WebGPURequest, WebGPUTexture, WebGPUTextureView};
-use wgpu_core::resource::{self, TextureDescriptor};
+use webgpu_traits::{
+    Extent3d, ImageSubresourceRange, TextureAspect, TextureDescriptor, TextureUsages,
+    TextureViewDescriptor, WebGPU, WebGPURequest, WebGPUTexture, WebGPUTextureView,
+};
 
 use crate::JSTraceable;
 use crate::dom::bindings::error::Fallible;
@@ -25,7 +26,7 @@ use crate::dom::bindings::root::{Dom, DomRoot};
 use crate::dom::bindings::str::USVString;
 use crate::gpuconvert::{WebGPUConvert, convert_texture_descriptor};
 use crate::gputextureview::GPUTextureView;
-use crate::traits::{Equivalence, GPUDeviceTrait, WebGPUGlobalTrait};
+use crate::traits::{Equivalence, WebGPUGlobalTrait, WebGPUPromise};
 
 #[derive(JSTraceable, MallocSizeOf)]
 struct DroppableGPUTexture {
@@ -57,7 +58,7 @@ pub struct GPUTexture<D: DomTypes> {
     device: Dom<D::GPUDevice>,
     #[no_trace]
     #[ignore_malloc_size_of = "External type"]
-    texture_size: wgpu_types::Extent3d,
+    texture_size: Extent3d,
     mip_level_count: u32,
     sample_count: u32,
     dimension: GPUTextureDimension,
@@ -73,7 +74,7 @@ impl<D: Equivalence> GPUTexture<D> {
         texture: WebGPUTexture,
         device: &D::GPUDevice,
         channel: WebGPU,
-        texture_size: wgpu_types::Extent3d,
+        texture_size: Extent3d,
         mip_level_count: u32,
         sample_count: u32,
         dimension: GPUTextureDimension,
@@ -103,7 +104,7 @@ impl<D: Equivalence> GPUTexture<D> {
         texture: WebGPUTexture,
         device: &D::GPUDevice,
         channel: WebGPU,
-        texture_size: wgpu_types::Extent3d,
+        texture_size: Extent3d,
         mip_level_count: u32,
         sample_count: u32,
         dimension: GPUTextureDimension,
@@ -112,6 +113,7 @@ impl<D: Equivalence> GPUTexture<D> {
         label: USVString,
     ) -> DomRoot<Self> {
         reflect_dom_object_with_wrap::<D, _, _>(
+            cx,
             Box::new(GPUTexture::new_inherited(
                 texture,
                 device,
@@ -125,7 +127,6 @@ impl<D: Equivalence> GPUTexture<D> {
                 label,
             )),
             global,
-            cx,
             GPUTextureWrap::<D>,
         )
     }
@@ -134,8 +135,7 @@ impl<D: Equivalence> GPUTexture<D> {
 impl<D> GPUTexture<D>
 where
     D: Equivalence,
-    D::GPUDevice: GPUDeviceTrait<D>,
-    D::GlobalScope: WebGPUGlobalTrait,
+    <D::Promise as PromiseHelpers<D>>::StackRoot: WebGPUPromise<D>,
 {
     pub fn id(&self) -> WebGPUTexture {
         self.droppable.texture
@@ -149,23 +149,21 @@ where
             sample_count: self.sample_count,
             dimension: self.dimension.convert(),
             format: self.format.convert(),
-            usage: wgpu_types::TextureUsages::from_bits_retain(self.texture_usage),
+            usage: TextureUsages::from_bits_retain(self.texture_usage),
             view_formats: vec![],
         }
     }
 
     /// <https://gpuweb.github.io/gpuweb/#dom-gpudevice-createtexture>
-    pub fn create(
+    pub(crate) fn create(
         cx: &mut JSContext,
         device: &D::GPUDevice,
         descriptor: &GPUTextureDescriptor,
     ) -> Fallible<DomRoot<GPUTexture<D>>> {
         let (desc, size) = convert_texture_descriptor::<D>(descriptor, device)?;
 
-        let texture_id = device
-            .global_from_reflector()
-            .global_wgpu_id_hub()
-            .create_texture_id();
+        let global: DomRoot<D::GlobalScope> = device.global_from_reflector();
+        let texture_id = global.global_wgpu_id_hub().create_texture_id();
 
         device
             .channel()
@@ -208,9 +206,7 @@ where
 impl<D> GPUTextureMethods<D> for GPUTexture<D>
 where
     D: Equivalence,
-    D::GPUDevice: GPUDeviceTrait<D>,
-    D::GlobalScope: WebGPUGlobalTrait,
-    Self: DomGlobalGeneric<D>,
+    <D::Promise as PromiseHelpers<D>>::StackRoot: WebGPUPromise<D>,
 {
     /// <https://gpuweb.github.io/gpuweb/#dom-gpuobjectbase-label>
     fn Label(&self) -> USVString {
@@ -228,37 +224,27 @@ where
         cx: &mut JSContext,
         descriptor: &GPUTextureViewDescriptor,
     ) -> Fallible<DomRoot<GPUTextureView<D>>> {
-        let desc = if !matches!(descriptor.mipLevelCount, Some(0)) &&
-            !matches!(descriptor.arrayLayerCount, Some(0))
-        {
-            Some(resource::TextureViewDescriptor {
-                label: (&descriptor.parent).convert(),
-                format: descriptor
-                    .format
-                    .map(|f| self.device.validate_texture_format_required_features(&f))
-                    .transpose()?,
-                dimension: descriptor.dimension.map(|dimension| dimension.convert()),
-                usage: Some(wgpu_types::TextureUsages::from_bits_retain(
-                    descriptor.usage,
-                )),
-                range: wgpu_types::ImageSubresourceRange {
-                    aspect: match descriptor.aspect {
-                        GPUTextureAspect::All => wgpu_types::TextureAspect::All,
-                        GPUTextureAspect::Stencil_only => wgpu_types::TextureAspect::StencilOnly,
-                        GPUTextureAspect::Depth_only => wgpu_types::TextureAspect::DepthOnly,
-                    },
-                    base_mip_level: descriptor.baseMipLevel,
-                    mip_level_count: descriptor.mipLevelCount,
-                    base_array_layer: descriptor.baseArrayLayer,
-                    array_layer_count: descriptor.arrayLayerCount,
+        // Invalid descriptors (e.g. a zero mip level or array layer count) are validated by wgpu,
+        // which then still registers the view id as invalid so that later uses don't panic.
+        let desc = TextureViewDescriptor {
+            label: (&descriptor.parent).convert(),
+            format: descriptor
+                .format
+                .map(|f| self.device.validate_texture_format_required_features(&f))
+                .transpose()?,
+            dimension: descriptor.dimension.map(|dimension| dimension.convert()),
+            usage: Some(TextureUsages::from_bits_retain(descriptor.usage)),
+            range: ImageSubresourceRange {
+                aspect: match descriptor.aspect {
+                    GPUTextureAspect::All => TextureAspect::All,
+                    GPUTextureAspect::Stencil_only => TextureAspect::StencilOnly,
+                    GPUTextureAspect::Depth_only => TextureAspect::DepthOnly,
                 },
-            })
-        } else {
-            self.device
-                .dispatch_error(webgpu_traits::Error::Validation(String::from(
-                    "arrayLayerCount and mipLevelCount cannot be 0",
-                )));
-            None
+                base_mip_level: descriptor.baseMipLevel,
+                mip_level_count: descriptor.mipLevelCount,
+                base_array_layer: descriptor.baseArrayLayer,
+                array_layer_count: descriptor.arrayLayerCount,
+            },
         };
 
         let texture_view_id = self

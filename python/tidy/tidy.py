@@ -7,11 +7,9 @@
 # option. This file may not be copied, modified, or distributed
 # except according to those terms.
 
-import configparser
 import fnmatch
 import functools
 import glob
-import io
 import itertools
 import json
 import os
@@ -19,14 +17,13 @@ import re
 import shutil
 import subprocess
 import sys
-from dataclasses import dataclass
-from typing import Any, TypedDict, LiteralString
-from collections.abc import Iterator, Callable
+import tomllib
 import types
+from collections.abc import Callable, Iterator
+from dataclasses import dataclass
+from typing import Any, LiteralString, TypedDict
 
 import colorama
-import wpt.manifestupdate
-import tomllib
 
 from .licenseck import APACHE, COPYRIGHT, MPL, OLD_MPL, licenses_toml
 from .linting_report import GitHubAnnotationManager
@@ -119,7 +116,6 @@ WEBIDL_STANDARDS = [
     b"//developer.mozilla.org/en-US/docs/Web/API",
     b"//dev.w3.org/2006/webapi",
     b"//dev.w3.org/csswg",
-    b"//dev.w3.org/fxtf",
     b"//dvcs.w3.org/hg",
     b"//www.w3.org/TR/trusted-types/",
     b"//www.w3.org/TR/credential-management",
@@ -127,7 +123,6 @@ WEBIDL_STANDARDS = [
     b"//dom.spec.whatwg.org",
     b"//drafts.csswg.org",
     b"//drafts.css-houdini.org",
-    b"//drafts.fxtf.org",
     b"//console.spec.whatwg.org",
     b"//encoding.spec.whatwg.org",
     b"//fetch.spec.whatwg.org",
@@ -504,7 +499,6 @@ def run_cargo_deny_lints() -> Iterator[tuple[str, int, str]]:
 
     errors = []
     for line in result.stderr.splitlines():
-        line = str(line)
         # Ignore empty lines. This is only relevant when `cargo-deny` crashed and we need to below print
         # what the corrupt line is.
         if not line.strip():
@@ -582,8 +576,13 @@ def check_toml(file_name: str, lines: list[bytes]) -> Iterator[tuple[int, str]]:
             lints_inherited = True
     if not ok_licensed:
         yield (0, ".toml file should contain a valid license.")
-    # TODO(47512): Check for `./components/` here
-    if "lints-configuration" in file_name and not lints_inherited:
+    if (
+        not any(file_name.startswith(folder) for folder in ["./support/crown/", "./ffi/capi/"])
+        # Required for the tests of tidy itself, where we don't want to lint any of the `Cargo.toml`
+        # except for the `Cargo.toml` for this specific check, which are in `lints-configuration/`.
+        and ("/tests/" not in file_name or "lints-configuration" in file_name)
+        and not lints_inherited
+    ):
         yield (0, ".toml file should turn on lints from workspace.")
 
     normalized_file_name = os.path.abspath(file_name)
@@ -822,34 +821,6 @@ def check_webidl_spec(file_name: str, contents: bytes) -> Iterator[tuple[int, st
     yield (0, "No specification link found.")
 
 
-def check_that_manifests_exist() -> Iterator[tuple[str, int, str]]:
-    # Determine the metadata and test directories from the configuration file.
-    metadata_dirs = []
-    config = configparser.ConfigParser()
-    config.read(WPT_CONFIG_INI_PATH)
-    for key in config:
-        if key.startswith("manifest:"):
-            metadata_dirs.append(os.path.join("./tests/wpt/", config[key]["metadata"]))
-
-    for directory in metadata_dirs:
-        manifest_path = os.path.join(TOPDIR, directory, "MANIFEST.json")
-        if not os.path.isfile(manifest_path):
-            yield (WPT_CONFIG_INI_PATH, 0, f"Path in config was not found: {manifest_path}")
-
-
-def check_that_manifests_are_clean() -> Iterator[tuple[str, int, str]]:
-    from wptrunner import wptlogging
-
-    print("\r ➤  Checking WPT manifests for cleanliness...")
-    output_stream = io.StringIO("")
-    logger = wptlogging.setup({}, {"mach": output_stream})
-    if wpt.manifestupdate.update(check_clean=True, logger=logger):
-        for line in output_stream.getvalue().splitlines():
-            if "ERROR" in line:
-                yield (WPT_CONFIG_INI_PATH, 0, line)
-        yield (WPT_CONFIG_INI_PATH, 0, "WPT manifest is dirty. Run `./mach update-manifest`.")
-
-
 def lint_wpt_test_files() -> Iterator[tuple[str, int, str]]:
     from tools.lint import lint
 
@@ -894,12 +865,6 @@ def run_wpt_lints(only_changed_files: bool) -> Iterator[tuple[str, int, str]]:
             print("\r ➤  Skipping WPT lint checks, because no relevant files changed.")
             return
 
-    manifests_exist_errors = list(check_that_manifests_exist())
-    if manifests_exist_errors:
-        yield from manifests_exist_errors
-        return
-
-    yield from check_that_manifests_are_clean()
     yield from lint_wpt_test_files()
     yield from check_flake8_lints()
 
@@ -968,8 +933,13 @@ def check_config_file(config_file: LiteralString, print_text: bool = True) -> It
     skip_dirs = ["./target", "./tests", "./support/crown/target"]
     invalid_dirs = [d for d in exclude_dirs if not os.path.isdir(d) and not any(s in d for s in skip_dirs)]
 
-    # Check for invalid listed ignored files
-    invalid_files = [f for f in exclude.get("files", []) if not os.path.exists(f)]
+    # Check for invalid listed ignored files, but ignore any file listed in the skipped
+    # directories -- these kinds of file are typically generated automatically.
+    invalid_files = [
+        file
+        for file in exclude.get("files", [])
+        if not os.path.exists(file) and not any(skip_dir in file for skip_dir in skip_dirs)
+    ]
 
     current_table = ""
     for idx, line in enumerate(lines):

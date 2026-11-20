@@ -228,6 +228,7 @@ def env_options():
 
 
 def get_bool_pref(default_prefs, extra_prefs, pref):
+    """Resolve a boolean preference for run info purposes."""
     for key, value in extra_prefs + default_prefs:
         if pref == key:
             if isinstance(value, str):
@@ -237,12 +238,49 @@ def get_bool_pref(default_prefs, extra_prefs, pref):
     return False
 
 
+def has_openh264_gmp(gmp_path):
+    """Whether a MOZ_GMP_PATH holds the real OpenH264 plugin.
+
+    Gecko requires each entry to be <dir>/gmp-<name>/<version>, so the parent
+    directory name is what identifies the plugin.
+    """
+    return any(os.path.basename(os.path.dirname(entry)) == "gmp-gmpopenh264"
+               for entry in gmp_path.split(os.pathsep) if entry)
+
+
+def has_vmp_signature(binary):
+    """Whether the Firefox binary has a Widevine Verified Media Path (VMP)
+    signature, i.e. the .sig file that signing places alongside it.
+
+    On macOS the signature files live in the bundle's Resources directory
+    rather than next to the binary.
+    """
+    if not binary:
+        return False
+    binary = os.path.abspath(binary)
+    if binary.endswith(".app"):
+        return os.path.isfile(os.path.join(binary, "Contents", "Resources",
+                                           "firefox.sig"))
+    name = os.path.basename(binary) + ".sig"
+    return any(os.path.isfile(path) for path in (
+        os.path.join(os.path.dirname(binary), name),
+        os.path.join(os.path.dirname(os.path.dirname(binary)), "Resources", name),
+    ))
+
+
 def run_info_extras(logger, default_prefs=None, **kwargs):
     extra_prefs = kwargs.get("extra_prefs", [])
     default_prefs = list(default_prefs.items()) if default_prefs is not None else []
 
     def bool_pref(pref):
         return get_bool_pref(default_prefs, extra_prefs, pref)
+
+    def prefers_openh264():
+        """Whether the OpenH264 plugin is present and preferred."""
+        return (has_openh264_gmp(kwargs.get("gmp_path") or
+                                 os.environ.get("MOZ_GMP_PATH", "")) and
+                bool_pref("media.gmp.encoder.preferred") and
+                bool_pref("media.gmp.decoder.preferred"))
 
     # Default fission to on, unless we get --disable-fission
     rv = {"e10s": kwargs["gecko_e10s"],
@@ -253,10 +291,19 @@ def run_info_extras(logger, default_prefs=None, **kwargs):
           "sessionHistoryInParent": True,
           "swgl": bool_pref("gfx.webrender.software"),
           "useDrawSnapshot": bool_pref("reftest.use-draw-snapshot"),
+          "nativePrinter": any(key == "remote.print.printer_name" and value
+                               for key, value in extra_prefs + default_prefs),
           "privateBrowsing": bool_pref("browser.privatebrowsing.autostart"),
-          "remoteAsyncEvents": (bool_pref("remote.events.async.mouse.enabled") or
-                                bool_pref("remote.events.async.wheel.enabled")),
+          "remoteAsyncMouseEvents": bool_pref("remote.events.async.mouse.enabled"),
+          "remoteAsyncTouchEvents": bool_pref("remote.events.async.touch.enabled"),
+          "remoteAsyncWheelEvents": bool_pref("remote.events.async.wheel.enabled"),
           "incOriginInit": os.environ.get("MOZ_ENABLE_INC_ORIGIN_INIT") == "1",
+          "openh264": prefers_openh264(),
+          "isolated_process": kwargs.get("isolated_process"),
+          "vmpSigned": has_vmp_signature(kwargs.get("binary")),
+          "playready": bool_pref("media.eme.playready.enabled"),
+          "csp_url_hashes": bool_pref("security.csp.url-hashes.enabled"),
+          "csp_strict_dynamic_url": bool_pref("security.csp.strict-dynamic-url.enabled"),
           }
     rv.update(run_info_browser_version(**kwargs))
 
@@ -289,9 +336,15 @@ def update_properties():
             "useDrawSnapshot",
             "asan",
             "tsan",
-            "remoteAsyncEvents",
+            "remoteAsyncMouseEvents",
+            "remoteAsyncTouchEvents",
+            "remoteAsyncWheelEvents",
             "sessionHistoryInParent",
+            "openh264",
+            "playready",
             "subsuite",
+            "csp_url_hashes",
+            "csp_strict_dynamic_url",
         ],
         {"os": ["display", "version", "os_version"], "processor": ["bits"]},
     )
@@ -414,10 +467,14 @@ class FirefoxInstanceManager:
         env = get_environ(self.logger, self.binary, self.debug_info,
                           self.headless, self.gmp_path, self.chaos_mode_flags,
                           self.e10s)
+        # Allow Marionette to execute commands in the chrome scope of the
+        # application. Not set in get_environ() because for wdspec tests the
+        # environment is forwarded to geckodriver via capabilities, which
+        # rejects this variable.
+        env["MOZ_REMOTE_ALLOW_SYSTEM_ACCESS"] = "1"
 
         args = self.binary_args[:] if self.binary_args else []
-        args += [cmd_arg("marionette"),
-                 cmd_arg("remote-allow-system-access"), "about:blank"]
+        args += [cmd_arg("marionette"), "about:blank"]
 
         debug_args, cmd = browser_command(self.binary,
                                           args,
@@ -594,6 +651,7 @@ class FirefoxOutputHandler(OutputHandler):
 
         # These are filled in after configure_handlers() is called
         self.lsan_handler = None
+        self.asan_handler = None
         self.mozleak_allowed = None
         self.mozleak_thresholds = None
         self.group_metadata = None
@@ -612,12 +670,22 @@ class FirefoxOutputHandler(OutputHandler):
                                                   allowed=lsan_allowed,
                                                   maxNumRecordedFrames=lsan_max_stack_depth,
                                                   allowAll=lsan_disabled)
+            # mozleak < 2.1 has no AddressSanitizer report parser, and the
+            # action it logs needs a mozlog that knows it.
+            asan_parser = getattr(mozleak, "ASanErrorParser", None)
+            if asan_parser and hasattr(self.logger, "asan_error"):
+                self.asan_handler = asan_parser(self.logger, scope=group_metadata.scope)
+            else:
+                self.asan_handler = None
         else:
             self.lsan_handler = None
+            self.asan_handler = None
         super().start()
 
     def after_process_stop(self, clean_shutdown=True):
         super().after_process_stop(clean_shutdown)
+        if self.asan_handler:
+            self.asan_handler.flush()
         if self.lsan_handler:
             self.lsan_handler.process()
         if self.leak_report_file is not None:
@@ -657,6 +725,8 @@ class FirefoxOutputHandler(OutputHandler):
             data = line.decode("utf8", "replace")
             if self.stack_fixer:
                 data = self.stack_fixer(data)
+            if self.asan_handler:
+                self.asan_handler.log(data, pid=self.pid)
             if self.lsan_handler:
                 data = self.lsan_handler.log(data)
             if data is not None:
@@ -777,6 +847,11 @@ class ProfileCreator:
         }
 
     def _get_default_prefs(self):
+        """Preferences that are applied to the profile of a test run.
+
+        These are not visible to "run_info_extras", which only sees preferences
+        given via "--setpref", so a run info flag does not reflect them.
+        """
         prefs = {
             "dom.file.createInChild": True,
             "places.history.enabled": False,
@@ -797,12 +872,36 @@ class ProfileCreator:
                 }
             )
         else:
-            # Except for wdspec dispatch wheel scroll as widget event by default.
+            # Dispatch wheel scroll as widget event by default. It stays
+            # disabled for wdspec until it can be enabled for all input sources.
             prefs["remote.events.async.wheel.enabled"] = True
 
         if self.debug_test:
             prefs["devtools.console.stdout.content"] = True
 
+        prefs.update(self._get_address_space_override_prefs())
+
+        return prefs
+
+    def _get_address_space_override_prefs(self):
+        """Classify the `http(s)-local` and `http(s)-public` servers in the
+        appropriate IP address spaces for Local Network Access tests.
+
+        See https://github.com/web-platform-tests/rfcs/blob/master/rfcs/address_space_overrides.md
+        """
+        address_space_ports = {
+            "private": ["http-local", "https-local"],
+            "public": ["http-public", "https-public"],
+        }
+        prefs = {}
+        for address_space, port_names in address_space_ports.items():
+            overrides = ",".join(
+                f"127.0.0.1:{port}"
+                for port_name in port_names
+                for port in self.config.ports.get(port_name, [])
+            )
+            if overrides:
+                prefs[f"network.lna.address_space.{address_space}.override"] = overrides
         return prefs
 
     def _setup_ssl(self, profile):
@@ -968,6 +1067,9 @@ class FirefoxBrowser(Browser):
                                  "testdriver": self._settings["testdriver"]}
 
     def check_crash(self, process, test):
+        asan_handler = self.instance.output_handler.asan_handler
+        if asan_handler is not None:
+            asan_handler.attribute(test)
         return log_gecko_crashes(self.logger,
                                  process,
                                  test,
@@ -983,7 +1085,7 @@ class FirefoxPytestBrowser(WebDriverBrowser):
                  disable_fission=False, stackfix_dir=None, leak_check=False,
                  asan=False, chaos_mode_flags=None, config=None, browser_channel="nightly",
                  headless=None, debug_test=False, profile_creator_cls=ProfileCreator,
-                 allow_list_paths=None, gmp_path=None, **kwargs):
+                 allow_list_paths=None, gmp_path=None, isolated_process=False, **kwargs):
 
         super().__init__(logger, binary, webdriver_binary, webdriver_args, **kwargs)
         self.binary = binary
@@ -998,7 +1100,7 @@ class FirefoxPytestBrowser(WebDriverBrowser):
         self.leak_check = leak_check
         self.leak_report_file = None
 
-        self.env = self.get_env(binary, debug_info, headless, gmp_path, chaos_mode_flags, e10s)
+        self.env = self.get_env(binary, debug_info, headless, gmp_path, chaos_mode_flags, e10s, isolated_process)
 
         # Todo: need test type to use "aam" test in profile_creator_cls
         profile_creator = profile_creator_cls(logger,
@@ -1018,7 +1120,7 @@ class FirefoxPytestBrowser(WebDriverBrowser):
         self.profile = profile_creator.create()
         self.marionette_port = None
 
-    def get_env(self, binary, debug_info, headless, gmp_path, chaos_mode_flags, e10s):
+    def get_env(self, binary, debug_info, headless, gmp_path, chaos_mode_flags, e10s, isolated_process):
         env = get_environ(self.logger,
                           binary,
                           debug_info,

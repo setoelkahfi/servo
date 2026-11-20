@@ -8,245 +8,435 @@ package org.servo.servoview
 import android.content.Context
 import android.util.Size
 import android.view.KeyEvent
+import android.view.MotionEvent
 import android.view.Surface
+import android.view.inputmethod.BaseInputConnection
+import androidx.activity.compose.BackHandler
+import androidx.compose.foundation.AndroidExternalSurface
+import androidx.compose.foundation.focusable
+import androidx.compose.foundation.interaction.Interaction
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.Stable
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.setValue
+import androidx.compose.runtime.withFrameNanos
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.viewinterop.AndroidView
+import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusRequester
+import androidx.compose.ui.input.key.Key
+import androidx.compose.ui.input.key.KeyEventType
+import androidx.compose.ui.input.key.key
+import androidx.compose.ui.input.key.nativeKeyCode
+import androidx.compose.ui.input.key.onKeyEvent
+import androidx.compose.ui.input.key.type
+import androidx.compose.ui.input.pointer.pointerInteropFilter
+import androidx.compose.ui.node.ModifierNodeElement
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalResources
+import androidx.compose.ui.platform.PlatformTextInputModifierNode
+import androidx.compose.ui.platform.establishTextInputSession
 import androidx.lifecycle.compose.LifecycleResumeEffect
+import java.util.concurrent.Executors
+import kotlin.coroutines.EmptyCoroutineContext
+import kotlinx.coroutines.CoroutineDispatcher
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.asCoroutineDispatcher
+import kotlinx.coroutines.flow.MutableSharedFlow
+import kotlinx.coroutines.launch
 
 @Composable
 fun Servo(
-    servoView: ServoView,
+    experimentalModeEnabled: Boolean,
+    args: String?,
+    initialUrl: String?,
+    logStr: String?,
+    onLoadingStateChange: (LoadingState) -> Unit,
+    client: Servo.Client,
+    navigator: ServoNavigator,
     modifier: Modifier = Modifier,
 ) {
-    LifecycleResumeEffect(servoView) {
-        servoView.onResume()
-        onPauseOrDispose {
-            servoView.onPause()
+    val context = LocalContext.current
+    val scope = rememberCoroutineScope()
+    var softKeyboardVisible by remember { mutableStateOf(false) }
+    val servo = remember {
+        Servo(
+            args = args,
+            url = initialUrl,
+            logStr = logStr,
+            experimentalMode = experimentalModeEnabled,
+            scope = scope,
+            client = client,
+            context = context,
+            navigator = navigator,
+            onImeShow = { softKeyboardVisible = true },
+            onImeHide = { softKeyboardVisible = false },
+            onLoadingStateChange = onLoadingStateChange,
+        )
+    }
+
+    LifecycleResumeEffect(servo) {
+        servo.suspend(false)
+        onPauseOrDispose { servo.suspend(true) }
+    }
+    LaunchedEffect(Unit) {
+        while (true) {
+            withFrameNanos { servo.onDoFrame() }
         }
     }
-    AndroidView(
-        factory = { _ -> servoView },
-        modifier = modifier,
-    )
+    LaunchedEffect(servo, navigator) { navigator.consumeNavigationEvents(servo) }
+    BackHandler(enabled = navigator.canGoBack) { navigator.back() }
+    LaunchedEffect(experimentalModeEnabled) { servo.setExperimentalMode(experimentalModeEnabled) }
+    DisposableEffect(servo) { onDispose { servo.glDispatcher.close() } }
+
+    val resources = LocalResources.current
+    val focusRequester = remember { FocusRequester() }
+    AndroidExternalSurface(
+        modifier =
+            modifier
+                .focusRequester(focusRequester)
+                .focusable()
+                .softKeyboardVisible(softKeyboardVisible)
+                .onKeyEvent { keyEvent ->
+                    when (keyEvent.type) {
+                        KeyEventType.KeyDown if keyEvent.key != Key.Back -> {
+                            servo.onKeyDown(
+                                keyEvent.key.nativeKeyCode,
+                                keyEvent.nativeKeyEvent,
+                            )
+                            true
+                        }
+
+                        KeyEventType.KeyUp if keyEvent.key != Key.Back -> {
+                            servo.onKeyUp(
+                                keyEvent.key.nativeKeyCode,
+                                keyEvent.nativeKeyEvent,
+                            )
+                            true
+                        }
+
+                        else -> false
+                    }
+                }
+                .pointerInteropFilter(null) { motionEvent ->
+                    focusRequester.requestFocus()
+
+                    val action = motionEvent.actionMasked
+                    val pointerIndex = motionEvent.actionIndex
+                    val pointerId = motionEvent.getPointerId(pointerIndex)
+                    val x = motionEvent.getX(pointerIndex)
+                    val y = motionEvent.getY(pointerIndex)
+
+                    when (action) {
+                        MotionEvent.ACTION_DOWN,
+                        MotionEvent.ACTION_POINTER_DOWN -> servo.touchDown(x, y, pointerId)
+                        MotionEvent.ACTION_MOVE -> servo.touchMove(x, y, pointerId)
+                        MotionEvent.ACTION_UP,
+                        MotionEvent.ACTION_POINTER_UP -> servo.touchUp(x, y, pointerId)
+                        MotionEvent.ACTION_CANCEL -> servo.touchCancel(x, y, pointerId)
+                    }
+
+                    true
+                },
+    ) {
+        var paused = false
+
+        onSurface { surface, width, height ->
+            val size = Size(width, height)
+
+            if (!paused) {
+                servo.addPlatformWindow(
+                    size,
+                    resources.displayMetrics.density,
+                    surface,
+                )
+            } else {
+                paused = false
+                servo.resumePainting(surface, size)
+            }
+
+            surface.onChanged { width, height -> servo.resize(Size(width, height)) }
+
+            surface.onDestroyed {
+                paused = true
+                servo.pausePainting()
+            }
+        }
+    }
 }
 
-class Servo(
+enum class LoadingState {
+    Loading,
+    Finished,
+}
+
+@Stable
+class ServoNavigator {
+    private sealed interface NavigationEvent : Interaction {
+        data class Navigate(val uri: String) : NavigationEvent
+
+        data object Back : NavigationEvent
+
+        data object Forward : NavigationEvent
+
+        data object Reload : NavigationEvent
+
+        data object Stop : NavigationEvent
+    }
+
+    private val coroutineScope = CoroutineScope(EmptyCoroutineContext)
+    private val navigationEvents = MutableSharedFlow<NavigationEvent>()
+
+    internal suspend fun consumeNavigationEvents(servo: Servo) {
+        navigationEvents.collect { navigationEvent ->
+            when (navigationEvent) {
+                is NavigationEvent.Navigate -> servo.loadUri(navigationEvent.uri)
+                NavigationEvent.Back -> servo.goBack()
+                NavigationEvent.Forward -> servo.goForward()
+                NavigationEvent.Reload -> servo.reload()
+                NavigationEvent.Stop -> servo.stop()
+            }
+        }
+    }
+
+    var canGoBack by mutableStateOf(false)
+        internal set
+
+    var canGoForward by mutableStateOf(false)
+        internal set
+
+    fun navigate(uri: String) {
+        coroutineScope.launch { navigationEvents.emit(NavigationEvent.Navigate(uri)) }
+    }
+
+    fun back() {
+        coroutineScope.launch { navigationEvents.emit(NavigationEvent.Back) }
+    }
+
+    fun forward() {
+        coroutineScope.launch { navigationEvents.emit(NavigationEvent.Forward) }
+    }
+
+    fun reload() {
+        coroutineScope.launch { navigationEvents.emit(NavigationEvent.Reload) }
+    }
+
+    fun stop() {
+        coroutineScope.launch { navigationEvents.emit(NavigationEvent.Stop) }
+    }
+}
+
+private fun Modifier.softKeyboardVisible(visible: Boolean) = this then SoftKeyboardVisible(visible)
+
+private data class SoftKeyboardVisible(val visible: Boolean) :
+    ModifierNodeElement<SoftKeyboardVisibleNode>() {
+    override fun create() = SoftKeyboardVisibleNode()
+
+    override fun update(node: SoftKeyboardVisibleNode) {
+        node.update(visible)
+    }
+}
+
+private class SoftKeyboardVisibleNode : Modifier.Node(), PlatformTextInputModifierNode {
+    private var textInputSessionJob: Job? = null
+
+    fun update(visible: Boolean) {
+        textInputSessionJob?.cancel()
+        if (visible) {
+            textInputSessionJob = coroutineScope.launch {
+                establishTextInputSession {
+                    startInputMethod { _ -> BaseInputConnection(view, true) }
+                }
+            }
+        }
+    }
+}
+
+class Servo
+internal constructor(
     args: String?,
     url: String?,
-    size: Size,
-    density: Float,
     logStr: String?,
     experimentalMode: Boolean,
-    private val runCallback: RunCallback,
+    private val scope: CoroutineScope,
     client: Client,
     context: Context,
-    surface: Surface,
+    navigator: ServoNavigator,
+    onImeShow: () -> Unit,
+    onImeHide: () -> Unit,
+    onLoadingStateChange: (LoadingState) -> Unit,
 ) {
     private val jni = JNIServo()
-    private val servoCallbacks = Callbacks(client, jni, runCallback)
+    internal val glDispatcher = Executors.newSingleThreadExecutor().asCoroutineDispatcher()
+    private val servoCallbacks =
+        Callbacks(
+            client,
+            jni,
+            scope,
+            glDispatcher,
+            navigator,
+            onImeShow,
+            onImeHide,
+            onLoadingStateChange,
+        )
 
     init {
-        this.runCallback.inGLThread {
+        scope.launch(glDispatcher) {
             jni.init(
                 context,
                 args,
                 url,
-                size,
-                density,
                 logStr,
                 experimentalMode,
                 servoCallbacks,
+            )
+        }
+    }
+
+    fun addPlatformWindow(
+        size: Size,
+        density: Float,
+        surface: Surface,
+    ) {
+        scope.launch(glDispatcher) {
+            jni.addPlatformWindow(
+                size,
+                density,
                 surface,
             )
         }
     }
 
-    fun version(): String {
-        return jni.version()
-    }
-
-    fun performUpdates() {
-        runCallback.inGLThread { jni.performUpdates() }
-    }
-
     fun resize(size: Size) {
-        runCallback.inGLThread { jni.resize(size) }
+        scope.launch(glDispatcher) { jni.resize(size) }
     }
 
     fun reload() {
-        runCallback.inGLThread { jni.reload() }
+        scope.launch(glDispatcher) { jni.reload() }
     }
 
     fun stop() {
-        runCallback.inGLThread { jni.stop() }
+        scope.launch(glDispatcher) { jni.stop() }
     }
 
     fun goBack() {
-        runCallback.inGLThread { jni.goBack() }
+        scope.launch(glDispatcher) { jni.goBack() }
     }
 
     fun goForward() {
-        runCallback.inGLThread { jni.goForward() }
+        scope.launch(glDispatcher) { jni.goForward() }
     }
 
     fun loadUri(uri: String) {
-        runCallback.inGLThread { jni.loadUri(uri) }
-    }
-
-    fun scroll(dx: Int, dy: Int, x: Int, y: Int) {
-        runCallback.inGLThread { jni.scroll(dx, dy, x, y) }
+        scope.launch(glDispatcher) { jni.loadUri(uri) }
     }
 
     fun onKeyDown(keyCode: Int, event: KeyEvent) {
-        runCallback.inGLThread { jni.keydown(keyCode, event.unicodeChar) }
+        scope.launch(glDispatcher) { jni.keydown(keyCode, event.unicodeChar) }
     }
 
     fun onKeyUp(keyCode: Int, event: KeyEvent) {
-        runCallback.inGLThread { jni.keyup(keyCode, event.unicodeChar) }
+        scope.launch(glDispatcher) { jni.keyup(keyCode, event.unicodeChar) }
     }
 
     fun touchDown(x: Float, y: Float, pointerId: Int) {
-        runCallback.inGLThread { jni.touchDown(x, y, pointerId) }
+        scope.launch(glDispatcher) { jni.touchDown(x, y, pointerId) }
     }
 
     fun touchMove(x: Float, y: Float, pointerId: Int) {
-        runCallback.inGLThread { jni.touchMove(x, y, pointerId) }
+        scope.launch(glDispatcher) { jni.touchMove(x, y, pointerId) }
     }
 
     fun touchUp(x: Float, y: Float, pointerId: Int) {
-        runCallback.inGLThread { jni.touchUp(x, y, pointerId) }
+        scope.launch(glDispatcher) { jni.touchUp(x, y, pointerId) }
     }
 
     fun touchCancel(x: Float, y: Float, pointerId: Int) {
-        runCallback.inGLThread { jni.touchCancel(x, y, pointerId) }
-    }
-
-    fun pinchZoomStart(factor: Float, x: Float, y: Float) {
-        runCallback.inGLThread { jni.pinchZoomStart(factor, x, y) }
-    }
-
-    fun pinchZoom(factor: Float, x: Float, y: Float) {
-        runCallback.inGLThread { jni.pinchZoom(factor, x, y) }
-    }
-
-    fun pinchZoomEnd(factor: Float, x: Float, y: Float) {
-        runCallback.inGLThread { jni.pinchZoomEnd(factor, x, y) }
-    }
-
-    fun click(x: Float, y: Float) {
-        runCallback.inGLThread { jni.click(x, y) }
+        scope.launch(glDispatcher) { jni.touchCancel(x, y, pointerId) }
     }
 
     fun pausePainting() {
-        runCallback.inGLThread { jni.pausePainting() }
+        scope.launch(glDispatcher) { jni.pausePainting() }
     }
 
     fun resumePainting(surface: Surface, size: Size) {
-        runCallback.inGLThread { jni.resumePainting(surface, size) }
+        scope.launch(glDispatcher) { jni.resumePainting(surface, size) }
     }
 
     fun suspend(suspended: Boolean) {
         servoCallbacks.suspended = suspended
     }
 
-    fun mediaSessionAction(action: Int) {
-        runCallback.inGLThread { jni.mediaSessionAction(action) }
-    }
-
     fun setExperimentalMode(enable: Boolean) {
-        runCallback.inGLThread { jni.setExperimentalMode(enable) }
+        scope.launch(glDispatcher) { jni.setExperimentalMode(enable) }
     }
 
     fun onDoFrame() {
-        runCallback.inGLThread { jni.doFrame() }
+        scope.launch(glDispatcher) { jni.doFrame() }
     }
 
     interface Client {
         fun onAlert(message: String)
 
-        fun onLoadStarted()
-
-        fun onLoadEnded()
-
         fun onTitleChanged(title: String)
 
         fun onUrlChanged(url: String)
-
-        fun onHistoryChanged(canGoBack: Boolean, canGoForward: Boolean)
-
-        fun onImeShow()
-
-        fun onImeHide()
-
-        fun onMediaSessionMetadata(title: String, artist: String, album: String)
-
-        fun onMediaSessionPlaybackStateChange(state: Int)
-
-        fun onMediaSessionSetPositionState(duration: Float, position: Float, playbackRate: Float)
-    }
-
-    interface RunCallback {
-        fun inGLThread(f: Runnable)
-
-        fun inUIThread(f: Runnable)
     }
 
     private class Callbacks(
         private var client: Client,
         private val jni: JNIServo,
-        private val runCallback: RunCallback,
+        private val scope: CoroutineScope,
+        private val glDispatcher: CoroutineDispatcher,
+        private val navigator: ServoNavigator,
+        private val onImeShow: () -> Unit,
+        private val onImeHide: () -> Unit,
+        private val onLoadingStateChange: (LoadingState) -> Unit,
     ) : JNIServo.Callbacks, Client {
         var suspended: Boolean = false
 
         override fun wakeup() {
             if (!suspended) {
-                runCallback.inGLThread { jni.performUpdates() }
+                scope.launch(glDispatcher) { jni.performUpdates() }
             }
         }
 
         override fun onAlert(message: String) {
-            runCallback.inUIThread { client.onAlert(message) }
+            scope.launch { client.onAlert(message) }
         }
 
         override fun onImeShow() {
-            runCallback.inUIThread { client.onImeShow() }
+            scope.launch { onImeShow.invoke() }
         }
 
         override fun onImeHide() {
-            runCallback.inUIThread { client.onImeHide() }
+            scope.launch { onImeHide.invoke() }
         }
 
         override fun onLoadStarted() {
-            runCallback.inUIThread { client.onLoadStarted() }
+            scope.launch { onLoadingStateChange(LoadingState.Loading) }
         }
 
         override fun onLoadEnded() {
-            runCallback.inUIThread { client.onLoadEnded() }
+            scope.launch { onLoadingStateChange(LoadingState.Finished) }
         }
 
         override fun onTitleChanged(title: String) {
-            runCallback.inUIThread { client.onTitleChanged(title) }
+            scope.launch { client.onTitleChanged(title) }
         }
 
         override fun onUrlChanged(url: String) {
-            runCallback.inUIThread { client.onUrlChanged(url) }
+            scope.launch { client.onUrlChanged(url) }
         }
 
         override fun onHistoryChanged(canGoBack: Boolean, canGoForward: Boolean) {
-            runCallback.inUIThread { client.onHistoryChanged(canGoBack, canGoForward) }
-        }
-
-        override fun onMediaSessionMetadata(title: String, artist: String, album: String) {
-            runCallback.inUIThread { client.onMediaSessionMetadata(title, artist, album) }
-        }
-
-        override fun onMediaSessionPlaybackStateChange(state: Int) {
-            runCallback.inUIThread { client.onMediaSessionPlaybackStateChange(state) }
-        }
-
-        override fun onMediaSessionSetPositionState(duration: Float, position: Float, playbackRate: Float) {
-            runCallback.inUIThread { client.onMediaSessionSetPositionState(duration, position, playbackRate) }
+            navigator.canGoBack = canGoBack
+            navigator.canGoForward = canGoForward
         }
     }
 }

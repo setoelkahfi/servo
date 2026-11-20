@@ -2,7 +2,7 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
-#[allow(clippy::module_inception, reason = "The interface name is CSS")]
+#[expect(clippy::module_inception, reason = "The interface name is CSS")]
 pub(crate) mod css;
 pub(crate) mod cssconditionrule;
 pub(crate) mod cssfontfacedescriptors;
@@ -28,6 +28,7 @@ pub(crate) mod cssstylevalue;
 pub(crate) mod csssupportsrule;
 pub(crate) mod fontface;
 pub(crate) mod fontfaceset;
+pub(crate) mod fontfacesetloadevent;
 pub(crate) mod stylepropertymapreadonly;
 pub(crate) mod stylesheet;
 pub(crate) mod stylesheetcontentscache;

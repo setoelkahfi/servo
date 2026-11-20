@@ -34,9 +34,9 @@ interface HTMLInputElement : HTMLElement {
            attribute boolean formNoValidate;
   [CEReactions]
            attribute DOMString formTarget;
-  // [CEReactions]
-  //          attribute unsigned long height;
-           attribute boolean indeterminate;
+  [CEReactions]
+           attribute unsigned long height;
+  attribute boolean indeterminate;
   // [CEReactions]
   //          attribute DOMString inputMode;
   readonly attribute HTMLDataListElement? list;
@@ -76,8 +76,8 @@ interface HTMLInputElement : HTMLElement {
            attribute object? valueAsDate;
   [SetterThrows]
            attribute unrestricted double valueAsNumber;
-  // [CEReactions]
-  //          attribute unsigned long width;
+  [CEReactions]
+           attribute unsigned long width;
 
   [Throws] undefined stepUp(optional long n = 1);
   [Throws] undefined stepDown(optional long n = 1);
@@ -106,15 +106,26 @@ interface HTMLInputElement : HTMLElement {
   [Throws]
            undefined setSelectionRange(unsigned long start, unsigned long end, optional DOMString direction);
 
+  [Throws] undefined showPicker();
+
   // also has obsolete members
 
   // Select with file-system paths for testing purpose
   [Pref="dom_testing_html_input_element_select_files_enabled"]
   undefined selectFiles(sequence<DOMString> path);
 };
+HTMLInputElement includes PopoverTargetAttributes;
 
 // https://html.spec.whatwg.org/multipage/#HTMLInputElement-partial
 partial interface HTMLInputElement {
   //         attribute DOMString align;
-  attribute DOMString useMap;
+  [CEReactions] attribute DOMString useMap;
+  [CEReactions] attribute unsigned long hspace;
+  [CEReactions] attribute unsigned long vspace;
+};
+
+// https://wicg.github.io/entries-api/#html-forms
+partial interface HTMLInputElement {
+  [Pref="dom_entries_api_enabled"] attribute boolean webkitdirectory;
+  [Pref="dom_entries_api_enabled"] readonly attribute /* FrozenArray<FileSystemEntry> */ any webkitEntries;
 };

@@ -1,11 +1,13 @@
 /* This Source Code Form is subject to the terms of the Mozilla Public
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
+use std::collections::HashSet;
 
 use embedder_traits::ViewportDetails;
 use log::warn;
+use net_traits::request::UpgradeInsecureNavigations;
 use rustc_hash::{FxHashMap, FxHashSet};
-use servo_base::id::{BrowsingContextGroupId, BrowsingContextId, PipelineId, WebViewId};
+use servo_base::id::{BrowsingContextId, PipelineId, WebViewId};
 
 use crate::pipeline::Pipeline;
 
@@ -27,9 +29,8 @@ pub struct NewBrowsingContextInfo {
     /// Whether this browsing context inherits a secure context.
     pub inherited_secure_context: Option<bool>,
 
-    /// Whether this browsing context should be throttled, using less resources
-    /// by stopping animations and running timers at a heavily limited rate.
-    pub throttled: bool,
+    /// <https://w3c.github.io/webappsec-upgrade-insecure-requests/#upgrade-insecure-navigations-set>
+    pub upgrade_insecure_navigations_set: HashSet<UpgradeInsecureNavigations>,
 }
 
 /// The constellation's view of a browsing context.
@@ -39,9 +40,6 @@ pub struct NewBrowsingContextInfo {
 /// sorted reverse chronologically: in particular prev.pop() is the latest
 /// past entry, and next.pop() is the earliest future entry.
 pub struct BrowsingContext {
-    /// The browsing context group id where the top-level of this bc is found.
-    pub bc_group_id: BrowsingContextGroupId,
-
     /// The browsing context id.
     pub id: BrowsingContextId,
 
@@ -57,9 +55,8 @@ pub struct BrowsingContext {
     /// Whether this browsing context inherits a secure context.
     pub inherited_secure_context: Option<bool>,
 
-    /// Whether this browsing context should be throttled, using less resources
-    /// by stopping animations and running timers at a heavily limited rate.
-    pub throttled: bool,
+    /// <https://w3c.github.io/webappsec-upgrade-insecure-requests/#upgrade-insecure-navigations-set>
+    pub upgrade_insecure_navigations_set: HashSet<UpgradeInsecureNavigations>,
 
     /// The pipeline for the current session history entry.
     pub pipeline_id: PipelineId,
@@ -78,7 +75,6 @@ impl BrowsingContext {
     /// Note this just creates the browsing context, it doesn't add it to the constellation's set of browsing contexts.
     #[expect(clippy::too_many_arguments)]
     pub fn new(
-        bc_group_id: BrowsingContextGroupId,
         id: BrowsingContextId,
         webview_id: WebViewId,
         pipeline_id: PipelineId,
@@ -86,18 +82,17 @@ impl BrowsingContext {
         viewport_details: ViewportDetails,
         is_private: bool,
         inherited_secure_context: Option<bool>,
-        throttled: bool,
+        inherited_upgrade_insecure_navigations_set: HashSet<UpgradeInsecureNavigations>,
     ) -> BrowsingContext {
         let mut pipelines = FxHashSet::default();
         pipelines.insert(pipeline_id);
         BrowsingContext {
-            bc_group_id,
             id,
             webview_id,
             viewport_details,
             is_private,
             inherited_secure_context,
-            throttled,
+            upgrade_insecure_navigations_set: inherited_upgrade_insecure_navigations_set,
             pipeline_id,
             parent_pipeline_id,
             pipelines,

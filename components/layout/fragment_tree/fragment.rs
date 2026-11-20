@@ -4,34 +4,34 @@
 
 use std::ops::Range;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 
 use app_units::Au;
 use atomic_refcell::AtomicRef;
 use euclid::{Point2D, Rect, Size2D};
 use fonts::{FontMetrics, ShapedTextSlice};
+use itertools::Either;
 use layout_api::BoxAreaType;
 use malloc_size_of_derive::MallocSizeOf;
 use servo_arc::Arc as ServoArc;
-use servo_base::id::PipelineId;
+use servo_base::cross_process_instant::CrossProcessInstant;
+use servo_base::id::{PipelineId, ScrollTreeNodeId};
 use servo_base::print_tree::PrintTree;
 use servo_base::text::Utf32CodeUnits;
 use servo_url::ServoUrl;
 use style::Zero;
+use style::logical_geometry::WritingMode;
 use style::properties::ComputedValues;
 use style_traits::CSSPixel;
 use webrender_api::{FontInstanceKey, ImageKey};
 
-use super::{
-    BaseFragment, BoxFragment, ContainingBlockManager, HoistedSharedFragment, PositioningFragment,
-    Tag,
-};
+use super::{BaseFragment, BoxFragment, HoistedSharedFragment, PositioningFragment, Tag};
 use crate::SharedStyle;
 use crate::cell::{ArcRefCell, RefOrAtomicRef};
 use crate::flow::inline::text_run::SharedTextRunData;
 use crate::fragment_tree::FragmentStatus;
-use crate::geom::{LogicalSides, PhysicalPoint, PhysicalRect};
+use crate::geom::{LogicalRect, LogicalSides, LogicalVec2, PhysicalPoint, PhysicalRect};
 use crate::layout_impl::LayoutThread;
-use crate::style_ext::ComputedValuesExt;
 
 #[derive(Clone, MallocSizeOf)]
 pub(crate) enum Fragment {
@@ -53,6 +53,27 @@ pub(crate) enum Fragment {
     Text(#[conditional_malloc_size_of] Arc<TextFragment>),
     Image(#[conditional_malloc_size_of] Arc<ImageFragment>),
     IFrame(#[conditional_malloc_size_of] Arc<IFrameFragment>),
+}
+
+/// A combination of a [`Fragment`] and its logical rectangle, which is used to keep
+/// a list of fragment children in order to later convert their logical rectangle
+/// into a physical rectangle when the size of the parent fragment is known.
+#[derive(Clone, MallocSizeOf)]
+pub(crate) struct FragmentAndLogicalRect {
+    pub fragment: Fragment,
+    /// The logical rectangle of the fragment relative to its parent's box. This logical rectangle
+    /// will be converted into a physical one, and the Fragment's `content_rect` will be updated
+    /// once the parent box's final size is known.
+    pub logical_rect: LogicalRect<Au>,
+}
+
+impl FragmentAndLogicalRect {
+    pub(crate) fn new(fragment: Fragment, logical_rect: LogicalRect<Au>) -> Self {
+        Self {
+            fragment,
+            logical_rect,
+        }
+    }
 }
 
 #[derive(Clone, MallocSizeOf)]
@@ -115,14 +136,21 @@ pub(crate) struct TextFragment {
 pub(crate) struct ImageFragment {
     pub base: BaseFragment,
     pub style: SharedStyle,
+    /// The style to use for the selection overlay if this [`ImageFragment`] is
+    /// selected.
+    pub selected_style: SharedStyle,
     pub clip: PhysicalRect<Au>,
     pub image_key: Option<ImageKey>,
     pub showing_broken_image_icon: bool,
     pub url: Option<ServoUrl>,
+    pub load_time: Option<CrossProcessInstant>,
     /// The intrinsic (natural) width of the image, if known.
     pub natural_width: Option<Au>,
     /// The intrinsic (natural) height of the image, if known.
     pub natural_height: Option<Au>,
+    /// Whether or not this image is selected.
+    #[conditional_malloc_size_of]
+    pub selected: Arc<AtomicBool>,
 }
 
 #[derive(MallocSizeOf)]
@@ -149,16 +177,16 @@ impl Fragment {
         })
     }
 
-    pub(crate) fn set_containing_block(&self, containing_block: &PhysicalRect<Au>) {
+    pub(crate) fn set_cumulative_content_rect(&self, content_rect: &PhysicalRect<Au>) {
         match self {
             Fragment::LayoutRoot(layout_root_fragment) => layout_root_fragment
                 .inner()
-                .set_containing_block(containing_block),
+                .set_cumulative_content_rect(content_rect),
             Fragment::Box(box_fragment) | Fragment::Float(box_fragment) => {
-                box_fragment.set_containing_block(containing_block)
+                box_fragment.set_cumulative_content_rect(content_rect)
             },
             Fragment::Positioning(positioning_fragment) => {
-                positioning_fragment.set_containing_block(containing_block)
+                positioning_fragment.set_cumulative_content_rect(content_rect)
             },
             Fragment::AbsoluteOrFixedPositionedPlaceholder(..) |
             Fragment::Text(..) |
@@ -194,7 +222,7 @@ impl Fragment {
         self.retrieve_box_fragment().map_or_else(
             || self.scrollable_overflow_for_parent(),
             |box_fragment| {
-                box_fragment.offset_by_containing_block(
+                box_fragment.offset_by_cumulative_content_offset(
                     &box_fragment.with_style().scrollable_overflow(),
                     layout_thread.into(),
                 )
@@ -227,10 +255,16 @@ impl Fragment {
                 fragment.with_style().scrollable_overflow_for_parent()
             },
             Fragment::Positioning(fragment) => fragment.scrollable_overflow_for_parent(),
+            Fragment::Text(fragment) => fragment.scrollable_overflow_for_parent(),
             Fragment::AbsoluteOrFixedPositionedPlaceholder(_) |
-            Fragment::Text(..) |
             Fragment::Image(..) |
             Fragment::IFrame(..) => self.base().map(|base| base.rect()).unwrap_or_default(),
+        }
+    }
+
+    fn set_rect(&self, rect: PhysicalRect<Au>) {
+        if let Some(base) = self.base() {
+            base.set_rect(rect);
         }
     }
 
@@ -248,7 +282,11 @@ impl Fragment {
         match self {
             // TODO: This should consider the box in pre-relative-adjusted position state.
             Fragment::Box(fragment) | Fragment::Float(fragment)
-                if !fragment.style().clone_position().is_absolutely_positioned() =>
+                if !fragment
+                    .style()
+                    .get_box()
+                    .position
+                    .is_absolutely_positioned() =>
             {
                 Some(fragment.margin_rect())
             },
@@ -269,29 +307,27 @@ impl Fragment {
     pub(crate) fn cumulative_box_area_rect(
         &self,
         area: BoxAreaType,
-        containing_block_computation: ContainingBlockCalculation<'_>,
+        cumulative_content_rect_calculation: CumulativeContentRectCalculation<'_>,
     ) -> Option<PhysicalRect<Au>> {
         match self {
             Fragment::LayoutRoot(layout_root_fragment) => layout_root_fragment
                 .inner()
-                .cumulative_box_area_rect(area, containing_block_computation),
+                .cumulative_box_area_rect(area, cumulative_content_rect_calculation),
             Fragment::Box(fragment) | Fragment::Float(fragment) => Some(match area {
                 BoxAreaType::Content => {
-                    fragment.cumulative_content_box_rect(containing_block_computation)
+                    fragment.cumulative_content_box_rect(cumulative_content_rect_calculation)
                 },
                 BoxAreaType::Padding => {
-                    fragment.cumulative_padding_box_rect(containing_block_computation)
+                    fragment.cumulative_padding_box_rect(cumulative_content_rect_calculation)
                 },
                 BoxAreaType::Border => {
-                    fragment.cumulative_border_box_rect(containing_block_computation)
+                    fragment.cumulative_border_box_rect(cumulative_content_rect_calculation)
                 },
             }),
-            Fragment::Positioning(fragment) => {
-                Some(fragment.offset_by_containing_block(
-                    &fragment.base.rect(),
-                    containing_block_computation,
-                ))
-            },
+            Fragment::Positioning(fragment) => Some(fragment.offset_by_containing_block(
+                &fragment.base.rect(),
+                cumulative_content_rect_calculation,
+            )),
             Fragment::Text(_) |
             Fragment::AbsoluteOrFixedPositionedPlaceholder(_) |
             Fragment::Image(_) |
@@ -349,12 +385,11 @@ impl Fragment {
 
     pub(crate) fn find<T>(
         &self,
-        manager: &ContainingBlockManager<PhysicalRect<Au>>,
+        parent_content_rect: &PhysicalRect<Au>,
         level: usize,
         process_func: &mut impl FnMut(&Fragment, usize, &PhysicalRect<Au>) -> Option<T>,
     ) -> Option<T> {
-        let containing_block = manager.get_containing_block_for_fragment(self);
-        if let Some(result) = process_func(self, level, containing_block) {
+        if let Some(result) = process_func(self, level, parent_content_rect) {
             return Some(result);
         }
 
@@ -362,43 +397,24 @@ impl Fragment {
             Fragment::LayoutRoot(layout_root_fragment) => {
                 layout_root_fragment
                     .inner()
-                    .find(manager, level, process_func)
+                    .find(parent_content_rect, level, process_func)
             },
             Fragment::Box(fragment) | Fragment::Float(fragment) => {
-                let style = fragment.style();
-                let content_rect = fragment
+                let content_rect_for_descendants = fragment
                     .content_rect()
-                    .translate(containing_block.origin.to_vector());
-                let padding_rect = fragment
-                    .padding_rect()
-                    .translate(containing_block.origin.to_vector());
-                let new_manager = if style
-                    .establishes_containing_block_for_all_descendants(fragment.base.flags)
-                {
-                    manager.new_for_absolute_and_fixed_descendants(&content_rect, &padding_rect)
-                } else if style
-                    .establishes_containing_block_for_absolute_descendants(fragment.base.flags)
-                {
-                    manager.new_for_absolute_descendants(&content_rect, &padding_rect)
-                } else {
-                    manager.new_for_non_absolute_descendants(&content_rect)
-                };
-
-                fragment
-                    .children
-                    .iter()
-                    .find_map(|child| child.find(&new_manager, level + 1, process_func))
+                    .translate(parent_content_rect.origin.to_vector());
+                fragment.children.iter().find_map(|child| {
+                    child.find(&content_rect_for_descendants, level + 1, process_func)
+                })
             },
             Fragment::Positioning(fragment) => {
-                let content_rect = fragment
+                let content_rect_for_descendants = fragment
                     .base
                     .rect()
-                    .translate(containing_block.origin.to_vector());
-                let new_manager = manager.new_for_non_absolute_descendants(&content_rect);
-                fragment
-                    .children
-                    .iter()
-                    .find_map(|child| child.find(&new_manager, level + 1, process_func))
+                    .translate(parent_content_rect.origin.to_vector());
+                fragment.children.iter().find_map(|child| {
+                    child.find(&content_rect_for_descendants, level + 1, process_func)
+                })
             },
             _ => None,
         }
@@ -436,6 +452,18 @@ impl Fragment {
             },
             _ => None,
         }
+    }
+
+    pub(crate) fn is_box_fragment(&self, box_fragment: &BoxFragment) -> bool {
+        self.retrieve_box_fragment()
+            .is_some_and(|this_box_fragment| std::ptr::eq(&**this_box_fragment, box_fragment))
+    }
+
+    pub(crate) fn spatial_tree_node(&self) -> Option<ScrollTreeNodeId> {
+        if let Fragment::Positioning(positioning_fragment) = self {
+            return positioning_fragment.spatial_tree_node.get();
+        };
+        self.retrieve_box_fragment()?.spatial_tree_node()
     }
 }
 
@@ -542,11 +570,50 @@ impl TextFragment {
                     return Some(current_character);
                 }
                 current_offset += advance;
-                current_character += Utf32CodeUnits(glyph.character_count());
+                current_character += glyph.character_count();
             }
         }
 
         Some(current_character)
+    }
+
+    fn scrollable_overflow_for_parent(&self) -> PhysicalRect<Au> {
+        let rect = self.base.rect();
+        let mut hanging_advance = Au::zero();
+        for slice in self.glyphs.iter().rev() {
+            hanging_advance += slice.hangable_advance();
+            if slice.has_non_hangable_non_removable_content() {
+                break;
+            }
+        }
+
+        let writing_mode = self.writing_mode();
+        let size = LogicalVec2::from_physical_size(&rect.size, writing_mode);
+        LogicalRect {
+            start_corner: LogicalVec2::zero(),
+            size: LogicalVec2 {
+                inline: size.inline - hanging_advance,
+                block: size.block,
+            },
+        }
+        .as_physical(writing_mode, size)
+        .translate(rect.origin.to_vector())
+    }
+
+    fn writing_mode(&self) -> WritingMode {
+        let mut writing_mode = self.style().writing_mode;
+        let is_rtl = self
+            .glyphs
+            .first()
+            .is_some_and(|shaped_text| shaped_text.is_rtl());
+
+        // If the directionality of the run is different from the parent writing mode then,
+        // invert the RTL-related bits.
+        if is_rtl == writing_mode.is_bidi_ltr() {
+            writing_mode ^= WritingMode::RTL | WritingMode::INLINE_REVERSED;
+        }
+
+        writing_mode
     }
 }
 
@@ -626,7 +693,7 @@ impl CollapsedMargin {
 /// some queries might need them beforehand. If the query is executed before stacking
 /// context tree construction, a quick traversal is performed to calculate them for
 /// the purpose of the query.
-pub(crate) enum ContainingBlockCalculation<'a> {
+pub(crate) enum CumulativeContentRectCalculation<'a> {
     /// This token variant is for the purpose of a layout query. In this case, if stacking
     /// context tree construction has not yet taken place, a cumulative containing block
     /// calculation traversal will be performed.
@@ -639,7 +706,7 @@ pub(crate) enum ContainingBlockCalculation<'a> {
     AlreadyDoneWithStackingContextTree,
 }
 
-impl ContainingBlockCalculation<'_> {
+impl CumulativeContentRectCalculation<'_> {
     pub(crate) fn ensure(&self) {
         match self {
             Self::Lazy { layout_thread } => layout_thread.ensure_containing_block_calculation(),
@@ -648,8 +715,107 @@ impl ContainingBlockCalculation<'_> {
     }
 }
 
-impl<'a> From<&'a LayoutThread> for ContainingBlockCalculation<'a> {
+impl<'a> From<&'a LayoutThread> for CumulativeContentRectCalculation<'a> {
     fn from(layout_thread: &'a LayoutThread) -> Self {
         Self::Lazy { layout_thread }
+    }
+}
+
+/// A temporary data structure to contain fragments that are meant to be
+/// children of another fragment.
+#[derive(Clone, MallocSizeOf)]
+pub(crate) enum FragmentChildren {
+    PhysicalDeprecated(Vec<Fragment>),
+    Logical(Vec<FragmentAndLogicalRect>),
+}
+
+impl Default for FragmentChildren {
+    fn default() -> Self {
+        Self::Logical(Default::default())
+    }
+}
+
+impl FragmentChildren {
+    pub(crate) fn fragments(&self) -> impl Iterator<Item = &Fragment> {
+        match self {
+            FragmentChildren::PhysicalDeprecated(fragments) => Either::Left(fragments.iter()),
+            FragmentChildren::Logical(fragment_and_logical_rects) => Either::Right(
+                fragment_and_logical_rects
+                    .iter()
+                    .map(|fragment_and_logical_rect| &fragment_and_logical_rect.fragment),
+            ),
+        }
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        match self {
+            FragmentChildren::PhysicalDeprecated(fragments) => fragments.is_empty(),
+            FragmentChildren::Logical(fragment_and_logical_rects) => {
+                fragment_and_logical_rects.is_empty()
+            },
+        }
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        match self {
+            FragmentChildren::PhysicalDeprecated(fragments) => fragments.len(),
+            FragmentChildren::Logical(fragment_and_logical_rects) => {
+                fragment_and_logical_rects.len()
+            },
+        }
+    }
+
+    pub(crate) fn into_physical_fragments(
+        self,
+        writing_mode: WritingMode,
+        container_size: LogicalVec2<Au>,
+    ) -> Vec<Fragment> {
+        match self {
+            FragmentChildren::PhysicalDeprecated(fragments) => fragments,
+            FragmentChildren::Logical(fragment_and_logical_rects) => fragment_and_logical_rects
+                .into_iter()
+                .map(|fragment_and_logical_rect| {
+                    fragment_and_logical_rect.fragment.set_rect(
+                        fragment_and_logical_rect
+                            .logical_rect
+                            .as_physical(writing_mode, container_size),
+                    );
+                    fragment_and_logical_rect.fragment
+                })
+                .collect(),
+        }
+    }
+
+    pub(crate) fn append(
+        &mut self,
+        mut other: Self,
+        writing_mode: WritingMode,
+        container_size: LogicalVec2<Au>,
+    ) {
+        match (self, &mut other) {
+            (Self::PhysicalDeprecated(fragments), _) => {
+                fragments.append(&mut other.into_physical_fragments(writing_mode, container_size))
+            },
+            (Self::Logical(fragments), Self::PhysicalDeprecated(other_fragments)) => {
+                // FIXME: This is wrong. The calculated logical rectangle here might be incorrect,
+                // but this is a graceful degradation of behavior until `PhysicalDeprecated` is
+                // removed entirely.
+                fragments.extend(other_fragments.drain(..).map(|fragment| {
+                    let logical_rect = fragment
+                        .base()
+                        .map(|base| {
+                            LogicalRect::from_physical(base.rect(), writing_mode, container_size)
+                        })
+                        .unwrap_or_else(LogicalRect::zero);
+                    FragmentAndLogicalRect {
+                        fragment,
+                        logical_rect,
+                    }
+                }));
+            },
+            (Self::Logical(fragments), Self::Logical(other_fragments)) => {
+                fragments.append(other_fragments)
+            },
+        }
     }
 }

@@ -2,7 +2,9 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
+use std::cell::OnceCell;
 use std::marker::PhantomData;
+use std::sync::atomic::Ordering;
 
 use atomic_refcell::{AtomicRef, AtomicRefCell, AtomicRefMut};
 use layout_api::{
@@ -12,7 +14,7 @@ use layout_api::{
 use malloc_size_of_derive::MallocSizeOf;
 use script::layout_dom::ServoLayoutNode;
 use servo_arc::Arc as ServoArc;
-use servo_base::text::{RangeAny, Utf32CodeUnits};
+use servo_base::text::{AssumeUnder4GB, RangeAny, Utf32CodeUnits};
 use smallvec::SmallVec;
 use style::context::SharedStyleContext;
 use style::properties::ComputedValues;
@@ -20,13 +22,17 @@ use style::selector_parser::PseudoElement;
 use style::values::specified::box_::DisplayOutside as StyloDisplayOutside;
 use web_atoms::{local_name, ns};
 
+use crate::BoxTree;
 use crate::cell::{ArcRefCell, WeakRefCell};
 use crate::context::LayoutContext;
 use crate::dom_traversal::{Contents, NodeAndStyleInfo};
 use crate::flexbox::FlexLevelBox;
 use crate::flow::inline::text_run::TextRun;
-use crate::flow::inline::{InlineItem, SharedInlineStyles, WeakInlineItem};
+use crate::flow::inline::{
+    InlineFormattingContext, InlineItem, SharedInlineStyles, WeakInlineItem,
+};
 use crate::flow::{BlockLevelBox, BlockLevelCreator};
+use crate::formatting_contexts::IndependentFormattingContext;
 use crate::fragment_tree::{Fragment, FragmentFlags};
 use crate::geom::PhysicalSize;
 use crate::layout_box_base::LayoutBoxBase;
@@ -35,7 +41,7 @@ use crate::style_ext::{
     ComputedValuesExt, Display, DisplayGeneratingBox, DisplayLayoutInternal, DisplayOutside,
 };
 use crate::table::{TableLevelBox, WeakTableLevelBox};
-use crate::taffy::TaffyItemBox;
+use crate::taffy::{TaffyItemBox, TaffyItemBoxInner};
 
 #[derive(MallocSizeOf)]
 pub struct PseudoLayoutData {
@@ -89,7 +95,17 @@ impl InnerDOMLayoutData {
 
     fn repair_style(&self, node: &ServoLayoutNode, context: &SharedStyleContext) {
         if let Some(layout_object) = &*self.self_box.borrow() {
-            layout_object.repair_style(context, node, &node.style(context));
+            let new_style = node.style(context);
+            let style = if node.as_element().is_some_and(|element| element.is_root()) {
+                BoxTree::style_with_writing_mode_source_style(
+                    new_style,
+                    &BoxTree::writing_mode_source_style(context, *node),
+                )
+            } else {
+                new_style
+            };
+
+            layout_object.repair_style(context, node, &style);
         }
 
         for pseudo_layout_data in self.pseudo_boxes.iter() {
@@ -103,10 +119,11 @@ impl InnerDOMLayoutData {
         }
     }
 
-    fn with_layout_box_base(&self, callback: impl FnOnce(&LayoutBoxBase)) {
-        if let Some(data) = self.self_box.borrow().as_ref() {
-            data.with_base(callback);
-        }
+    fn with_layout_box_base<T>(&self, callback: impl FnOnce(&LayoutBoxBase) -> T) -> Option<T> {
+        self.self_box
+            .borrow()
+            .as_ref()
+            .and_then(|data| data.with_base(callback))
     }
 
     fn with_layout_box_base_including_pseudos(&self, mut callback: impl FnMut(&LayoutBoxBase)) {
@@ -130,9 +147,21 @@ pub(super) enum LayoutBox {
     TableLevelBox(TableLevelBox),
     TaffyItemBox(ArcRefCell<TaffyItemBox>),
     Text(ArcRefCell<TextRun>),
+    Widget(ArcRefCell<IndependentFormattingContext>),
 }
 
 impl LayoutBox {
+    fn parent(&self) -> Option<LayoutBox> {
+        match self {
+            LayoutBox::Text(text_run) => text_run
+                .borrow()
+                .parent_box
+                .as_ref()
+                .and_then(WeakLayoutBox::upgrade),
+            _ => self.with_base(|base| base.parent_box()).flatten(),
+        }
+    }
+
     pub(crate) fn with_base<T>(&self, callback: impl FnOnce(&LayoutBoxBase) -> T) -> Option<T> {
         Some(match self {
             LayoutBox::DisplayContents(..) | LayoutBox::Text(..) => return None,
@@ -141,6 +170,7 @@ impl LayoutBox {
             LayoutBox::FlexLevel(flex_level_box) => flex_level_box.borrow().with_base(callback),
             LayoutBox::TaffyItemBox(taffy_item_box) => taffy_item_box.borrow().with_base(callback),
             LayoutBox::TableLevelBox(table_box) => table_box.with_base(callback),
+            LayoutBox::Widget(widget_context) => callback(&widget_context.borrow().base),
         })
     }
 
@@ -161,6 +191,7 @@ impl LayoutBox {
                 taffy_item_box.borrow_mut().with_base_mut(callback)
             },
             LayoutBox::TableLevelBox(table_box) => table_box.with_base_mut(callback),
+            LayoutBox::Widget(widget_context) => callback(&mut widget_context.borrow_mut().base),
         })
     }
 
@@ -195,6 +226,9 @@ impl LayoutBox {
             LayoutBox::Text(..) => {
                 // There is nothing to update in this case.
             },
+            LayoutBox::Widget(widget_context) => widget_context
+                .borrow_mut()
+                .repair_style(context, node, new_style),
         }
     }
 
@@ -216,6 +250,9 @@ impl LayoutBox {
             Self::Text(..) => {
                 // This kind of box cannot have children, so no need to do anything.
             },
+            LayoutBox::Widget(widget_context) => {
+                widget_context.borrow().attached_to_tree(layout_box)
+            },
         }
     }
 
@@ -236,7 +273,93 @@ impl LayoutBox {
                 WeakLayoutBox::TaffyItemBox(taffy_item_box.downgrade())
             },
             Self::Text(text_run) => WeakLayoutBox::Text(text_run.downgrade()),
+            Self::Widget(widget_context) => WeakLayoutBox::Widget(widget_context.downgrade()),
         }
+    }
+
+    fn with_independent_formatting_context<T>(
+        &self,
+        callback: impl FnOnce(&IndependentFormattingContext) -> Option<T>,
+    ) -> Option<T> {
+        match self {
+            LayoutBox::DisplayContents(..) => None,
+            LayoutBox::BlockLevel(block_level_box) => match &*block_level_box.borrow() {
+                BlockLevelBox::Independent(independent_formatting_context) => {
+                    callback(independent_formatting_context)
+                },
+                BlockLevelBox::OutOfFlowAbsolutelyPositionedBox(positioned) => {
+                    callback(&positioned.borrow().context)
+                },
+                BlockLevelBox::OutOfFlowFloatBox(float) => callback(&float.contents),
+                BlockLevelBox::OutsideMarker(..) |
+                BlockLevelBox::SameFormattingContextBlock(..) => None,
+            },
+            LayoutBox::InlineLevel(inline_item) => match inline_item {
+                InlineItem::Atomic(atomic_item, ..) => callback(&atomic_item.borrow()),
+                InlineItem::OutOfFlowFloatBox(float) => callback(&float.borrow().contents),
+                InlineItem::OutOfFlowAbsolutelyPositionedBox(absolute, ..) => {
+                    callback(&absolute.borrow().context)
+                },
+                InlineItem::StartInlineBox(..) |
+                InlineItem::EndInlineBox(..) |
+                InlineItem::TextRun(..) |
+                InlineItem::BlockLevel(..) => None,
+            },
+            LayoutBox::FlexLevel(flex_level_box) => match &*flex_level_box.borrow() {
+                FlexLevelBox::FlexItem(flex_item) => {
+                    callback(&flex_item.independent_formatting_context)
+                },
+                FlexLevelBox::OutOfFlowAbsolutelyPositionedBox(absolute) => {
+                    callback(&absolute.borrow().context)
+                },
+            },
+            LayoutBox::TableLevelBox(table_level_box) => match table_level_box {
+                TableLevelBox::Caption(caption) => callback(&caption.borrow().context),
+                TableLevelBox::Cell(cell) => callback(&cell.borrow().context),
+                TableLevelBox::TrackGroup(..) | TableLevelBox::Track(..) => None,
+            },
+            LayoutBox::TaffyItemBox(taffy_item_box) => {
+                match &taffy_item_box.borrow().taffy_level_box {
+                    TaffyItemBoxInner::InFlowBox(independent_formatting_context) => {
+                        callback(independent_formatting_context)
+                    },
+                    TaffyItemBoxInner::OutOfFlowAbsolutelyPositionedBox(absolute) => {
+                        callback(&absolute.borrow().context)
+                    },
+                }
+            },
+            LayoutBox::Text(..) => None,
+            LayoutBox::Widget(widget_context) => callback(&widget_context.borrow()),
+        }
+    }
+
+    pub(crate) fn with_inline_formatting_context<T>(
+        &self,
+        callback: impl FnOnce(&InlineFormattingContext) -> Option<T>,
+    ) -> Option<T> {
+        if let LayoutBox::BlockLevel(block_level_box) = self &&
+            let BlockLevelBox::SameFormattingContextBlock(same_formatting_context_block) =
+                &*block_level_box.borrow() &&
+            let Some(inline_formatting_context) = same_formatting_context_block
+                .contents
+                .inline_formatting_context()
+        {
+            return callback(inline_formatting_context);
+        }
+
+        self.with_independent_formatting_context(|independent_formatting_context| {
+            independent_formatting_context
+                .inline_formatting_context()
+                .and_then(callback)
+        })
+    }
+
+    pub(crate) fn layout_box_for_containing_inline_formatting_context(&self) -> Option<LayoutBox> {
+        let mut current = self.parent()?;
+        while let LayoutBox::InlineLevel(InlineItem::StartInlineBox(..)) = current {
+            current = current.parent()?;
+        }
+        Some(current)
     }
 }
 
@@ -249,6 +372,7 @@ pub(super) enum WeakLayoutBox {
     TableLevelBox(WeakTableLevelBox),
     TaffyItemBox(WeakRefCell<TaffyItemBox>),
     Text(WeakRefCell<TextRun>),
+    Widget(WeakRefCell<IndependentFormattingContext>),
 }
 
 impl WeakLayoutBox {
@@ -267,6 +391,7 @@ impl WeakLayoutBox {
                 LayoutBox::TaffyItemBox(taffy_item_box.upgrade()?)
             },
             Self::Text(text_run) => LayoutBox::Text(text_run.upgrade()?),
+            Self::Widget(widget_context) => LayoutBox::Widget(widget_context.upgrade()?),
         })
     }
 }
@@ -284,7 +409,11 @@ impl GenericLayoutDataTrait for DOMLayoutData {
         self
     }
 
-    fn set_text_run_selection(&self, new_range: Option<RangeAny<Utf32CodeUnits>>) -> bool {
+    fn set_text_run_selection(
+        &self,
+        new_range: Option<RangeAny<Utf32CodeUnits>>,
+        new_paints_caret: bool,
+    ) -> bool {
         let inner = self.0.borrow();
         // When `::first-letter` is used, one DOM text node can generate multiple text runs
         // so there isn’t a single place to set the new range
@@ -297,10 +426,48 @@ impl GenericLayoutDataTrait for DOMLayoutData {
         }
         if let Some(LayoutBox::Text(text_run)) = &*inner.self_box.borrow() {
             *text_run.borrow().run_data.selection.borrow_mut() = new_range;
+            text_run
+                .borrow()
+                .run_data
+                .paints_caret
+                .store(new_paints_caret, Ordering::Relaxed);
             true
         } else {
             false
         }
+    }
+
+    fn set_element_selection(&self, selected: bool) -> bool {
+        let inner = self.0.borrow();
+        let inner_box = inner.self_box.borrow();
+        let Some(inner_box) = &*inner_box else {
+            return false;
+        };
+        inner_box
+            .with_independent_formatting_context(|independent_formatting_context| {
+                Some(independent_formatting_context.set_selection(selected))
+            })
+            .unwrap_or(false)
+    }
+
+    fn rendered_text(&self, range: RangeAny<Utf32CodeUnits>) -> Option<String> {
+        let inner = self.0.borrow();
+        let self_box = inner.self_box.borrow();
+
+        let Some(LayoutBox::Text(text_run)) = self_box.as_ref() else {
+            return None;
+        };
+
+        let text_run = text_run.borrow();
+        let range_in_text_run = text_run.run_data.map_dom_range_to_transformed_range(range);
+        let start_in_ifc = text_run.run_data.character_range_in_ifc_text.start;
+
+        let string = text_run.run_data.text_content.get()?;
+        let start =
+            (range_in_text_run.start + start_in_ifc).to_utf8_code_units_in(AssumeUnder4GB, string);
+        let end =
+            (range_in_text_run.end + start_in_ifc).to_utf8_code_units_in(AssumeUnder4GB, string);
+        Some(string[start.0 as usize..end.0 as usize].to_owned())
     }
 }
 
@@ -349,6 +516,10 @@ impl Drop for BoxSlot<'_> {
 }
 
 pub(crate) trait NodeExt<'dom> {
+    /// Return true if the element is an HTML `<br>` element.
+    fn is_html_br_element(&self) -> bool;
+    /// Return true if the element is an HTML `<wbr>` element.
+    fn is_html_wbr_element(&self) -> bool;
     /// Returns the relevant data wrapping into respective struct and its size in pixels.
     fn as_image(&self) -> Option<(ImageInfo, PhysicalSize<f64>)>;
     fn as_canvas(&self) -> Option<(CanvasInfo, PhysicalSize<f64>)>;
@@ -387,7 +558,9 @@ pub(crate) trait NodeExt<'dom> {
 
     /// Run `callback` on the fragments without cloning them. Returns `None` if the node has no box.
     fn with_fragments<T>(&self, callback: impl FnOnce(&[Fragment]) -> T) -> Option<T>;
-    fn with_layout_box_base(&self, callback: impl FnMut(&LayoutBoxBase));
+    /// Run `callback` on the `LayoutBoxBase` of this node's box or the box of its pseudo-element.
+    /// Returns `None` if there is no such box.
+    fn with_layout_box_base<T>(&self, callback: impl FnOnce(&LayoutBoxBase) -> T) -> Option<T>;
     fn with_layout_box_base_including_pseudos(&self, callback: impl FnMut(&LayoutBoxBase));
 
     fn repair_style(&self, context: &SharedStyleContext);
@@ -421,6 +594,16 @@ pub(crate) trait NodeExt<'dom> {
 }
 
 impl<'dom> NodeExt<'dom> for ServoLayoutNode<'dom> {
+    fn is_html_br_element(&self) -> bool {
+        self.as_html_element()
+            .is_some_and(|element| element.local_name() == &local_name!("br"))
+    }
+
+    fn is_html_wbr_element(&self) -> bool {
+        self.as_html_element()
+            .is_some_and(|element| element.local_name() == &local_name!("wbr"))
+    }
+
     fn as_image(&self) -> Option<(ImageInfo, PhysicalSize<f64>)> {
         let (resource, metadata) = self.image_data()?;
         let width = metadata.map(|metadata| metadata.width).unwrap_or_default();
@@ -433,6 +616,7 @@ impl<'dom> NodeExt<'dom> for ServoLayoutNode<'dom> {
         }
         Some((
             ImageInfo {
+                load_time: self.load_time(),
                 image: resource,
                 showing_broken_image_icon: self.showing_broken_image_icon(),
                 url: self.image_url(),
@@ -456,7 +640,7 @@ impl<'dom> NodeExt<'dom> for ServoLayoutNode<'dom> {
         Some((
             VideoInfo {
                 image_key: data.current_frame.map(|frame| frame.image_key),
-                poster_url: data.poster_url,
+                poster_or_src_url: data.poster_or_src_url,
             },
             natural_size,
         ))
@@ -602,10 +786,24 @@ impl<'dom> NodeExt<'dom> for ServoLayoutNode<'dom> {
         }
     }
 
-    fn with_layout_box_base(&self, callback: impl FnMut(&LayoutBoxBase)) {
-        if let Some(inner_layout_data) = self.inner_layout_data() {
-            inner_layout_data.with_layout_box_base(callback);
-        }
+    fn with_layout_box_base<T>(&self, callback: impl FnOnce(&LayoutBoxBase) -> T) -> Option<T> {
+        let pseudo_element_chain = self.pseudo_element_chain();
+        let inner_layout_data = self.inner_layout_data()?;
+        let Some(primary) = pseudo_element_chain.primary else {
+            return inner_layout_data.with_layout_box_base(callback);
+        };
+
+        let primary_data = inner_layout_data.pseudo_layout_data(primary)?;
+        drop(inner_layout_data);
+        let Some(secondary) = pseudo_element_chain.secondary else {
+            return primary_data.borrow().with_layout_box_base(callback);
+        };
+
+        primary_data
+            .borrow()
+            .pseudo_layout_data(secondary)?
+            .borrow()
+            .with_layout_box_base(callback)
     }
 
     fn with_layout_box_base_including_pseudos(&self, callback: impl FnMut(&LayoutBoxBase)) {
@@ -674,6 +872,7 @@ impl<'dom> NodeExt<'dom> for ServoLayoutNode<'dom> {
             ),
             LayoutBox::TaffyItemBox(..) => true,
             LayoutBox::Text(..) => unreachable!("An element should never be a text node"),
+            LayoutBox::Widget(..) => unreachable!("Widgets are always pseudo-elements."),
         }
     }
 
@@ -708,23 +907,30 @@ impl<'dom> NodeExt<'dom> for ServoLayoutNode<'dom> {
         let Display::GeneratingBox(display) = box_style.display.into() else {
             return false;
         };
-        let contents = || {
-            assert!(
-                self.pseudo_element_chain().is_empty(),
-                "Shouldn't try to rebuild box tree from a pseudo-element"
-            );
-            Contents::for_element(info.node, layout_context)
-        };
+        assert!(
+            self.pseudo_element_chain().is_empty(),
+            "Shouldn't try to rebuild box tree from a pseudo-element"
+        );
+        // TODO: Use a `LazyCell` once `LazyCell::into_inner()` stabilizes.
+        let contents = OnceCell::new();
+        let compute_contents = || Contents::for_element(info.node, layout_context);
+        let display =
+            || display.used_value_for_contents(contents.get_or_init(compute_contents), &info);
         match layout_box {
             LayoutBox::DisplayContents(..) => false,
             LayoutBox::BlockLevel(block_level) => {
                 let mut block_level = block_level.borrow_mut();
                 match &mut *block_level {
                     BlockLevelBox::Independent(independent_formatting_context) => {
+                        if box_style.position.is_absolutely_positioned() ||
+                            box_style.float.is_floating()
+                        {
+                            return false;
+                        }
                         let DisplayGeneratingBox::OutsideInside {
                             outside: DisplayOutside::Block,
                             inside: display_inside,
-                        } = display
+                        } = display()
                         else {
                             return false;
                         };
@@ -732,7 +938,7 @@ impl<'dom> NodeExt<'dom> for ServoLayoutNode<'dom> {
                             BlockLevelCreator::new_for_inflow_block_level_element(
                                 &info,
                                 display_inside,
-                                contents(),
+                                contents.into_inner().unwrap_or_else(compute_contents),
                                 independent_formatting_context.propagated_data,
                             ),
                             BlockLevelCreator::Independent { .. }
@@ -743,7 +949,7 @@ impl<'dom> NodeExt<'dom> for ServoLayoutNode<'dom> {
                         true
                     },
                     BlockLevelBox::OutOfFlowFloatBox(float_box) => {
-                        if !info.style.clone_float().is_floating() {
+                        if !info.style.get_float().is_floating() {
                             return false;
                         }
                         float_box.contents.rebuild(layout_context, &info);
@@ -754,7 +960,7 @@ impl<'dom> NodeExt<'dom> for ServoLayoutNode<'dom> {
                         // original display was inline-level, then the box needs to be handled as
                         // an inline-level in order to compute the static position correctly.
                         // See `BlockContainerBuilder::handle_absolutely_positioned_element()`.
-                        if !info.style.clone_position().is_absolutely_positioned() ||
+                        if !info.style.get_box().position.is_absolutely_positioned() ||
                             box_style.original_display.outside() != StyloDisplayOutside::Block
                         {
                             return false;
@@ -770,7 +976,7 @@ impl<'dom> NodeExt<'dom> for ServoLayoutNode<'dom> {
             },
             LayoutBox::InlineLevel(inline_level) => match inline_level {
                 InlineItem::OutOfFlowAbsolutelyPositionedBox(positioned_box, ..) => {
-                    if !info.style.clone_position().is_absolutely_positioned() {
+                    if !info.style.get_box().position.is_absolutely_positioned() {
                         return false;
                     }
                     positioned_box
@@ -780,7 +986,7 @@ impl<'dom> NodeExt<'dom> for ServoLayoutNode<'dom> {
                     true
                 },
                 InlineItem::Atomic(atomic_box, _, _) => {
-                    let flags = match contents() {
+                    let flags = match contents.get_or_init(compute_contents) {
                         Contents::NonReplaced(_) => FragmentFlags::empty(),
                         Contents::Replaced(_) => FragmentFlags::IS_REPLACED,
                         Contents::Widget(_) => FragmentFlags::IS_WIDGET,
@@ -797,8 +1003,8 @@ impl<'dom> NodeExt<'dom> for ServoLayoutNode<'dom> {
                 let mut flex_level_box = flex_level_box.borrow_mut();
                 match &mut *flex_level_box {
                     FlexLevelBox::FlexItem(flex_item_box) => {
-                        if info.style.clone_position().is_absolutely_positioned() ||
-                            flex_item_box.style().clone_order() != info.style.clone_order()
+                        if info.style.get_box().position.is_absolutely_positioned() ||
+                            !flex_item_box.style().order_equals(&info.style)
                         {
                             return false;
                         }
@@ -807,7 +1013,7 @@ impl<'dom> NodeExt<'dom> for ServoLayoutNode<'dom> {
                             .rebuild(layout_context, &info)
                     },
                     FlexLevelBox::OutOfFlowAbsolutelyPositionedBox(positioned_box) => {
-                        if !info.style.clone_position().is_absolutely_positioned() {
+                        if !info.style.get_box().position.is_absolutely_positioned() {
                             return false;
                         }
                         positioned_box
@@ -820,7 +1026,7 @@ impl<'dom> NodeExt<'dom> for ServoLayoutNode<'dom> {
             },
             LayoutBox::TableLevelBox(table_level_box) => match table_level_box {
                 TableLevelBox::Caption(caption) => {
-                    if display !=
+                    if display() !=
                         DisplayGeneratingBox::LayoutInternal(DisplayLayoutInternal::TableCaption)
                     {
                         return false;
@@ -829,7 +1035,7 @@ impl<'dom> NodeExt<'dom> for ServoLayoutNode<'dom> {
                     true
                 },
                 TableLevelBox::Cell(table_cell) => {
-                    if display !=
+                    if display() !=
                         DisplayGeneratingBox::LayoutInternal(DisplayLayoutInternal::TableCell)
                     {
                         return false;
@@ -844,6 +1050,7 @@ impl<'dom> NodeExt<'dom> for ServoLayoutNode<'dom> {
             },
             LayoutBox::TaffyItemBox(..) => false,
             LayoutBox::Text(..) => unreachable!("An element should never be a text node"),
+            LayoutBox::Widget(..) => unreachable!("Widgets are always pseudo-elements."),
         }
     }
 
@@ -853,7 +1060,8 @@ impl<'dom> NodeExt<'dom> for ServoLayoutNode<'dom> {
                 .element_data()
                 .styles
                 .primary()
-                .clone_position()
+                .get_box()
+                .position
                 .is_absolutely_positioned()
         })
     }

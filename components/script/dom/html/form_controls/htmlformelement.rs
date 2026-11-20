@@ -20,6 +20,7 @@ use rustc_hash::FxBuildHasher;
 use script_bindings::cell::DomRefCell;
 use script_bindings::codegen::GenericBindings::DocumentFragmentBinding::DocumentFragmentMethods;
 use script_bindings::dom::UnrootedDom;
+use script_bindings::domstring::TracedDOMString;
 use script_bindings::match_domstring_ascii;
 use script_bindings::reflector::DomObject;
 use servo_constellation_traits::{LoadData, LoadOrigin, NavigationHistoryBehavior};
@@ -36,7 +37,7 @@ use crate::dom::bindings::codegen::Bindings::HTMLElementBinding::HTMLElementMeth
 use crate::dom::bindings::codegen::Bindings::HTMLFormControlsCollectionBinding::HTMLFormControlsCollectionMethods;
 use crate::dom::bindings::codegen::Bindings::HTMLFormElementBinding::HTMLFormElementMethods;
 use crate::dom::bindings::codegen::Bindings::HTMLInputElementBinding::HTMLInputElementMethods;
-use crate::dom::bindings::codegen::Bindings::HTMLOrSVGElementBinding::FocusOptions;
+use crate::dom::bindings::codegen::Bindings::HTMLOrSVGOrMathMLElementBinding::FocusOptions;
 use crate::dom::bindings::codegen::Bindings::HTMLTextAreaElementBinding::HTMLTextAreaElementMethods;
 use crate::dom::bindings::codegen::Bindings::NodeBinding::{NodeConstants, NodeMethods};
 use crate::dom::bindings::codegen::Bindings::NodeListBinding::NodeListMethods;
@@ -54,7 +55,7 @@ use crate::dom::customelementregistry::CallbackReaction;
 use crate::dom::document::Document;
 use crate::dom::domtokenlist::DOMTokenList;
 use crate::dom::element::attributes::storage::AttrRef;
-use crate::dom::element::{AttributeMutation, AttributeMutationReason, Element};
+use crate::dom::element::{AttributeMutation, Element};
 use crate::dom::event::{Event, EventBubbles, EventCancelable};
 use crate::dom::eventtarget::EventTarget;
 use crate::dom::file::File;
@@ -200,7 +201,7 @@ impl HTMLFormElement {
             .iter()
             .filter(|n| HTMLFormElement::filter_for_radio_list(mode, n, name))
             .nth(index as usize)
-            .map(|n| UnrootedDom::upcast(UnrootedDom::from_dom(n.clone(), no_gc)))
+            .map(|node| UnrootedDom::upcast(node.as_unrooted(no_gc)))
     }
 
     pub(crate) fn count_for_radio_list(&self, mode: RadioListMode, name: &Atom) -> u32 {
@@ -209,6 +210,44 @@ impl HTMLFormElement {
             .iter()
             .filter(|n| HTMLFormElement::filter_for_radio_list(mode, n, name))
             .count() as u32
+    }
+
+    /// <https://html.spec.whatwg.org/multipage/#default-button>
+    pub(crate) fn default_button(&self) -> Option<DomRoot<Element>> {
+        // > A form element's default button is the first submit button in tree order whose form owner
+        // > is that form element. `controls` holds exactly the elements owned by this form, kept in
+        // > tree order.
+        self.controls
+            .borrow()
+            .iter()
+            .find(|control| {
+                control
+                    .downcast::<HTMLInputElement>()
+                    .is_some_and(HTMLInputElement::is_submit_button) ||
+                    control
+                        .downcast::<HTMLButtonElement>()
+                        .is_some_and(HTMLButtonElement::is_submit_button)
+            })
+            .map(|control| control.as_rooted())
+    }
+
+    pub(crate) fn invalidate_default_button(&self, no_gc: &NoGC) {
+        let default_button = self.default_button();
+        for control in self.controls.borrow().iter() {
+            Self::update_control_default_state(
+                no_gc,
+                control,
+                default_button.as_deref() == Some(&**control),
+            );
+        }
+    }
+
+    fn update_control_default_state(no_gc: &NoGC, control: &Element, is_default_button: bool) {
+        if let Some(button) = control.downcast::<HTMLButtonElement>() {
+            button.update_default_state(is_default_button, no_gc);
+        } else if let Some(input) = control.downcast::<HTMLInputElement>() {
+            input.update_default_state(is_default_button, no_gc);
+        }
     }
 }
 
@@ -469,7 +508,7 @@ impl HTMLFormElementMethods<crate::DomTypeHolder> for HTMLFormElement {
             candidates_length = candidates.Length(cx);
         }
 
-        let mut past_names_map = self.past_names_map.borrow_mut();
+        let mut past_names_map = self.past_names_map.safe_borrow_mut(cx.no_gc());
 
         // Step 3
         if candidates_length == 0 {
@@ -527,7 +566,7 @@ impl HTMLFormElementMethods<crate::DomTypeHolder> for HTMLFormElement {
         })
     }
 
-    // https://html.spec.whatwg.org/multipage/#the-form-element:supported-property-names
+    /// <https://html.spec.whatwg.org/multipage/#the-form-element:supported-property-names>
     fn SupportedPropertyNames(&self, no_gc: &NoGC) -> Vec<DOMString> {
         // Step 1
         #[derive(Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -651,7 +690,7 @@ impl HTMLFormElementMethods<crate::DomTypeHolder> for HTMLFormElement {
         let mut names_vec: Vec<DOMString> = Vec::new();
         for elem in sourced_names_vec.iter() {
             if !names_vec.iter().any(|name| *name == *elem.name) {
-                names_vec.push(DOMString::from(&*elem.name));
+                names_vec.push(TracedDOMString::from(elem.name.clone()).root());
             }
         }
 
@@ -715,9 +754,9 @@ impl HTMLFormElement {
             .any(|control| control.is_invalid(cx, false));
 
         self.upcast::<Element>()
-            .set_state(ElementState::VALID, !is_any_invalid);
+            .set_state(cx.no_gc(), ElementState::VALID, !is_any_invalid);
         self.upcast::<Element>()
-            .set_state(ElementState::INVALID, is_any_invalid);
+            .set_state(cx.no_gc(), ElementState::INVALID, is_any_invalid);
     }
 
     /// [Form submission](https://html.spec.whatwg.org/multipage/#concept-form-submit)
@@ -727,12 +766,12 @@ impl HTMLFormElement {
         submit_method_flag: SubmittedFrom,
         submitter: FormSubmitterElement,
     ) {
-        // Step 1
+        // Step 1. If form cannot navigate, then return.
         if self.upcast::<Element>().cannot_navigate() {
             return;
         }
 
-        // Step 2
+        // Step 2. If form's constructing entry list is true, then return.
         if self.constructing_entry_list.get() {
             return;
         }
@@ -747,21 +786,27 @@ impl HTMLFormElement {
         }
 
         let base = doc.base_url();
-        // TODO: Handle browsing contexts (Step 5)
-        // Step 6
+        // Step 5. If submitted from submit() method is false:
         if submit_method_flag == SubmittedFrom::NotFromForm {
-            // Step 6.1
+            // Step 5.1. If form's firing submission events is true, then return.
             if self.firing_submission_events.get() {
                 return;
             }
-            // Step 6.2
+            // Step 5.2. Set form's firing submission events to true.
             self.firing_submission_events.set(true);
-            // Step 6.3
+            // Step 5.3. For each element field in the list of submittable elements
+            // whose form owner is form, set field's user validity to true.
+            self.Elements(cx).set_user_validity_on_all(cx.no_gc());
+            // Step 5.4. If the submitter element's no-validate state is false,
+            // then interactively validate the constraints of form and examine
+            // the result. If the result is negative (i.e., the constraint validation
+            // concluded that there were invalid fields and probably informed the
+            // user of this):
             if !submitter.no_validate(self) && self.interactive_validation(cx).is_err() {
                 self.firing_submission_events.set(false);
                 return;
             }
-            // Step 6.4
+            // Step 5.5
             // spec calls this "submitterButton" but it doesn't have to be a button,
             // just not be the form itself
             let submitter_button = match submitter {
@@ -776,7 +821,7 @@ impl HTMLFormElement {
                 FormSubmitterElement::Button(b) => Some(b.upcast::<HTMLElement>()),
             };
 
-            // Step 6.5
+            // Step 5.6
             let event = SubmitEvent::new(
                 cx,
                 self.global().as_window(),
@@ -788,13 +833,13 @@ impl HTMLFormElement {
             let event = event.upcast::<Event>();
             event.fire(cx, self.upcast::<EventTarget>());
 
-            // Step 6.6
+            // Step 5.7
             self.firing_submission_events.set(false);
-            // Step 6.7
+            // Step 5.8
             if event.DefaultPrevented() {
                 return;
             }
-            // Step 6.8
+            // Step 5.9
             if self.upcast::<Element>().cannot_navigate() {
                 return;
             }
@@ -862,7 +907,7 @@ impl HTMLFormElement {
         // for choosing a navigable given target, form's node navigable, and noopener.
         let Some(chosen) = doc.browsing_context().and_then(|source| {
             source
-                .choose_a_navigable(cx, target.unwrap_or_default(), noopener)
+                .choose_a_navigable(cx, &target.unwrap_or_default(), noopener)
                 .0
         }) else {
             // Step 23. If targetNavigable is null, then return.
@@ -892,6 +937,10 @@ impl HTMLFormElement {
             target_document.get_referrer_policy(),
             Some(target_window.as_global_scope().is_secure_context()),
             Some(target_document.insecure_requests_policy()),
+            target_window
+                .as_global_scope()
+                .upgrade_insecure_navigations_set()
+                .clone(),
             target_document.has_trustworthy_ancestor_origin(),
             target_document.creation_sandboxing_flag_set_considering_parent_iframe(),
         );
@@ -1243,7 +1292,10 @@ impl HTMLFormElement {
         let mut data_set = Vec::new();
         for child in self.controls.borrow().iter() {
             // Step 5.1: The field element is disabled.
-            if child.disabled_state() {
+            if child
+                .downcast::<HTMLElement>()
+                .is_some_and(|html_element| html_element.is_form_element_disabled(cx.no_gc()))
+            {
                 continue;
             }
             let child = child.upcast::<Node>();
@@ -1411,7 +1463,7 @@ impl HTMLFormElement {
         {
             let root = self.upcast::<Element>().root_element();
             let root = root.upcast::<Node>();
-            let mut controls = self.controls.borrow_mut();
+            let mut controls = self.controls.safe_borrow_mut(cx.no_gc());
 
             // https://html.spec.whatwg.org/multipage/#create-an-element-for-the-token
             // associates form control elements with a form before they are bound to the tree.
@@ -1431,7 +1483,7 @@ impl HTMLFormElement {
     fn remove_control<T: ?Sized + FormControl>(&self, cx: &mut JSContext, control: &T) {
         {
             let control = control.to_element();
-            let mut controls = self.controls.borrow_mut();
+            let mut controls = self.controls.safe_borrow_mut(cx.no_gc());
             controls
                 .iter()
                 .position(|c| &**c == control)
@@ -1441,7 +1493,7 @@ impl HTMLFormElement {
             // "If an element listed in a form element's past names map
             // changes form owner, then its entries must be removed
             // from that map."
-            let mut past_names_map = self.past_names_map.borrow_mut();
+            let mut past_names_map = self.past_names_map.safe_borrow_mut(cx.no_gc());
             past_names_map.0.retain(|_k, v| v.0 != control);
         }
         self.update_validity(cx);
@@ -1546,10 +1598,10 @@ pub(crate) struct FormDatum {
 }
 
 impl FormDatum {
-    pub(crate) fn replace_value(&self) -> &DOMString {
+    pub(crate) fn replace_value(&self) -> DOMString {
         match self.value {
-            FormDatumValue::File(ref f) => f.name(),
-            FormDatumValue::String(ref s) => s,
+            FormDatumValue::File(ref f) => f.name().clone().root(),
+            FormDatumValue::String(ref s) => s.clone(),
         }
     }
 }
@@ -1681,7 +1733,7 @@ impl FormSubmitterElement<'_> {
         }
     }
 
-    // https://html.spec.whatwg.org/multipage/#concept-submit-button
+    /// <https://html.spec.whatwg.org/multipage/#concept-submit-button>
     pub(crate) fn is_submit_button(&self) -> bool {
         match *self {
             // https://html.spec.whatwg.org/multipage/#image-button-state-(type=image)
@@ -1693,7 +1745,7 @@ impl FormSubmitterElement<'_> {
         }
     }
 
-    // https://html.spec.whatwg.org/multipage/#form-owner
+    /// <https://html.spec.whatwg.org/multipage/#form-owner>
     pub(crate) fn form_owner(&self) -> Option<DomRoot<HTMLFormElement>> {
         match *self {
             FormSubmitterElement::Button(button_el) => button_el.form_owner(),
@@ -1726,6 +1778,7 @@ pub(crate) trait FormControl: DomObject<ReflectorType = ()> + NodeTraits {
         node.set_flag(NodeFlags::PARSER_ASSOCIATED_FORM_OWNER, true);
         form.add_control(cx, self);
         self.set_form_owner(cx, Some(form));
+        form.invalidate_default_button(cx.no_gc());
     }
 
     /// <https://html.spec.whatwg.org/multipage/#reset-the-form-owner>
@@ -1767,8 +1820,8 @@ pub(crate) trait FormControl: DomObject<ReflectorType = ()> + NodeTraits {
         };
 
         if old_owner != new_owner {
-            if let Some(o) = old_owner {
-                o.remove_control(cx, self);
+            if let Some(ref old_owner) = old_owner {
+                old_owner.remove_control(cx, self);
             }
             if let Some(ref new_owner) = new_owner {
                 new_owner.add_control(cx, self);
@@ -1787,13 +1840,21 @@ pub(crate) trait FormControl: DomObject<ReflectorType = ()> + NodeTraits {
                 )
             }
             self.set_form_owner(cx, new_owner.as_deref());
+
+            if let Some(old_owner) = old_owner {
+                old_owner.invalidate_default_button(cx.no_gc());
+            }
+            match new_owner {
+                Some(new_owner) => new_owner.invalidate_default_button(cx.no_gc()),
+                None => HTMLFormElement::update_control_default_state(cx.no_gc(), elem, false),
+            }
         }
     }
 
     /// <https://html.spec.whatwg.org/multipage/#association-of-controls-and-forms>
     fn form_attribute_mutated(&self, cx: &mut JSContext, mutation: AttributeMutation) {
         match mutation {
-            AttributeMutation::Set(..) => {
+            AttributeMutation::Set(_) => {
                 self.register_if_necessary();
             },
             AttributeMutation::Removed => {
@@ -1839,20 +1900,17 @@ pub(crate) trait FormControl: DomObject<ReflectorType = ()> + NodeTraits {
         node.set_flag(NodeFlags::PARSER_ASSOCIATED_FORM_OWNER, false);
 
         if !must_skip_reset {
-            self.form_attribute_mutated(
-                cx,
-                AttributeMutation::Set(None, AttributeMutationReason::Directly),
-            );
+            self.form_attribute_mutated(cx, AttributeMutation::Set(None));
         }
     }
 
     /// <https://html.spec.whatwg.org/multipage/#association-of-controls-and-forms>
     fn unbind_form_control_from_tree(&self, cx: &mut JSContext) {
-        let elem = self.to_element();
-        let has_form_attr = elem.has_attribute(&local_name!("form"));
+        let element = self.to_element();
+        let has_form_attr = element.has_attribute(&local_name!("form"));
         let same_subtree = self
             .form_owner()
-            .is_none_or(|form| elem.is_in_same_home_subtree(&*form));
+            .is_none_or(|form| element.is_in_same_home_subtree(&*form));
 
         self.unregister_if_necessary();
 
@@ -1903,11 +1961,11 @@ pub(crate) trait FormControl: DomObject<ReflectorType = ()> + NodeTraits {
     }
 
     /// <https://html.spec.whatwg.org/multipage/#candidate-for-constraint-validation>
-    fn is_candidate_for_constraint_validation(&self) -> bool {
+    fn is_candidate_for_constraint_validation(&self, no_gc: &NoGC) -> bool {
         let element = self.to_element();
         let html_element = element.downcast::<HTMLElement>();
         if let Some(html_element) = html_element {
-            html_element.is_submittable_element() || element.is_instance_validatable()
+            html_element.is_submittable_element() || element.is_instance_validatable(no_gc)
         } else {
             false
         }

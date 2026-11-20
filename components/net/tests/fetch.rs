@@ -12,7 +12,10 @@ use std::time::{Duration, SystemTime};
 
 use content_security_policy as csp;
 use crossbeam_channel::{Sender, unbounded};
-use devtools_traits::{HttpRequest as DevtoolsHttpRequest, HttpResponse as DevtoolsHttpResponse};
+use devtools_traits::{
+    HttpRequest as DevtoolsHttpRequest, HttpResponse as DevtoolsHttpResponse,
+    HttpResponseBody as DevtoolsHttpResponseBody,
+};
 use headers::{
     AccessControlAllowCredentials, AccessControlAllowHeaders, AccessControlAllowMethods,
     AccessControlAllowOrigin, AccessControlMaxAge, CacheControl, ContentLength, ContentType, ETag,
@@ -40,8 +43,7 @@ use net_traits::request::{
 };
 use net_traits::response::{CacheState, Response, ResponseBody, ResponseType};
 use net_traits::{
-    FetchTaskTarget, IncludeSubdomains, NetworkError, ReferrerPolicy, ResourceFetchTiming,
-    ResourceTimingType, get_current_locale,
+    FetchTaskTarget, IncludeSubdomains, NetworkError, ReferrerPolicy, get_current_locale,
 };
 use servo_base::id::{TEST_PIPELINE_ID, TEST_WEBVIEW_ID};
 use servo_url::{ImmutableOrigin, ServoUrl};
@@ -213,7 +215,7 @@ fn test_fetch_blob() {
         expected: bytes.to_vec(),
     };
 
-    spawn_blocking_task::<_, Response>(methods::fetch(request, &mut target, &context));
+    spawn_blocking_task(methods::fetch(request, &mut target, &context));
 
     let fetch_response = receiver.recv().unwrap();
     assert!(!fetch_response.is_network_error());
@@ -455,8 +457,8 @@ fn test_cors_preflight_cache_fetch() {
     assert_eq!(1, counter.load(Ordering::SeqCst));
 
     // The entry exists in the CORS-preflight cache
-    assert_eq!(true, cache.match_method(&wrapped_request2, Method::GET));
-    assert_eq!(true, cache.match_method(&wrapped_request3, Method::GET));
+    assert_eq!(true, cache.match_method(&wrapped_request2, &Method::GET));
+    assert_eq!(true, cache.match_method(&wrapped_request3, &Method::GET));
 
     match *fetch_response0.body.lock() {
         ResponseBody::Done(ref body) => assert_eq!(&**body, ACK),
@@ -757,8 +759,8 @@ fn test_fetch_with_local_urls_only() {
 // NOTE(emilio): If this test starts failing:
 //
 // openssl req -x509 -nodes -days 3650 -newkey rsa:2048 \
-//   -keyout resources/privatekey_for_testing.key       \
-//   -out resources/self_signed_certificate_for_testing.crt
+//   -keyout components/net/tests/privatekey_for_testing.key         \
+//   -out components/net/tests/self_signed_certificate_for_testing.crt
 //
 // And make sure to specify `localhost` as the server name.
 #[test]
@@ -785,7 +787,6 @@ fn test_fetch_with_hsts() {
         file_token: FileTokenCheck::NotRequired,
         request_interceptor: Arc::new(TokioMutex::new(RequestInterceptor::new(embedder_proxy))),
         cancellation_listener: Arc::new(Default::default()),
-        timing: ResourceFetchTiming::new(ResourceTimingType::Navigation).into(),
         protocols: Arc::new(ProtocolRegistry::default()),
         websocket_chan: None,
         ca_certificates: CACertificates::Default,
@@ -849,7 +850,6 @@ fn test_load_adds_host_to_hsts_list_when_url_is_https() {
         file_token: FileTokenCheck::NotRequired,
         request_interceptor: Arc::new(TokioMutex::new(RequestInterceptor::new(embedder_proxy))),
         cancellation_listener: Arc::new(Default::default()),
-        timing: ResourceFetchTiming::new(ResourceTimingType::Navigation).into(),
         protocols: Arc::new(ProtocolRegistry::default()),
         websocket_chan: None,
         ca_certificates: CACertificates::Default,
@@ -918,7 +918,6 @@ fn test_fetch_self_signed() {
         file_token: FileTokenCheck::NotRequired,
         request_interceptor: Arc::new(TokioMutex::new(RequestInterceptor::new(embedder_proxy))),
         cancellation_listener: Arc::new(Default::default()),
-        timing: ResourceFetchTiming::new(ResourceTimingType::Navigation).into(),
         protocols: Arc::new(ProtocolRegistry::default()),
         websocket_chan: None,
         ca_certificates: CACertificates::Default,
@@ -1060,6 +1059,8 @@ fn test_fetch_blocked_nosniff() {
         (Destination::Script, mime::TEXT_JAVASCRIPT, false),
         (Destination::Script, mime::TEXT_CSS, true),
         (Destination::Style, mime::TEXT_CSS, false),
+        (Destination::Style, mime::TEXT_HTML, true),
+        (Destination::Style, mime::TEXT_PLAIN, true),
     ];
 
     for test in tests {
@@ -1501,7 +1502,11 @@ fn test_fetch_with_devtools() {
     let httpresponse = DevtoolsHttpResponse {
         headers: Some(response_headers),
         status: HttpStatus::default(),
-        body: Some(content.as_bytes().to_vec().into()),
+        body: Some(DevtoolsHttpResponseBody {
+            data: content.as_bytes().to_vec().into(),
+            truncated: false,
+            content_size: content.len(),
+        }),
         from_cache: false,
         pipeline_id: TEST_PIPELINE_ID,
         browsing_context_id: TEST_WEBVIEW_ID.into(),
@@ -1536,7 +1541,7 @@ fn test_fetch_request_intercepted() {
                     HeaderValue::from_static(HEADERVALUE),
                 );
                 let response =
-                    embedder_traits::WebResourceResponse::new(web_resource_request.url.clone())
+                    embedder_traits::WebResourceResponse::new(web_resource_request.url.into_url())
                         .headers(headers)
                         .status_code(StatusCode::FOUND)
                         .status_message(STATUS_MESSAGE.to_vec());
@@ -1565,7 +1570,6 @@ fn test_fetch_request_intercepted() {
         file_token: FileTokenCheck::NotRequired,
         request_interceptor: Arc::new(TokioMutex::new(RequestInterceptor::new(embedder_proxy))),
         cancellation_listener: Arc::new(Default::default()),
-        timing: ResourceFetchTiming::new(ResourceTimingType::Navigation).into(),
         protocols: Arc::new(ProtocolRegistry::default()),
         websocket_chan: None,
         ca_certificates: CACertificates::Default,

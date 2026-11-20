@@ -121,16 +121,17 @@ dictionary AudioTimestamp {
 interface OfflineAudioContext : BaseAudioContext {
     constructor(OfflineAudioContextOptions contextOptions);
     constructor(unsigned long numberOfChannels, unsigned long length, float sampleRate);
-    Promise<AudioBuffer> startRendering();
+    Promise<AudioBuffer> startRendering(optional unsigned long? chunkSize = null);
     Promise<undefined> resume();
     Promise<undefined> suspend(double suspendTime);
-    readonly attribute unsigned long length;
+    Promise<undefined> close();
+    readonly attribute unsigned long? length;
     attribute EventHandler oncomplete;
 };
 
 dictionary OfflineAudioContextOptions {
     unsigned long numberOfChannels = 1;
-    required unsigned long length;
+    unsigned long? length = null;
     required float sampleRate;
     (AudioContextRenderSizeCategory or unsigned long) renderSizeHint = "default";
 };
@@ -399,6 +400,10 @@ dictionary DelayOptions : AudioNodeOptions {
     double delayTime = 0;
 };
 
+enum MakeupGainOptions {
+    "automatic"
+};
+
 [Exposed=Window]
 interface DynamicsCompressorNode : AudioNode {
     constructor (BaseAudioContext context,
@@ -409,11 +414,13 @@ interface DynamicsCompressorNode : AudioNode {
     readonly attribute float reduction;
     readonly attribute AudioParam attack;
     readonly attribute AudioParam release;
+    readonly attribute AudioParam makeupGain;
 };
 
 dictionary DynamicsCompressorOptions : AudioNodeOptions {
     float attack = 0.003;
     float knee = 30;
+    (float or MakeupGainOptions) makeupGain = "automatic";
     float ratio = 12;
     float release = 0.25;
     float threshold = -24;

@@ -5,14 +5,14 @@
 use std::collections::VecDeque;
 
 use euclid::Scale;
-use paint_api::display_list::ScrollTree;
-use paint_api::largest_contentful_paint_candidate::LCPCandidate;
+use paint_api::display_list::{PaintTimingInfo, ScrollTree};
 use paint_api::{CompositionPipeline, PipelineExitSource};
+use rustc_hash::FxHashMap;
 use servo_base::Epoch;
-use servo_base::id::PipelineId;
+use servo_base::id::{ContainerTimingID, LCPCandidateID, PipelineId, ScrollTreeNodeId};
 use style_traits::CSSPixel;
-use webrender_api::Epoch as WebRenderEpoch;
-use webrender_api::units::DevicePixel;
+use webrender_api::units::{DevicePixel, LayoutRect};
+use webrender_api::{Epoch as WebRenderEpoch, PipelineId as WebRenderPipelineId};
 
 use crate::painter::PaintMetricState;
 use crate::web_content_animation::PipelineAnimations;
@@ -26,6 +26,11 @@ pub(crate) struct PipelineDetails {
 
     /// The ids of the child pipelines for this pipeline.
     pub children: Vec<PipelineId>,
+
+    /// A map of `<iframe>` [`PipelineId`]s to their rectangle and containing [`ScrollTreeNodeId`].
+    /// This can be used to translate from coordinates within an `<iframe>` to root WebView
+    /// coordinates.
+    pub iframes: FxHashMap<WebRenderPipelineId, (ScrollTreeNodeId, LayoutRect)>,
 
     /// Whether animations are running
     pub animations_running: bool,
@@ -46,8 +51,11 @@ pub(crate) struct PipelineDetails {
     /// The paint metric status of the first contentful paint.
     pub first_contentful_paint_metric: PaintMetricState,
 
-    /// LCP candidates waiting to be presented, in order by [WebRenderEpoch].
-    pub lcp_candidates: VecDeque<(WebRenderEpoch, LCPCandidate)>,
+    /// LCP candidates waiting to be presented, in order by [WebRenderEpoch]
+    pub lcp_candidates: VecDeque<(WebRenderEpoch, (LCPCandidateID, usize), PaintTimingInfo)>,
+
+    /// Container Timing updates waiting to be presented, in order by [WebRenderEpoch].
+    pub container_timing_candidates: VecDeque<(WebRenderEpoch, Vec<ContainerTimingID>)>,
 
     /// The CSS pixel to device pixel scale of the viewport of this pipeline, including
     /// page zoom, but not including any pinch zoom amount. This is used to detect
@@ -86,6 +94,7 @@ impl PipelineDetails {
             pipeline: None,
             parent_pipeline_id: None,
             children: Default::default(),
+            iframes: Default::default(),
             viewport_scale: None,
             animations_running: false,
             animation_callbacks_running: false,
@@ -94,15 +103,21 @@ impl PipelineDetails {
             first_paint_metric: PaintMetricState::Waiting,
             first_contentful_paint_metric: PaintMetricState::Waiting,
             lcp_candidates: VecDeque::new(),
+            container_timing_candidates: VecDeque::new(),
             exited: PipelineExitSource::empty(),
             display_list_epoch: None,
             animations: Default::default(),
         }
     }
 
-    pub(crate) fn install_new_scroll_tree(&mut self, new_scroll_tree: ScrollTree) {
+    pub(crate) fn install_new_scroll_tree_and_iframes(
+        &mut self,
+        new_scroll_tree: ScrollTree,
+        iframes: FxHashMap<WebRenderPipelineId, (ScrollTreeNodeId, LayoutRect)>,
+    ) {
         let old_scroll_offsets = self.scroll_tree.scroll_offsets();
         self.scroll_tree = new_scroll_tree;
         self.scroll_tree.set_all_scroll_offsets(&old_scroll_offsets);
+        self.iframes = iframes;
     }
 }

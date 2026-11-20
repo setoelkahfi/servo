@@ -17,8 +17,8 @@ img {
     height: 100px;
 }
 </style>
-<canvas id=canvas width="300" height="100" layoutsubtree>
-  <div id=child>
+<canvas id=canvas width="300" height="100" content=drawable>
+  <div drawable id=child>
      <img id=image src="resources/rgb100.gif"/>
   </div>
 </canvas>
@@ -28,6 +28,8 @@ let ctx = canvas.getContext("2d");
 let child = document.getElementById("child");
 
 promise_test(() => new Promise((resolve, reject) => {
+  assert_implements('captureElementImage' in HTMLCanvasElement.prototype,
+                    'html-in-canvas is not supported');
   window.onload = () => {
     let colorEquals = (a, b) => {
       return a[0] == b[0] && a[1] == b[1] && a[2] == b[2] && a[3] == b[3];

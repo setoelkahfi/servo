@@ -1,7 +1,7 @@
 /* This Source Code Form is subject to the terms of the Mozilla Public
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
-#![allow(rustdoc::private_intra_doc_links)]
+#![expect(rustdoc::private_intra_doc_links)]
 
 //! Same-formatting context blocks. This represents a block in block flow that does not
 //! establish a new formatting context.
@@ -14,10 +14,11 @@ use script::layout_dom::ServoLayoutNode;
 use servo_arc::Arc as ServoArc;
 use style::Zero;
 use style::context::SharedStyleContext;
-use style::logical_geometry::Direction;
+use style::logical_geometry::LogicalAxis;
 use style::properties::ComputedValues;
 use style::servo::selector_parser::PseudoElement;
 
+use crate::containing_block::{ConstraintSpace, ContainingBlock};
 use crate::context::LayoutContext;
 use crate::flow::float::{Clear, ContainingBlockPositionInfo, SequentialLayoutState};
 use crate::flow::{
@@ -28,9 +29,8 @@ use crate::fragment_tree::{BoxFragment, CollapsedBlockMargins, CollapsedMargin, 
 use crate::geom::{LogicalRect, LogicalSides1D, LogicalVec2};
 use crate::layout_box_base::LayoutBoxBase;
 use crate::positioned::PositioningContext;
-use crate::sizing::{InlineContentSizesResult, Size};
+use crate::sizing::InlineContentSizesResult;
 use crate::style_ext::LayoutStyle;
-use crate::{ConstraintSpace, ContainingBlock};
 
 /// A block in block flow that does not establish a new formatting context.
 #[derive(Debug, MallocSizeOf)]
@@ -176,14 +176,18 @@ impl SameFormattingContextBlock {
             pbm,
             block_sizes,
             depends_on_block_constraints,
-            available_block_size,
+            tentative_block_size,
+            block_stretch_size,
             justify_self,
+            automatic_block_size,
             ..
         } = solve_containing_block_padding_and_border_for_in_flow_box(
+            layout_context,
             containing_block,
             &layout_style,
             get_inline_content_sizes,
             ignore_block_margins_for_stretch,
+            &self.base,
             None,
             has_inline_parent,
         );
@@ -193,7 +197,7 @@ impl SameFormattingContextBlock {
         } = solve_margins(
             containing_block,
             &pbm,
-            containing_block_for_children.size.inline,
+            containing_block_for_children.inline_size(),
             justify_self,
         );
 
@@ -201,9 +205,8 @@ impl SameFormattingContextBlock {
             pbm.padding.block_start.is_zero() && pbm.border.block_start.is_zero();
 
         let mut clearance = None;
-        let parent_containing_block_position_info;
-        match sequential_layout_state {
-            None => parent_containing_block_position_info = None,
+        let parent_containing_block_position_info = match sequential_layout_state {
+            None => None,
             Some(ref mut sequential_layout_state) => {
                 let clear = Clear::from_style_and_container_writing_mode(
                     style,
@@ -269,11 +272,9 @@ impl SameFormattingContextBlock {
                     block_start: sequential_layout_state.bfc_relative_block_position,
                     block_start_margins_not_collapsed: sequential_layout_state.current_margin,
                     inline_start,
-                    inline_end: inline_start + containing_block_for_children.size.inline,
+                    inline_end: inline_start + containing_block_for_children.inline_size(),
                 };
-                parent_containing_block_position_info = Some(
-                    sequential_layout_state.replace_containing_block_position_info(new_cb_offsets),
-                );
+                Some(sequential_layout_state.replace_containing_block_position_info(new_cb_offsets))
             },
         };
 
@@ -327,14 +328,6 @@ impl SameFormattingContextBlock {
             }
         }
 
-        let tentative_block_size = if is_anonymous {
-            // Anonymous blocks do not establish a containing block for their children,
-            // so we can't use that. However, they always have their sizing properties
-            // set to their initial values, so it's fine to use the default.
-            &Default::default()
-        } else {
-            &containing_block_for_children.size.block
-        };
         let collapsed_through = collapsible_margins_in_children.collapsed_through &&
             pbm.padding_border_sums.block.is_zero() &&
             tentative_block_size.definite_or_min().is_zero();
@@ -347,10 +340,10 @@ impl SameFormattingContextBlock {
         }
 
         let block_size = block_sizes.resolve(
-            Direction::Block,
-            Size::FitContent,
+            LogicalAxis::Block,
+            automatic_block_size,
             Au::zero,
-            available_block_size,
+            block_stretch_size,
             || content_block_size.into(),
             false, /* is_table */
         );
@@ -415,7 +408,7 @@ impl SameFormattingContextBlock {
             },
             size: LogicalVec2 {
                 block: block_size,
-                inline: containing_block_for_children.size.inline,
+                inline: containing_block_for_children.inline_size(),
             },
         };
 
@@ -436,7 +429,7 @@ impl SameFormattingContextBlock {
             base_fragment_info,
             style.clone(),
             flow_layout.fragments,
-            content_rect.as_physical(Some(containing_block)),
+            content_rect.as_physical_deprecated(containing_block),
             pbm.padding.to_physical(containing_block_writing_mode),
             pbm.border.to_physical(containing_block_writing_mode),
             margin.to_physical(containing_block_writing_mode),

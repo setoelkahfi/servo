@@ -8,17 +8,18 @@
 mod font_context {
     use std::collections::HashMap;
     use std::ffi::OsStr;
+    use std::fs::File;
+    use std::io::Read;
     use std::path::PathBuf;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicI32, Ordering};
     use std::thread;
 
     use app_units::Au;
-    use fonts::platform::font::PlatformFont;
     use fonts::{
         FallbackFontSelectionOptions, FontContext, FontDescriptor, FontFamilyDescriptor,
-        FontIdentifier, FontSearchScope, FontTemplate, FontTemplates, LocalFontIdentifier,
-        PlatformFontMethods, SystemFontServiceMessage, SystemFontServiceProxy,
+        FontIdentifier, FontSearchScope, FontTemplate, FontTemplateDescriptor, FontTemplates,
+        LocalFontIdentifier, SystemFontServiceMessage, SystemFontServiceProxy,
         SystemFontServiceProxySender, fallback_font_families,
     };
     use icu_locale_core::subtags::Language;
@@ -27,13 +28,15 @@ mod font_context {
     use parking_lot::Mutex;
     use servo_arc::Arc as ServoArc;
     use servo_base::generic_channel::{self, GenericReceiver};
+    use skrifa::Font as SkrifaFont;
+    use skrifa::font::Blob;
     use style::ArcSlice;
     use style::computed_values::font_optical_sizing::T as FontOpticalSizing;
     use style::properties::longhands::font_variant_caps::computed_value::T as FontVariantCaps;
     use style::properties::style_structs::Font as FontStyleStruct;
     use style::values::computed::font::{
-        FamilyName, FontFamily, FontFamilyList, FontFamilyNameSyntax, FontStretch, FontStyle,
-        FontSynthesis, FontWeight, SingleFontFamily,
+        FamilyName, FontFamily, FontFamilyList, FontFamilyNameSyntax, FontStyle, FontSynthesis,
+        FontWeight, FontWidth, SingleFontFamily,
     };
     use stylo_atoms::Atom;
     use webrender_api::{FontInstanceKey, FontKey, IdNamespace};
@@ -127,7 +130,7 @@ mod font_context {
                         );
                     },
                     SystemFontServiceMessage::GetFontInstanceKey(_, result_sender) |
-                    SystemFontServiceMessage::GetFontInstance(_, _, _, _, _, result_sender) => {
+                    SystemFontServiceMessage::GetFontInstance(_, _, _, _, _, _, result_sender) => {
                         let _ = result_sender.send(FontInstanceKey(IdNamespace(0), 0));
                     },
                     SystemFontServiceMessage::GetFontKey(_, result_sender) => {
@@ -176,23 +179,21 @@ mod font_context {
             let mut path: PathBuf = [env!("CARGO_MANIFEST_DIR"), "tests", "support", "CSSTest"]
                 .iter()
                 .collect();
-            path.push(format!("{}.ttf", name));
+            path.push(format!("{name}.ttf"));
 
             let local_font_identifier = LocalFontIdentifier {
                 path: path.to_str().expect("Could not load test font").into(),
                 face_index: 0,
                 named_instance_index: 0,
             };
-            let handle = PlatformFont::new_from_local_font_identifier(
-                local_font_identifier.clone(),
-                None,
-                false,
-            )
-            .expect("Could not load test font");
+
+            let mut bytes = std::fs::read(&path).unwrap();
+            let skrifa_font = SkrifaFont::new(Blob::Shared(Arc::new(bytes)), 0).unwrap();
+            let descriptor = FontTemplateDescriptor::from_skrifa_font(&skrifa_font);
 
             family.add_template(FontTemplate::new(
                 FontIdentifier::Local(local_font_identifier),
-                handle.descriptor(),
+                descriptor,
                 None,
             ));
         }
@@ -330,7 +331,7 @@ mod font_context {
 
         let mut font_descriptor = FontDescriptor {
             weight: FontWeight::normal(),
-            stretch: FontStretch::hundred(),
+            width: FontWidth::hundred(),
             style: FontStyle::normal(),
             variant: FontVariantCaps::Normal,
             pt_size: Au(10),

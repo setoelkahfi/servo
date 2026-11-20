@@ -9,7 +9,10 @@ use dom_struct::dom_struct;
 use embedder_traits::SelectedFile;
 use js::context::{JSContext, NoGC};
 use js::rust::HandleObject;
+use script_bindings::domstring::TracedDOMString;
 use script_bindings::reflector::reflect_weak_referenceable_dom_object_with_proto;
+use script_bindings::serializable::Serializable;
+use script_bindings::structuredclone::StructuredData;
 use servo_base::id::{FileId, FileIndex};
 use servo_constellation_traits::{BlobImpl, SerializableFile};
 use time::{Duration, OffsetDateTime};
@@ -20,9 +23,7 @@ use crate::dom::bindings::codegen::UnionTypes::ArrayBufferOrArrayBufferViewOrBlo
 use crate::dom::bindings::error::{Error, Fallible};
 use crate::dom::bindings::inheritance::Castable;
 use crate::dom::bindings::root::DomRoot;
-use crate::dom::bindings::serializable::Serializable;
 use crate::dom::bindings::str::{DOMString, USVString};
-use crate::dom::bindings::structuredclone::StructuredData;
 use crate::dom::blob::{Blob, normalize_type_string, process_blob_parts};
 use crate::dom::globalscope::GlobalScope;
 use crate::dom::window::Window;
@@ -30,11 +31,13 @@ use crate::dom::window::Window;
 #[dom_struct]
 pub(crate) struct File {
     blob: Blob,
-    name: DOMString,
+    name: TracedDOMString,
     modified: SystemTime,
-    // TODO: This depends on the `webkitdirectory` from `HTMLInputElement`.
-    // Then need to change `SelectedFile` in embedder,
-    // and filemanager_thread to recursively walk.
+    // Only set when a directory is selected.
+    // 1. webdriver send keys to <input>.
+    // 2. When dom_testing_html_input_element_select_files_enabled,
+    //    the testing API selectFiles.
+    // 3. with `webkitdirectory` in the file picker.
     webkit_relative_path: USVString,
 }
 
@@ -47,7 +50,7 @@ impl File {
     ) -> File {
         File {
             blob: Blob::new_inherited(blob_impl),
-            name,
+            name: name.traced(),
             // https://w3c.github.io/FileAPI/#dfn-lastModified
             modified: modified.unwrap_or_else(SystemTime::now),
             webkit_relative_path,
@@ -109,9 +112,10 @@ impl File {
                 .expect("File name encoding error"),
         );
 
-        File::new(
+        Self::new_with_proto(
             cx,
             window.upcast(),
+            None,
             BlobImpl::new_from_file(
                 selected.id,
                 selected.filename,
@@ -120,6 +124,7 @@ impl File {
             ),
             name,
             Some(selected.modified),
+            USVString::from(selected.relative_path.unwrap_or_default()),
         )
     }
 
@@ -127,7 +132,7 @@ impl File {
         self.blob.get_bytes()
     }
 
-    pub(crate) fn name(&self) -> &DOMString {
+    pub(crate) fn name(&self) -> &TracedDOMString {
         &self.name
     }
 
@@ -150,7 +155,7 @@ impl File {
     }
 }
 
-impl Serializable for File {
+impl Serializable<crate::DomTypeHolder> for File {
     type Index = FileIndex;
     type Data = SerializableFile;
 
@@ -224,7 +229,7 @@ impl FileMethods<crate::DomTypeHolder> for File {
 
     /// <https://w3c.github.io/FileAPI/#dfn-name>
     fn Name(&self) -> DOMString {
-        self.name.clone()
+        self.name.clone().root()
     }
 
     /// <https://wicg.github.io/entries-api/#dom-file-webkitrelativepath>

@@ -6,15 +6,16 @@ use std::default::Default;
 
 use dom_struct::dom_struct;
 use html5ever::{LocalName, Prefix, local_name};
-use js::context::JSContext;
+use js::context::{JSContext, NoGC};
 use js::rust::HandleObject;
 use pixels::RasterImage;
 use script_bindings::cell::DomRefCell;
 use servo_arc::Arc;
+use style::attr::{AttrValue, LengthOrPercentageOrAuto};
 
 use crate::dom::bindings::codegen::Bindings::HTMLObjectElementBinding::HTMLObjectElementMethods;
 use crate::dom::bindings::inheritance::Castable;
-use crate::dom::bindings::root::{DomRoot, MutNullableDom};
+use crate::dom::bindings::root::{DomRoot, LayoutDom, MutNullableDom};
 use crate::dom::bindings::str::DOMString;
 use crate::dom::document::Document;
 use crate::dom::element::attributes::storage::AttrRef;
@@ -101,14 +102,34 @@ impl HTMLObjectElementMethods<crate::DomTypeHolder> for HTMLObjectElement {
     // https://html.spec.whatwg.org/multipage/#dom-object-usemap
     make_setter!(SetUseMap, "usemap");
 
+    // <https://html.spec.whatwg.org/multipage/#dom-object-width>
+    make_getter!(Width, "width");
+    // <https://html.spec.whatwg.org/multipage/#dom-object-width>
+    make_dimension_setter!(SetWidth, "width");
+
+    // <https://html.spec.whatwg.org/multipage/#dom-object-height>
+    make_getter!(Height, "height");
+    // <https://html.spec.whatwg.org/multipage/#dom-object-height>
+    make_dimension_setter!(SetHeight, "height");
+
+    // https://html.spec.whatwg.org/multipage/#dom-object-hspace
+    make_dimension_uint_getter!(Hspace, "hspace");
+    // https://html.spec.whatwg.org/multipage/#dom-object-hspace
+    make_dimension_uint_setter!(SetHspace, "hspace");
+
+    // https://html.spec.whatwg.org/multipage/#dom-object-vspace
+    make_dimension_uint_getter!(Vspace, "vspace");
+    // https://html.spec.whatwg.org/multipage/#dom-object-vspace
+    make_dimension_uint_setter!(SetVspace, "vspace");
+
     /// <https://html.spec.whatwg.org/multipage/#dom-fae-form>
     fn GetForm(&self) -> Option<DomRoot<HTMLFormElement>> {
         self.form_owner()
     }
 
     /// <https://html.spec.whatwg.org/multipage/#dom-cva-willvalidate>
-    fn WillValidate(&self) -> bool {
-        self.is_instance_validatable()
+    fn WillValidate(&self, no_gc: &NoGC) -> bool {
+        self.is_instance_validatable(no_gc)
     }
 
     /// <https://html.spec.whatwg.org/multipage/#dom-cva-validity>
@@ -147,7 +168,14 @@ impl Validatable for HTMLObjectElement {
             .or_init(|| ValidityState::new(cx, &self.owner_window(), self.upcast()))
     }
 
-    fn is_instance_validatable(&self) -> bool {
+    fn satisfies_constraints(&self) -> bool {
+        let Some(validity_state) = self.validity_state.get() else {
+            return true;
+        };
+        validity_state.invalid_flags().is_empty()
+    }
+
+    fn is_instance_validatable(&self, _no_gc: &NoGC) -> bool {
         // https://html.spec.whatwg.org/multipage/#the-object-element%3Abarred-from-constraint-validation
         false
     }
@@ -169,7 +197,7 @@ impl VirtualMethods for HTMLObjectElement {
             .attribute_mutated(cx, attr, mutation);
         match *attr.local_name() {
             local_name!("data") => {
-                if let AttributeMutation::Set(..) = mutation {
+                if let AttributeMutation::Set(_) = mutation {
                     self.process_data_url();
                 }
             },
@@ -177,6 +205,32 @@ impl VirtualMethods for HTMLObjectElement {
                 self.form_attribute_mutated(cx, mutation);
             },
             _ => {},
+        }
+    }
+
+    fn parse_plain_attribute(&self, name: &LocalName, value: DOMString) -> AttrValue {
+        match *name {
+            local_name!("width") |
+            local_name!("height") |
+            local_name!("hspace") |
+            local_name!("vspace") => AttrValue::from_dimension(value.into()),
+            _ => self
+                .super_type()
+                .unwrap()
+                .parse_plain_attribute(name, value),
+        }
+    }
+
+    fn attribute_affects_presentational_hints(&self, attr: AttrRef<'_>) -> bool {
+        match attr.local_name() {
+            &local_name!("width") |
+            &local_name!("height") |
+            &local_name!("hspace") |
+            &local_name!("vspace") => true,
+            _ => self
+                .super_type()
+                .unwrap()
+                .attribute_affects_presentational_hints(attr),
         }
     }
 }
@@ -192,5 +246,27 @@ impl FormControl for HTMLObjectElement {
 
     fn to_html_element(&self) -> &HTMLElement {
         self.upcast::<HTMLElement>()
+    }
+}
+
+impl LayoutDom<'_, HTMLObjectElement> {
+    pub(crate) fn width(self) -> LengthOrPercentageOrAuto {
+        self.upcast::<Element>()
+            .dimension_attr_value(local_name!("width"))
+    }
+
+    pub(crate) fn height(self) -> LengthOrPercentageOrAuto {
+        self.upcast::<Element>()
+            .dimension_attr_value(local_name!("height"))
+    }
+
+    pub(crate) fn margin_right_left(self) -> LengthOrPercentageOrAuto {
+        self.upcast::<Element>()
+            .dimension_attr_value(local_name!("hspace"))
+    }
+
+    pub(crate) fn margin_top_bottom(self) -> LengthOrPercentageOrAuto {
+        self.upcast::<Element>()
+            .dimension_attr_value(local_name!("vspace"))
     }
 }

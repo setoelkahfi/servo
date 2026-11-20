@@ -17,10 +17,8 @@ use crate::dom::globalscope::GlobalScope;
 #[dom_struct]
 pub(crate) struct MediaStreamTrack {
     eventtarget: EventTarget,
-    #[ignore_malloc_size_of = "defined in servo-media"]
     #[no_trace]
     id: MediaStreamId,
-    #[ignore_malloc_size_of = "defined in servo-media"]
     #[no_trace]
     ty: MediaStreamType,
 }
@@ -60,8 +58,8 @@ impl MediaStreamTrackMethods<crate::DomTypeHolder> for MediaStreamTrack {
     /// <https://w3c.github.io/mediacapture-main/#dom-mediastreamtrack-kind>
     fn Kind(&self) -> DOMString {
         match self.ty {
-            MediaStreamType::Video => "video".into(),
-            MediaStreamType::Audio => "audio".into(),
+            MediaStreamType::Video => DOMString::from_static("video"),
+            MediaStreamType::Audio => DOMString::from_static("audio"),
         }
     }
 

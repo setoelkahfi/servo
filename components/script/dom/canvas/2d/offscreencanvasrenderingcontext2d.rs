@@ -6,19 +6,21 @@ use dom_struct::dom_struct;
 use euclid::default::Size2D;
 use js::context::{JSContext, NoGC};
 use pixels::Snapshot;
-use script_bindings::reflector::reflect_dom_object_with_cx;
+use script_bindings::reflector::reflect_dom_object;
 use servo_canvas_traits::canvas::CanvasCommand;
 
 use crate::canvas_context::{CanvasContext, HTMLCanvasElementOrOffscreenCanvas};
 use crate::dom::bindings::codegen::Bindings::CanvasRenderingContext2DBinding::{
     CanvasDirection, CanvasFillRule, CanvasImageSource, CanvasLineCap, CanvasLineJoin,
-    CanvasRenderingContext2DMethods, CanvasTextAlign, CanvasTextBaseline,
+    CanvasRenderingContext2DMethods, CanvasRenderingContext2DSettings, CanvasTextAlign,
+    CanvasTextBaseline,
 };
 use crate::dom::bindings::codegen::Bindings::DOMMatrixBinding::DOMMatrix2DInit;
 use crate::dom::bindings::codegen::Bindings::OffscreenCanvasRenderingContext2DBinding::OffscreenCanvasRenderingContext2DMethods;
 use crate::dom::bindings::codegen::UnionTypes::{
     HTMLCanvasElementOrOffscreenCanvas as RootedHTMLCanvasElementOrOffscreenCanvas,
     StringOrCanvasGradientOrCanvasPattern,
+    UnrestrictedDoubleOrDOMPointInitOrUnrestrictedDoubleOrDOMPointInitSequence,
 };
 use crate::dom::bindings::error::{ErrorResult, Fallible};
 use crate::dom::bindings::num::Finite;
@@ -34,7 +36,7 @@ use crate::dom::offscreencanvas::OffscreenCanvas;
 use crate::dom::path2d::Path2D;
 use crate::dom::textmetrics::TextMetrics;
 
-#[dom_struct(associated_memory)]
+#[dom_struct]
 pub(crate) struct OffscreenCanvasRenderingContext2D {
     context: CanvasRenderingContext2D,
 }
@@ -45,9 +47,10 @@ impl OffscreenCanvasRenderingContext2D {
         global: &GlobalScope,
         canvas: HTMLCanvasElementOrOffscreenCanvas,
         size: Size2D<u32>,
+        settings: &CanvasRenderingContext2DSettings,
     ) -> Option<OffscreenCanvasRenderingContext2D> {
         Some(OffscreenCanvasRenderingContext2D {
-            context: CanvasRenderingContext2D::new_inherited(global, canvas, size)?,
+            context: CanvasRenderingContext2D::new_inherited(global, canvas, size, settings)?,
         })
     }
 
@@ -56,14 +59,16 @@ impl OffscreenCanvasRenderingContext2D {
         global: &GlobalScope,
         canvas: &OffscreenCanvas,
         size: Size2D<u32>,
+        settings: &CanvasRenderingContext2DSettings,
     ) -> Option<DomRoot<OffscreenCanvasRenderingContext2D>> {
         OffscreenCanvasRenderingContext2D::new_inherited(
             global,
             HTMLCanvasElementOrOffscreenCanvas::OffscreenCanvas(Dom::from_ref(canvas)),
             size,
+            settings,
         )
         .map(|context| {
-            let context = reflect_dom_object_with_cx(Box::new(context), global, cx);
+            let context = reflect_dom_object(cx, Box::new(context), global);
             context.context.update_associated_memory_size();
             context
         })
@@ -107,6 +112,14 @@ impl CanvasContext for OffscreenCanvasRenderingContext2D {
 impl OffscreenCanvasRenderingContext2DMethods<crate::DomTypeHolder>
     for OffscreenCanvasRenderingContext2D
 {
+    /// <https://html.spec.whatwg.org/multipage/#dom-context-2d-canvas-getcontextattributes>
+    fn GetContextAttributes(&self) -> CanvasRenderingContext2DSettings {
+        // The getContextAttributes() method steps are to return «[ "alpha" → this's alpha,
+        // "desynchronized" → this's desynchronized, "colorSpace" → this's color space,
+        // "colorType" → this's color type, "willReadFrequently" → this's will read frequently ]».
+        self.context.GetContextAttributes()
+    }
+
     /// <https://html.spec.whatwg.org/multipage/offscreencontext2d-canvas>
     fn Canvas(&self) -> DomRoot<OffscreenCanvas> {
         match self.context.canvas() {
@@ -166,8 +179,8 @@ impl OffscreenCanvasRenderingContext2DMethods<crate::DomTypeHolder>
     }
 
     /// <https://html.spec.whatwg.org/multipage/#dom-context-2d-shadowcolor>
-    fn SetShadowColor(&self, value: DOMString) {
-        self.context.SetShadowColor(value)
+    fn SetShadowColor(&self, cx: &mut JSContext, value: DOMString) {
+        self.context.SetShadowColor(cx, value)
     }
 
     /// <https://html.spec.whatwg.org/multipage/#dom-context-2d-strokestyle>
@@ -176,8 +189,8 @@ impl OffscreenCanvasRenderingContext2DMethods<crate::DomTypeHolder>
     }
 
     /// <https://html.spec.whatwg.org/multipage/#dom-context-2d-strokestyle>
-    fn SetStrokeStyle(&self, value: StringOrCanvasGradientOrCanvasPattern) {
-        self.context.SetStrokeStyle(value)
+    fn SetStrokeStyle(&self, cx: &mut JSContext, value: StringOrCanvasGradientOrCanvasPattern) {
+        self.context.SetStrokeStyle(cx, value)
     }
 
     /// <https://html.spec.whatwg.org/multipage/#dom-context-2d-strokestyle>
@@ -186,8 +199,8 @@ impl OffscreenCanvasRenderingContext2DMethods<crate::DomTypeHolder>
     }
 
     /// <https://html.spec.whatwg.org/multipage/#dom-context-2d-strokestyle>
-    fn SetFillStyle(&self, value: StringOrCanvasGradientOrCanvasPattern) {
-        self.context.SetFillStyle(value)
+    fn SetFillStyle(&self, cx: &mut JSContext, value: StringOrCanvasGradientOrCanvasPattern) {
+        self.context.SetFillStyle(cx, value)
     }
 
     /// <https://html.spec.whatwg.org/multipage/#dom-context-2d-createlineargradient>
@@ -273,13 +286,27 @@ impl OffscreenCanvasRenderingContext2DMethods<crate::DomTypeHolder>
     }
 
     /// <https://html.spec.whatwg.org/multipage/#dom-context-2d-filltext>
-    fn FillText(&self, text: DOMString, x: f64, y: f64, max_width: Option<f64>) {
-        self.context.FillText(text, x, y, max_width)
+    fn FillText(
+        &self,
+        cx: &mut JSContext,
+        text: DOMString,
+        x: f64,
+        y: f64,
+        max_width: Option<f64>,
+    ) {
+        self.context.FillText(cx, text, x, y, max_width)
     }
 
     /// <https://html.spec.whatwg.org/multipage/#dom-context-2d-stroketext>
-    fn StrokeText(&self, text: DOMString, x: f64, y: f64, max_width: Option<f64>) {
-        self.context.StrokeText(text, x, y, max_width)
+    fn StrokeText(
+        &self,
+        cx: &mut JSContext,
+        text: DOMString,
+        x: f64,
+        y: f64,
+        max_width: Option<f64>,
+    ) {
+        self.context.StrokeText(cx, text, x, y, max_width)
     }
 
     /// <https://html.spec.whatwg.org/multipage/#textmetrics>
@@ -293,8 +320,8 @@ impl OffscreenCanvasRenderingContext2DMethods<crate::DomTypeHolder>
     }
 
     /// <https://html.spec.whatwg.org/multipage/#dom-context-2d-font>
-    fn SetFont(&self, value: DOMString) {
-        self.context.SetFont(value)
+    fn SetFont(&self, cx: &mut JSContext, value: DOMString) {
+        self.context.SetFont(cx, value)
     }
 
     /// <https://html.spec.whatwg.org/multipage/#dom-context-2d-textalign>
@@ -423,7 +450,7 @@ impl OffscreenCanvasRenderingContext2DMethods<crate::DomTypeHolder>
         self.context.PutImageData(no_gc, imagedata, dx, dy)
     }
 
-    // https://html.spec.whatwg.org/multipage/#dom-context-2d-putimagedata
+    /// <https://html.spec.whatwg.org/multipage/#dom-context-2d-putimagedata>
     fn PutImageData_(
         &self,
         no_gc: &NoGC,
@@ -584,6 +611,18 @@ impl OffscreenCanvasRenderingContext2DMethods<crate::DomTypeHolder>
     /// <https://html.spec.whatwg.org/multipage/#dom-context-2d-rect>
     fn Rect(&self, x: f64, y: f64, width: f64, height: f64) {
         self.context.Rect(x, y, width, height)
+    }
+
+    /// <https://html.spec.whatwg.org/multipage/#dom-context-2d-roundrect>
+    fn RoundRect(
+        &self,
+        x: f64,
+        y: f64,
+        width: f64,
+        height: f64,
+        radii: UnrestrictedDoubleOrDOMPointInitOrUnrestrictedDoubleOrDOMPointInitSequence,
+    ) -> ErrorResult {
+        self.context.RoundRect(x, y, width, height, radii)
     }
 
     /// <https://html.spec.whatwg.org/multipage/#dom-context-2d-quadraticcurveto>

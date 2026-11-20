@@ -22,7 +22,6 @@ use crate::traits::Equivalence;
 
 #[derive(JSTraceable, MallocSizeOf)]
 struct DroppableGPUTextureView {
-    #[ignore_malloc_size_of = "defined in webgpu"]
     #[no_trace]
     channel: WebGPU,
     #[no_trace]
@@ -79,6 +78,7 @@ impl<D: Equivalence> GPUTextureView<D> {
         label: USVString,
     ) -> DomRoot<GPUTextureView<D>> {
         reflect_dom_object_with_wrap::<D, _, _>(
+            cx,
             Box::new(GPUTextureView::new_inherited(
                 channel,
                 texture_view,
@@ -86,7 +86,6 @@ impl<D: Equivalence> GPUTextureView<D> {
                 label,
             )),
             global,
-            cx,
             GPUTextureViewWrap::<D>,
         )
     }

@@ -3,23 +3,27 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 use std::cell::Cell;
-use std::rc::Rc;
 
 use dom_struct::dom_struct;
 use js::context::JSContext;
 use script_bindings::cell::DomRefCell;
 use script_bindings::reflector::{Reflector, reflect_dom_object};
 
-use crate::dom::bindings::callback::ExceptionHandling;
+use crate::dom::bindings::callback::{ExceptionHandling, RootedCallback, TracedCallback};
 use crate::dom::bindings::codegen::Bindings::FileSystemDirectoryReaderBinding::{
     FileSystemDirectoryReaderMethods, FileSystemEntriesCallback,
 };
 use crate::dom::bindings::codegen::Bindings::FileSystemEntryBinding::ErrorCallback;
 use crate::dom::bindings::refcounted::Trusted;
 use crate::dom::bindings::reflector::DomGlobal;
-use crate::dom::bindings::root::{Dom, DomRoot};
+use crate::dom::bindings::root::{Dom, DomRoot, MutNullableDom};
+use crate::dom::domexception::{DOMErrorName, DOMException};
 use crate::dom::filesystemdirectoryentry::FileSystemDirectoryEntry;
 use crate::dom::globalscope::GlobalScope;
+
+/// Maximum number of entries returned by a single `readEntries()` call,
+/// matching Chromium's limit.
+const READ_ENTRIES_BATCH_SIZE: usize = 100;
 
 #[dom_struct]
 pub(crate) struct FileSystemDirectoryReader {
@@ -28,15 +32,30 @@ pub(crate) struct FileSystemDirectoryReader {
     idx: Cell<usize>,
     reading_flag: Cell<bool>,
     done_flag: Cell<bool>,
+    reader_error: MutNullableDom<DOMException>,
     pending_callbacks: DomRefCell<Vec<PendingEntriesCallback>>,
     next_callback: Cell<usize>,
 }
 
 #[derive(JSTraceable, MallocSizeOf)]
+#[cfg_attr(crown, crown::unrooted_must_root_lint::must_root)]
 struct PendingEntriesCallback {
     id: usize,
-    #[conditional_malloc_size_of]
-    callback: Rc<FileSystemEntriesCallback>,
+    callback: TracedCallback<FileSystemEntriesCallback>,
+    error: Option<TracedCallback<ErrorCallback>>,
+}
+
+/// The action for a `readEntries` call decided synchronously.
+#[derive(Clone, Copy)]
+enum ReadEntriesAction {
+    /// Another read already in progress.
+    InvalidState,
+    /// A previous read failed.
+    ReaderError,
+    /// Every entry already produced.
+    Done,
+    /// Start a new read.
+    Read,
 }
 
 impl FileSystemDirectoryReader {
@@ -47,6 +66,7 @@ impl FileSystemDirectoryReader {
             idx: Cell::new(0),
             reading_flag: Cell::new(false),
             done_flag: Cell::new(false),
+            reader_error: MutNullableDom::new(None),
             pending_callbacks: Default::default(),
             next_callback: Cell::new(0),
         }
@@ -69,19 +89,41 @@ impl FileSystemDirectoryReaderMethods<crate::DomTypeHolder> for FileSystemDirect
     /// <https://wicg.github.io/entries-api/#dom-filesystemdirectoryreader-readentries>
     fn ReadEntries(
         &self,
-        success_callback: Rc<FileSystemEntriesCallback>,
-        _error_callback: Option<Rc<ErrorCallback>>,
+        success_callback: RootedCallback<FileSystemEntriesCallback>,
+        error_callback: Option<RootedCallback<ErrorCallback>>,
     ) {
-        // Per spec §7.3: queue a task to invoke successCallback with the
-        // directory's children that have not yet been produced. The first
-        // call returns all children; subsequent calls return an empty list
-        // (done flag set).
-        let id = self.next_callback.get();
-        let pending_callback = PendingEntriesCallback {
-            id,
-            callback: success_callback,
+        // Steps 1-4. The checks and the flag update run synchronously,
+        // before the callback task is queued.
+        //
+        // 1. If this’s reading flag is true, queue a task to invoke
+        //    errorCallback with « a newly created "InvalidStateError"
+        //    DOMException » and "report", and abort these steps.
+        // 2. If this’s reader error is not null, queue a task to invoke
+        //    errorCallback (if given) with « reader error » and "report", and
+        //    abort these steps.
+        // 3. If this’s done flag is true, queue a task to invoke
+        //    successCallback with an empty list and "report", and abort these
+        //    steps.
+        // 4. Set this’s reading flag to true.
+        let action = if self.reading_flag.get() {
+            ReadEntriesAction::InvalidState
+        } else if self.reader_error.get().is_some() {
+            ReadEntriesAction::ReaderError
+        } else if self.done_flag.get() {
+            ReadEntriesAction::Done
+        } else {
+            self.reading_flag.set(true);
+            ReadEntriesAction::Read
         };
-        self.pending_callbacks.borrow_mut().push(pending_callback);
+
+        let id = self.next_callback.get();
+        self.pending_callbacks
+            .borrow_mut()
+            .push(PendingEntriesCallback {
+                id,
+                callback: success_callback.to_traced(),
+                error: error_callback.map(|callback| callback.to_traced()),
+            });
         self.next_callback.set(id + 1);
 
         let this = Trusted::new(self);
@@ -96,18 +138,92 @@ impl FileSystemDirectoryReaderMethods<crate::DomTypeHolder> for FileSystemDirect
                     .iter()
                     .position(|val| val.id == id);
                 if let Some(index) = maybe_index {
-                    let callback = this
+                    let error_callback = this
+                        .pending_callbacks
+                        .borrow_mut()
+                        .get(index)
+                        .and_then(|pending| pending.error.as_ref())
+                        .map(|callback| callback.root(cx));
+                    rooted!(&in(cx) let callback = this
                         .pending_callbacks
                         .borrow_mut()
                         .swap_remove(index)
-                        .callback;
-                    let entries = if this.done_flag.get() {
-                        Vec::new()
-                    } else {
-                        this.done_flag.set(true);
-                        this.dir.children()
-                    };
-                    let _ = callback.Call__(cx, entries, ExceptionHandling::Report);
+                        .callback);
+                    match action {
+                        ReadEntriesAction::InvalidState => {
+                            // 1. Invoke errorCallback with « a newly created
+                            //    "InvalidStateError" DOMException » and "report".
+                            let error = DOMException::new(
+                                cx,
+                                &this.global(),
+                                DOMErrorName::InvalidStateError,
+                            );
+                            if let Some(error_callback) = error_callback {
+                                let _ = error_callback.Call__(
+                                    cx,
+                                    &error,
+                                    ExceptionHandling::Report,
+                                );
+                            }
+                        }
+                        ReadEntriesAction::ReaderError => {
+                            // 2. Invoke errorCallback (if given) with « reader error » and "report".
+                            let error = this
+                                .reader_error
+                                .get()
+                                .expect("reader error must be set");
+                            if let Some(error_callback) = error_callback {
+                                let _ = error_callback.Call__(
+                                    cx,
+                                    &error,
+                                    ExceptionHandling::Report,
+                                );
+                            }
+                        }
+                        ReadEntriesAction::Done => {
+                            // 3. Invoke successCallback with an empty list.
+                            let _ = callback.Call__(cx, Vec::new(), ExceptionHandling::Report);
+                        }
+                        ReadEntriesAction::Read => {
+                            // 5. In parallel, run these steps:
+                            //
+                            // 5.1. If this’s directory is null, then..
+                            // TODO: (Not reachable until we hook embedder)
+                            //
+                            // 5.2. Let entries be a non-zero number of
+                            //      entries from this’s directory that have
+                            //      not yet been produced by this
+                            //      FileSystemDirectoryReader, if any.
+                            let start = this.idx.get();
+                            let entries = this.dir.children_batch(start, READ_ENTRIES_BATCH_SIZE);
+                            this.idx.set(start + entries.len());
+                            //
+                            // 5.3. If the previous step failed (for example,
+                            //      the directory was deleted or permission is denied), then:
+                            //      (Not reachable as we use in-memory entries currently)
+                            //
+                            //      1. Queue a task to run these steps:
+                            //         1. Let error be a an appropriate DOMException.
+                            //         2. Set this’s reader error to error.
+                            //         3. Set this’s reading flag to false.
+                            //         4. Invoke errorCallback (if given) with
+                            //            « error » and "report".
+                            //      2. Abort these steps.
+                            //      TODO: Reading the in-memory children cannot
+                            //      currently fail; this is where
+                            //      `reader_error` would be set.
+                            //
+                            // 5.4. Queue a task to run these steps:
+                            // 5.4.1. If entries is empty, then set this’s done flag to true.
+                            if entries.is_empty() {
+                                this.done_flag.set(true);
+                            }
+                            // 5.4.2. Set this’s reading flag to false.
+                            this.reading_flag.set(false);
+                            // 5.4.3. Invoke successCallback with « entries » and "report".
+                            let _ = callback.Call__(cx, entries, ExceptionHandling::Report);
+                        }
+                    }
                 }
             }));
     }

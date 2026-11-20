@@ -66,7 +66,7 @@ impl WebStorageThreadFactory for GenericSender<WebStorageThreadMsg> {
     }
 }
 
-#[derive(Deserialize, MallocSizeOf, Serialize)]
+#[derive(Default, Deserialize, MallocSizeOf, Serialize)]
 pub struct StorageOrigins {
     // TODO: Consider grouping by eTLD+1
     // TODO: Consider ImmutableOrigin instead of String for tracking origins
@@ -138,10 +138,12 @@ impl OriginEntry {
     }
 
     pub fn insert(&mut self, key: String, value: String) -> Option<String> {
-        let old_value = self.tree.insert(key.clone(), value.clone());
+        let key_len = key.len();
+        let value_len = value.len();
+        let old_value = self.tree.insert(key, value);
         let size_change = match &old_value {
-            Some(old) => value.len() as isize - old.len() as isize,
-            None => (key.len() + value.len()) as isize,
+            Some(old) => value_len as isize - old.len() as isize,
+            None => (key_len + value_len) as isize,
         };
         self.size = (self.size as isize + size_change) as usize;
         old_value
@@ -219,10 +221,11 @@ impl WebStorageManager {
         port: GenericReceiver<WebStorageThreadMsg>,
         config_dir: Option<PathBuf>,
     ) -> WebStorageManager {
-        let mut local_storage_origins = StorageOrigins::new();
-        if let Some(ref config_dir) = config_dir {
-            read_json_from_file(&mut local_storage_origins, config_dir, "localstorage.json");
-        }
+        let local_storage_origins = config_dir
+            .as_ref()
+            .and_then(|config_dir| read_json_from_file(config_dir, "localstorage.json").ok())
+            .unwrap_or_default();
+
         WebStorageManager {
             port,
             session_storage_origins: StorageOrigins::new(),
@@ -538,6 +541,10 @@ impl WebStorageManager {
 
         let mut new_total_size = total_size + value.len();
         if let Some(old_value) = entry.inner().get(&name) {
+            if old_value == &value {
+                sender.send(Ok((false, None))).unwrap();
+                return;
+            }
             new_total_size -= old_value.len();
         } else {
             new_total_size += name.len();
@@ -545,23 +552,14 @@ impl WebStorageManager {
 
         let message = if new_total_size > QUOTA_SIZE_LIMIT {
             Err(())
-        } else {
-            let result =
-                entry
-                    .insert(name.clone(), value.clone())
-                    .map_or(Ok((true, None)), |old| {
-                        if old == value {
-                            Ok((false, None))
-                        } else {
-                            Ok((true, Some(old)))
-                        }
-                    });
-            if storage_type == WebStorageType::Local &&
-                let Ok(env) = self.get_environment_mut(&origin)
-            {
+        } else if storage_type == WebStorageType::Local {
+            let old_value = entry.insert(name.clone(), value.clone());
+            if let Ok(env) = self.get_environment_mut(&origin) {
                 env.set(&name, &value);
             }
-            result
+            Ok((true, old_value))
+        } else {
+            Ok((true, entry.insert(name, value)))
         };
         sender.send(message).unwrap();
     }

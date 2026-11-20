@@ -188,6 +188,15 @@ class WebDriverBidiBluetoothProtocolPart(BidiBluetoothProtocolPart):
             context=context,
             address=address)
 
+    async def simulate_gatt_mtu_change(self,
+            context: str,
+            address: str,
+            mtu: int) -> None:
+        await self.webdriver.bidi_session.bluetooth.simulate_gatt_mtu_change(
+            context=context,
+            address=address,
+            mtu=mtu)
+
     async def simulate_service(self,
             context: str,
             address: str,
@@ -404,14 +413,30 @@ class WebDriverBidiEmulationProtocolPart(BidiEmulationProtocolPart):
         return await self.webdriver.bidi_session.emulation.set_locale_override(
             locale=locale, contexts=contexts)
 
+    async def set_media_features_override(self, features, contexts):
+        return await self.webdriver.bidi_session.emulation.set_media_features_override(
+            features=features, contexts=contexts)
+
     async def set_screen_orientation_override(self, screen_orientation,
             contexts):
         return await self.webdriver.bidi_session.emulation.set_screen_orientation_override(
             screen_orientation=screen_orientation, contexts=contexts)
 
+    async def set_scrollbar_type_override(self, scrollbar_type, contexts):
+        return await self.webdriver.bidi_session.emulation.set_scrollbar_type_override(
+            scrollbar_type=scrollbar_type, contexts=contexts)
+
+    async def set_text_layout_mode_override(self, text_layout_mode, contexts):
+        return await self.webdriver.bidi_session.emulation.set_text_layout_mode_override(
+            text_layout_mode=text_layout_mode, contexts=contexts)
+
     async def set_touch_override(self, max_touch_points, contexts):
         return await self.webdriver.bidi_session.emulation.set_touch_override(
             max_touch_points=max_touch_points, contexts=contexts)
+
+    async def set_viewport_meta_override(self, viewport_meta, contexts):
+        return await self.webdriver.bidi_session.emulation.set_viewport_meta_override(
+            viewport_meta=viewport_meta, contexts=contexts)
 
 
 class WebDriverBidiPermissionsProtocolPart(BidiPermissionsProtocolPart):
@@ -616,6 +641,10 @@ class WebDriverCookiesProtocolPart(CookiesProtocolPart):
 class WebDriverWindowProtocolPart(WindowProtocolPart):
     def setup(self):
         self.webdriver = self.parent.webdriver
+
+    def create(self, type_hint=None):
+        self.logger.debug(f"Creating new {type_hint}")
+        return self.webdriver.new_window(type_hint=type_hint)
 
     def minimize(self):
         self.logger.debug("Minimizing")
@@ -886,6 +915,11 @@ class WebDriverVirtualAuthenticatorProtocolPart(VirtualAuthenticatorProtocolPart
 
     def set_user_verified(self, authenticator_id, uv):
         return self.webdriver.send_session_command("POST", "webauthn/authenticator/%s/uv" % authenticator_id, uv)
+
+    def set_credential_properties(self, authenticator_id, credential_id, props):
+        return self.webdriver.send_session_command(
+            "POST",
+            "webauthn/authenticator/%s/credentials/%s/props" % (authenticator_id, credential_id), props)
 
 
 class WebDriverSPCTransactionsProtocolPart(SPCTransactionsProtocolPart):

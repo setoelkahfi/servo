@@ -3,9 +3,8 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 use std::cell::{Cell, Ref, RefCell};
-use std::rc::Rc;
 
-use cssparser::{Parser, ParserInput};
+use cssparser::Parser;
 use dom_struct::dom_struct;
 use fonts::{
     FontContext, FontContextWebFontMethods, FontFaceRuleInfo, FontTemplate, LowercaseFontFamilyName,
@@ -13,6 +12,7 @@ use fonts::{
 use js::context::JSContext;
 use js::rust::HandleObject;
 use script_bindings::cell::DomRefCell;
+use script_bindings::domstring::TracedDOMString;
 use script_bindings::reflector::{Reflector, reflect_dom_object_with_proto};
 use servo_arc::Arc as ServoArc;
 use style::error_reporting::ParseErrorReporter;
@@ -21,23 +21,23 @@ use style::properties::font_face::Descriptors;
 use style::stylesheets::{CssRuleType, FontFaceRule, UrlExtraData};
 use style_traits::{ParsingMode, ToCss};
 
-use crate::css::css::parser_context_for_document_with_reporter;
+use crate::css::css::{parser_context_for_document_with_reporter, parser_context_for_worker};
 use crate::dom::bindings::buffer_source::get_buffer_source_copy;
 use crate::dom::bindings::codegen::Bindings::FontFaceBinding::{
-    FontFaceDescriptors, FontFaceLoadStatus, FontFaceMethods,
+    FontFaceDescriptors as FontFaceInputDescriptors, FontFaceLoadStatus, FontFaceMethods,
 };
 use crate::dom::bindings::codegen::Bindings::WindowBinding::WindowMethods;
 use crate::dom::bindings::codegen::UnionTypes;
 use crate::dom::bindings::codegen::UnionTypes::StringOrArrayBufferViewOrArrayBuffer;
 use crate::dom::bindings::error::{Error, ErrorResult, Fallible};
+use crate::dom::bindings::inheritance::Castable;
 use crate::dom::bindings::refcounted::Trusted;
 use crate::dom::bindings::reflector::DomGlobal;
 use crate::dom::bindings::root::{DomRoot, MutNullableDom};
 use crate::dom::bindings::str::DOMString;
 use crate::dom::css::fontfaceset::FontFaceSet;
 use crate::dom::globalscope::GlobalScope;
-use crate::dom::node::NodeTraits;
-use crate::dom::promise::Promise;
+use crate::dom::promise::{Promise, RootedPromise, TracedPromise};
 use crate::dom::window::Window;
 
 /// <https://drafts.csswg.org/css-font-loading/#fontface-interface>
@@ -45,7 +45,9 @@ use crate::dom::window::Window;
 pub struct FontFace {
     reflector: Reflector,
     status: Cell<FontFaceLoadStatus>,
-    family_name: DomRefCell<DOMString>,
+    family_name: DomRefCell<TracedDOMString>,
+
+    #[no_trace = "Does not contain managed objects"]
     descriptors: DomRefCell<FontFaceDescriptors>,
 
     /// A reference to the [`FontFaceSet`] that this `FontFace` is a member of, if it has been
@@ -67,8 +69,7 @@ pub struct FontFace {
     urls: DomRefCell<Option<SourceList>>,
 
     /// <https://drafts.csswg.org/css-font-loading/#dom-fontface-fontstatuspromise-slot>
-    #[conditional_malloc_size_of]
-    font_status_promise: Rc<Promise>,
+    font_status_promise: TracedPromise,
 
     /// The `@font-face` rule that this `FontFace` object is [css-connected] to, if any.
     ///
@@ -85,59 +86,66 @@ pub struct FontFace {
 /// to implement than parsing each declaration on its own.
 fn parse_font_face_descriptors(
     global: &GlobalScope,
-    family_name: &DOMString,
+    family_name: &TracedDOMString,
     sources: Option<&DOMString>,
     input_descriptors: &FontFaceDescriptors,
 ) -> Fallible<FontFaceRule> {
-    let window = global.as_window(); // TODO: Support calling FontFace APIs from Worker
-    let document = window.Document();
-    let url_data = UrlExtraData(document.owner_global().api_base_url().get_arc());
+    let document = global.downcast::<Window>().map(|window| window.Document());
+    let url_data = UrlExtraData(global.api_base_url().get_arc());
     let error_reporter = FontFaceErrorReporter {
         not_encountered_error: Cell::new(true),
     };
-    let parser_context = parser_context_for_document_with_reporter(
-        &document,
-        CssRuleType::FontFace,
-        ParsingMode::DEFAULT,
-        &url_data,
-        &error_reporter,
-    );
+    let parser_context = match &document {
+        Some(document) => parser_context_for_document_with_reporter(
+            document,
+            CssRuleType::FontFace,
+            ParsingMode::DEFAULT,
+            &url_data,
+            &error_reporter,
+        ),
+        // Workers have no document, so the descriptors are parsed against the worker's URL.
+        None => parser_context_for_worker(
+            CssRuleType::FontFace,
+            ParsingMode::DEFAULT,
+            &url_data,
+            Some(&error_reporter),
+        ),
+    };
 
     let FontFaceDescriptors {
-        ascentOverride,
-        descentOverride,
+        ascent_override,
+        descent_override,
         display,
-        featureSettings,
-        lineGapOverride,
-        stretch,
+        feature_settings,
+        line_gap_override,
+        width,
         style,
-        unicodeRange,
-        variationSettings,
+        unicode_range,
+        variation_settings,
         weight,
     } = input_descriptors;
 
     let maybe_sources = sources.map_or_else(String::new, |sources| format!("src: {sources};"));
     let font_face_rule = format!(
         r"
-        ascent-override: {ascentOverride};
-        descent-override: {descentOverride};
+        ascent-override: {ascent_override};
+        descent-override: {descent_override};
         font-display: {display};
         font-family: {family_name};
-        font-feature-settings: {featureSettings};
-        font-stretch: {stretch};
+        font-feature-settings: {feature_settings};
         font-style: {style};
-        font-variation-settings: {variationSettings};
+        font-variation-settings: {variation_settings};
         font-weight: {weight};
-        line-gap-override: {lineGapOverride};
-        unicode-range: {unicodeRange};
+        font-width: {width};
+        line-gap-override: {line_gap_override};
+        unicode-range: {unicode_range};
         {maybe_sources}
     "
     );
 
     // TODO: Should this be the source location in the script that invoked the font face API?
     let location = cssparser::SourceLocation { line: 0, column: 0 };
-    let mut input = ParserInput::new(&font_face_rule);
-    let mut parser = Parser::new(&mut input);
+    let mut parser = Parser::new(&font_face_rule);
     let mut parsed_font_face_rule =
         style::font_face::parse_font_face_block(&parser_context, &mut parser, location);
 
@@ -165,20 +173,54 @@ fn parse_font_face_descriptors(
     }
 }
 
+#[derive(Clone, MallocSizeOf)]
+pub(crate) struct FontFaceDescriptors {
+    ascent_override: DOMString,
+    descent_override: DOMString,
+    display: DOMString,
+    feature_settings: DOMString,
+    line_gap_override: DOMString,
+    style: DOMString,
+    unicode_range: DOMString,
+    variation_settings: DOMString,
+    weight: DOMString,
+    width: DOMString,
+}
+
+impl From<&FontFaceInputDescriptors> for FontFaceDescriptors {
+    fn from(descriptors: &FontFaceInputDescriptors) -> Self {
+        Self {
+            ascent_override: descriptors.ascentOverride.clone(),
+            descent_override: descriptors.descentOverride.clone(),
+            display: descriptors.display.clone(),
+            feature_settings: descriptors.featureSettings.clone(),
+            line_gap_override: descriptors.lineGapOverride.clone(),
+            style: descriptors.style.clone(),
+            unicode_range: descriptors.unicodeRange.clone(),
+            variation_settings: descriptors.variationSettings.clone(),
+            weight: descriptors.weight.clone(),
+            width: descriptors
+                .width
+                .clone()
+                .unwrap_or(descriptors.stretch.clone()),
+        }
+    }
+}
+
 /// Converts the descriptors of a `@font-face` rule (as defined by stylo) to
 /// the the IDL `FontFaceDescriptors` dictionary used by the JS interface.
 fn serialize_parsed_descriptors(descriptors: &Descriptors) -> FontFaceDescriptors {
     FontFaceDescriptors {
-        ascentOverride: descriptors.ascent_override.to_css_string().into(),
-        descentOverride: descriptors.descent_override.to_css_string().into(),
+        ascent_override: descriptors.ascent_override.to_css_string().into(),
+        descent_override: descriptors.descent_override.to_css_string().into(),
         display: descriptors.font_display.to_css_string().into(),
-        featureSettings: descriptors.font_feature_settings.to_css_string().into(),
-        lineGapOverride: descriptors.line_gap_override.to_css_string().into(),
-        stretch: descriptors.font_stretch.to_css_string().into(),
+        feature_settings: descriptors.font_feature_settings.to_css_string().into(),
+        line_gap_override: descriptors.line_gap_override.to_css_string().into(),
         style: descriptors.font_style.to_css_string().into(),
-        unicodeRange: descriptors.unicode_range.to_css_string().into(),
-        variationSettings: descriptors.font_variation_settings.to_css_string().into(),
+        unicode_range: descriptors.unicode_range.to_css_string().into(),
+        variation_settings: descriptors.font_variation_settings.to_css_string().into(),
         weight: descriptors.font_weight.to_css_string().into(),
+        width: descriptors.font_width.to_css_string().into(),
     }
 }
 
@@ -218,20 +260,20 @@ impl FontFace {
             Box::new(Self {
                 reflector: Reflector::new(),
                 font_face_set: MutNullableDom::default(),
-                font_status_promise,
+                font_status_promise: font_status_promise.to_traced(),
                 family_name: DomRefCell::default(),
                 urls: Default::default(),
                 descriptors: DomRefCell::new(FontFaceDescriptors {
-                    ascentOverride: DOMString::new(),
-                    descentOverride: DOMString::new(),
+                    ascent_override: DOMString::new(),
+                    descent_override: DOMString::new(),
                     display: DOMString::new(),
-                    featureSettings: DOMString::new(),
-                    lineGapOverride: DOMString::new(),
-                    stretch: DOMString::new(),
+                    feature_settings: DOMString::new(),
+                    line_gap_override: DOMString::new(),
                     style: DOMString::new(),
-                    unicodeRange: DOMString::new(),
-                    variationSettings: DOMString::new(),
+                    unicode_range: DOMString::new(),
+                    variation_settings: DOMString::new(),
                     weight: DOMString::new(),
+                    width: DOMString::new(),
                 }),
                 status: Cell::new(FontFaceLoadStatus::Error),
                 template: RefCell::default(),
@@ -247,7 +289,7 @@ impl FontFace {
         family_name: DOMString,
         urls: Option<SourceList>,
         descriptors: &Descriptors,
-        font_status_promise: Rc<Promise>,
+        font_status_promise: &RootedPromise,
     ) -> Self {
         Self {
             reflector: Reflector::new(),
@@ -259,10 +301,10 @@ impl FontFace {
             descriptors: DomRefCell::new(serialize_parsed_descriptors(descriptors)),
 
             font_face_set: MutNullableDom::default(),
-            family_name: DomRefCell::new(family_name),
+            family_name: DomRefCell::new(family_name.traced()),
             urls: DomRefCell::new(urls),
             template: RefCell::default(),
-            font_status_promise,
+            font_status_promise: font_status_promise.to_traced(),
             css_font_face_rule: Default::default(),
         }
     }
@@ -275,7 +317,7 @@ impl FontFace {
         font_family: DOMString,
         urls: Option<SourceList>,
         descriptors: &Descriptors,
-        font_status_promise: Rc<Promise>,
+        font_status_promise: &RootedPromise,
     ) -> DomRoot<Self> {
         reflect_dom_object_with_proto(
             cx,
@@ -295,7 +337,7 @@ impl FontFace {
         family_name: DOMString,
         descriptors: FontFaceDescriptors,
         src: Option<SourceList>,
-        font_status_promise: Rc<Promise>,
+        font_status_promise: &RootedPromise,
         font_face_rule: ServoArc<FontFaceRuleInfo>,
     ) -> Self {
         Self {
@@ -303,10 +345,10 @@ impl FontFace {
             status: Cell::new(FontFaceLoadStatus::Loading),
             descriptors: DomRefCell::new(descriptors),
             font_face_set: MutNullableDom::default(),
-            family_name: DomRefCell::new(family_name),
+            family_name: DomRefCell::new(family_name.traced()),
             urls: DomRefCell::new(src),
             template: RefCell::default(),
-            font_status_promise,
+            font_status_promise: font_status_promise.to_traced(),
             css_font_face_rule: DomRefCell::new(Some(font_face_rule)),
         }
     }
@@ -321,7 +363,7 @@ impl FontFace {
             .descriptors
             .font_family
             .as_ref()
-            .map(|name| DOMString::from(&*name.name))
+            .map(|name| TracedDOMString::from(name.name.clone()).root())
         else {
             // Web fonts without a family name are not loaded, and they should not appear in document.fonts either.
             return None;
@@ -340,7 +382,7 @@ impl FontFace {
                 family_name,
                 descriptors,
                 font_face_rule.descriptors.src.clone(),
-                font_status_promise,
+                &font_status_promise,
                 font_face_rule,
             )),
             global,
@@ -395,7 +437,6 @@ impl FontFace {
             .ok()
             .and_then(|parsed_font_face_rule| {
                 global
-                    .as_window()
                     .font_context()
                     .construct_web_font_from_data(&data, (&parsed_font_face_rule).into())
             });
@@ -476,7 +517,7 @@ impl FontFace {
 impl FontFaceMethods<crate::DomTypeHolder> for FontFace {
     /// <https://drafts.csswg.org/css-font-loading/#dom-fontface-family>
     fn Family(&self) -> DOMString {
-        self.family_name.borrow().clone()
+        self.family_name.borrow().clone().root()
     }
 
     /// <https://drafts.csswg.org/css-font-loading/#dom-fontface-family>
@@ -484,7 +525,7 @@ impl FontFaceMethods<crate::DomTypeHolder> for FontFace {
         let descriptors = self.descriptors.borrow();
         let global = self.global();
         let _ = parse_font_face_descriptors(&global, &family_name, None, &descriptors)?;
-        *self.family_name.borrow_mut() = family_name;
+        *self.family_name.borrow_mut() = family_name.traced();
         Ok(())
     }
 
@@ -512,51 +553,51 @@ impl FontFaceMethods<crate::DomTypeHolder> for FontFace {
         self.validate_and_set_descriptors(new_descriptors)
     }
 
-    /// <https://drafts.csswg.org/css-font-loading/#dom-fontface-stretch>
-    fn Stretch(&self) -> DOMString {
-        self.descriptors.borrow().stretch.clone()
+    /// <https://drafts.csswg.org/css-font-loading/#dom-fontface-width>
+    fn Width(&self) -> DOMString {
+        self.descriptors.borrow().width.clone()
     }
 
-    /// <https://drafts.csswg.org/css-font-loading/#dom-fontface-stretch>
-    fn SetStretch(&self, value: DOMString) -> ErrorResult {
+    /// <https://drafts.csswg.org/css-font-loading/#dom-fontface-width>
+    fn SetWidth(&self, value: DOMString) -> ErrorResult {
         let mut new_descriptors = self.descriptors.borrow().clone();
-        new_descriptors.stretch = value;
+        new_descriptors.width = value;
         self.validate_and_set_descriptors(new_descriptors)
     }
 
     /// <https://drafts.csswg.org/css-font-loading/#dom-fontface-unicoderange>
     fn UnicodeRange(&self) -> DOMString {
-        self.descriptors.borrow().unicodeRange.clone()
+        self.descriptors.borrow().unicode_range.clone()
     }
 
     /// <https://drafts.csswg.org/css-font-loading/#dom-fontface-unicoderange>
     fn SetUnicodeRange(&self, value: DOMString) -> ErrorResult {
         let mut new_descriptors = self.descriptors.borrow().clone();
-        new_descriptors.unicodeRange = value;
+        new_descriptors.unicode_range = value;
         self.validate_and_set_descriptors(new_descriptors)
     }
 
     /// <https://drafts.csswg.org/css-font-loading/#dom-fontface-featuresettings>
     fn FeatureSettings(&self) -> DOMString {
-        self.descriptors.borrow().featureSettings.clone()
+        self.descriptors.borrow().feature_settings.clone()
     }
 
     /// <https://drafts.csswg.org/css-font-loading/#dom-fontface-featuresettings>
     fn SetFeatureSettings(&self, value: DOMString) -> ErrorResult {
         let mut new_descriptors = self.descriptors.borrow().clone();
-        new_descriptors.featureSettings = value;
+        new_descriptors.feature_settings = value;
         self.validate_and_set_descriptors(new_descriptors)
     }
 
     /// <https://drafts.csswg.org/css-font-loading/#dom-fontface-variationsettings>
     fn VariationSettings(&self) -> DOMString {
-        self.descriptors.borrow().variationSettings.clone()
+        self.descriptors.borrow().variation_settings.clone()
     }
 
     /// <https://drafts.csswg.org/css-font-loading/#dom-fontface-variationsettings>
     fn SetVariationSettings(&self, value: DOMString) -> ErrorResult {
         let mut new_descriptors = self.descriptors.borrow().clone();
-        new_descriptors.variationSettings = value;
+        new_descriptors.variation_settings = value;
         self.validate_and_set_descriptors(new_descriptors)
     }
 
@@ -574,37 +615,37 @@ impl FontFaceMethods<crate::DomTypeHolder> for FontFace {
 
     /// <https://drafts.csswg.org/css-font-loading/#dom-fontface-ascentoverride>
     fn AscentOverride(&self) -> DOMString {
-        self.descriptors.borrow().ascentOverride.clone()
+        self.descriptors.borrow().ascent_override.clone()
     }
 
     /// <https://drafts.csswg.org/css-font-loading/#dom-fontface-ascentoverride>
     fn SetAscentOverride(&self, value: DOMString) -> ErrorResult {
         let mut new_descriptors = self.descriptors.borrow().clone();
-        new_descriptors.ascentOverride = value;
+        new_descriptors.ascent_override = value;
         self.validate_and_set_descriptors(new_descriptors)
     }
 
     /// <https://drafts.csswg.org/css-font-loading/#dom-fontface-descentoverride>
     fn DescentOverride(&self) -> DOMString {
-        self.descriptors.borrow().descentOverride.clone()
+        self.descriptors.borrow().descent_override.clone()
     }
 
     /// <https://drafts.csswg.org/css-font-loading/#dom-fontface-descentoverride>
     fn SetDescentOverride(&self, value: DOMString) -> ErrorResult {
         let mut new_descriptors = self.descriptors.borrow().clone();
-        new_descriptors.descentOverride = value;
+        new_descriptors.descent_override = value;
         self.validate_and_set_descriptors(new_descriptors)
     }
 
     /// <https://drafts.csswg.org/css-font-loading/#dom-fontface-linegapoverride>
     fn LineGapOverride(&self) -> DOMString {
-        self.descriptors.borrow().lineGapOverride.clone()
+        self.descriptors.borrow().line_gap_override.clone()
     }
 
     /// <https://drafts.csswg.org/css-font-loading/#dom-fontface-linegapoverride>
     fn SetLineGapOverride(&self, value: DOMString) -> ErrorResult {
         let mut new_descriptors = self.descriptors.borrow().clone();
-        new_descriptors.lineGapOverride = value;
+        new_descriptors.line_gap_override = value;
         self.validate_and_set_descriptors(new_descriptors)
     }
 
@@ -617,15 +658,15 @@ impl FontFaceMethods<crate::DomTypeHolder> for FontFace {
     /// load. For fonts constructed from a buffer source, or fonts that are already loading or
     /// loaded, it does nothing.
     /// <https://drafts.csswg.org/css-font-loading/#font-face-load>
-    fn Load(&self, cx: &mut JSContext) -> Rc<Promise> {
+    fn Load(&self, cx: &mut JSContext) -> RootedPromise {
         // Step 2. If font face’s [[Urls]] slot is null, or its status attribute is anything
         // other than "unloaded", return font face’s [[FontStatusPromise]] and abort these
         // steps.
-        let Some(sources) = self.urls.borrow_mut().take() else {
-            return self.font_status_promise.clone();
+        let Some(sources) = self.urls.safe_borrow_mut(cx.no_gc()).take() else {
+            return self.font_status_promise.root(cx);
         };
         if self.status.get() != FontFaceLoadStatus::Unloaded {
-            return self.font_status_promise.clone();
+            return self.font_status_promise.root(cx);
         }
 
         let global = self.global();
@@ -681,14 +722,12 @@ impl FontFaceMethods<crate::DomTypeHolder> for FontFace {
             .font_face_rule(&global)
             .expect("Parsing shouldn't fail as descriptors are valid by construction");
 
-        // Construct a WebFontDocumentContext object for the current document.
-        let document_context = global.as_window().web_font_context(cx.no_gc());
+        // Construct a WebFontDocumentContext object for this global.
+        let document_context = global.web_font_context(cx.no_gc());
 
         // Step 4. Using the value of font face’s [[Urls]] slot, attempt to load a font as defined
         // in [CSS-FONTS-3], as if it was the value of a @font-face rule’s src descriptor.
-        // TODO: FontFaceSet is not supported on Workers yet. The `as_window` call below should be
-        // replaced when we do support it.
-        global.as_window().font_context().load_web_font_for_script(
+        global.font_context().load_web_font_for_script(
             global.webview_id(),
             sources,
             (&parsed_font_face_rule).into(),
@@ -707,22 +746,22 @@ impl FontFaceMethods<crate::DomTypeHolder> for FontFace {
             font_face_set.handle_font_face_status_changed(cx, self);
         }
 
-        self.font_status_promise.clone()
+        self.font_status_promise.root(cx)
     }
 
     /// <https://drafts.csswg.org/css-font-loading/#dom-fontface-loaded>
-    fn Loaded(&self) -> Rc<Promise> {
-        self.font_status_promise.clone()
+    fn Loaded(&self, cx: &JSContext) -> RootedPromise {
+        self.font_status_promise.root(cx)
     }
 
     /// <https://drafts.csswg.org/css-font-loading/#font-face-constructor>
     fn Constructor(
         cx: &mut JSContext,
-        window: &Window,
+        global: &GlobalScope,
         proto: Option<HandleObject>,
         family: DOMString,
         source: UnionTypes::StringOrArrayBufferViewOrArrayBuffer,
-        descriptors: &FontFaceDescriptors,
+        descriptors: &FontFaceInputDescriptors,
     ) -> DomRoot<FontFace> {
         // Step 2. If the source argument was a CSSOMString, set font face’s internal [[Urls]] slot to the string.
         let url_source = if let StringOrArrayBufferViewOrArrayBuffer::String(source) = &source {
@@ -736,8 +775,8 @@ impl FontFaceMethods<crate::DomTypeHolder> for FontFace {
         // according to the grammars of the corresponding descriptors of the CSS @font-face rule If
         // the source argument is a CSSOMString, parse it according to the grammar of the CSS src
         // descriptor of the @font-face rule.
-        let global = window.as_global_scope();
-        let parse_result = parse_font_face_descriptors(global, &family, url_source, descriptors);
+        let parse_result =
+            parse_font_face_descriptors(global, &family, url_source, &descriptors.into());
 
         let Ok(ref parsed_font_face_rule) = parse_result else {
             // If any of them fail to parse correctly, reject font face’s
@@ -759,7 +798,7 @@ impl FontFaceMethods<crate::DomTypeHolder> for FontFace {
             family,
             sources,
             &parsed_font_face_rule.descriptors,
-            font_status_promise,
+            &font_status_promise,
         );
 
         // If font face’s status is "error", terminate this algorithm;

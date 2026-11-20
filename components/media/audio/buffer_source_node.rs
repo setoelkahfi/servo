@@ -2,6 +2,8 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
+use std::sync::Arc;
+
 use malloc_size_of_derive::MallocSizeOf;
 
 use crate::audio_node::{
@@ -15,7 +17,7 @@ use crate::param::{Param, ParamType};
 #[derive(Debug, Clone, MallocSizeOf)]
 pub enum AudioBufferSourceNodeMessage {
     /// Set the data block holding the audio sample data to be played.
-    SetBuffer(Option<AudioBuffer>),
+    SetBuffer(#[conditional_malloc_size_of] Option<Arc<AudioBuffer>>),
     /// Set loop parameter.
     SetLoopEnabled(bool),
     /// Set loop parameter.
@@ -30,7 +32,8 @@ pub enum AudioBufferSourceNodeMessage {
 #[derive(Debug, Clone, MallocSizeOf)]
 pub struct AudioBufferSourceNodeOptions {
     /// The audio asset to be played.
-    pub buffer: Option<AudioBuffer>,
+    #[conditional_malloc_size_of]
+    pub buffer: Option<Arc<AudioBuffer>>,
     /// The initial value for the detune AudioParam.
     pub detune: f32,
     /// The initial value for the loop_enabled attribute.
@@ -63,7 +66,7 @@ impl Default for AudioBufferSourceNodeOptions {
 pub(crate) struct AudioBufferSourceNode {
     channel_info: ChannelInfo,
     /// A data block holding the audio sample data to be played.
-    buffer: Option<AudioBuffer>,
+    buffer: Option<Arc<AudioBuffer>>,
     /// How many more buffer-frames to output. See buffer_pos for clarification.
     buffer_duration: f64,
     /// "Index" of the next buffer frame to play. "Index" is in quotes because
@@ -432,6 +435,15 @@ impl AudioBuffer {
                     self.buffers[chan as usize][prev]
                 }
             },
+        }
+    }
+
+    pub fn scale(&mut self, scale: f64) {
+        for buffer in self.buffers.as_mut_slice() {
+            *buffer = buffer
+                .iter()
+                .map(|x| (*x as f64 * scale) as f32)
+                .collect::<Vec<_>>();
         }
     }
 

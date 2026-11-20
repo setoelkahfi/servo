@@ -11,7 +11,7 @@ use script::layout_dom::ServoLayoutNode;
 use style::context::{SharedStyleContext, StyleContext};
 use style::dom::{NodeInfo, TElement, TNode};
 use style::selector_parser::RestyleDamage;
-use style::traversal::{DomTraversal, PerLevelTraversalData, recalc_style_at};
+use style::traversal::{DomTraversal, recalc_style_at};
 
 use crate::BoxTree;
 use crate::context::LayoutContext;
@@ -39,7 +39,6 @@ where
 {
     fn process_preorder<F>(
         &self,
-        traversal_data: &PerLevelTraversalData,
         context: &mut StyleContext<E>,
         node: E::ConcreteNode,
         note_child: F,
@@ -53,6 +52,7 @@ where
         let layout_element = dangerous_style_element.layout_element();
         let had_style_data = layout_element.style_data().is_some();
         layout_element.initialize_style_and_layout_data::<DOMLayoutData>();
+        layout_element.ensure_presentational_hints();
 
         let mut element_data = dangerous_style_element.mutate_data().unwrap();
         if !had_style_data {
@@ -61,7 +61,6 @@ where
 
         recalc_style_at(
             self,
-            traversal_data,
             context,
             dangerous_style_element,
             &mut element_data,

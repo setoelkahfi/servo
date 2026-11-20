@@ -15,14 +15,12 @@ use bitflags::bitflags;
 use crossbeam_channel::Sender;
 use dpi::PhysicalSize;
 use embedder_traits::{
-    EventLoopWaker, InputEventAndId, InputEventId, InputEventResult, ScreenshotCaptureError,
-    Scroll, ShutdownState, ViewportDetails, WebViewPoint, WebViewRect,
+    EventLoopWaker, InputEventAndId, InputEventId, InputEventResult, PipelineRect,
+    ScreenshotCaptureError, Scroll, ShutdownState, ViewportDetails, WebViewPoint, WebViewRect,
 };
 use euclid::{Scale, Size2D};
 use image::RgbaImage;
-use log::debug;
-#[cfg(feature = "webgl")]
-use log::warn;
+use log::{debug, warn};
 use paint_api::rendering_context::RenderingContext;
 use paint_api::{
     PaintMessage, PaintProxy, PainterSurfmanDetails, PainterSurfmanDetailsMap,
@@ -52,7 +50,7 @@ use webgl::webgl_thread::WebGLContextBusyMap;
 #[cfg(feature = "webgpu")]
 use webgpu::canvas_context::WebGpuExternalImageMap;
 use webrender::{CaptureBits, MemoryReport};
-use webrender_api::units::{DevicePixel, DevicePoint};
+use webrender_api::units::{DevicePixel, DevicePoint, DeviceRect};
 use webrender_api::{FontInstanceKey, FontKey, ImageKey};
 #[cfg(feature = "webxr")]
 use webxr::WebXrRegistry;
@@ -188,6 +186,8 @@ bitflags! {
         const StartedFlinging = 1 << 4;
         /// A blinking text caret requires a redraw.
         const BlinkingCaret = 1 << 5;
+        /// The observers of the refresh driver wait for a paint after the next frame start.
+        const FrameStart = 1 << 6;
     }
 }
 
@@ -217,11 +217,13 @@ impl Paint {
 
         // Create the WebXR main thread.
         #[cfg(feature = "webxr")]
-        let webxr_main_thread = webxr::MainThreadRegistry::new(
+        let mut webxr_main_thread = webxr::MainThreadRegistry::new(
             state.event_loop_waker.clone(),
             webxr_layer_grand_manager,
         )
         .expect("Failed to create WebXR device registry");
+        #[cfg(feature = "webxr")]
+        webxr_main_thread.register_fallback(webxr::inline::InlineDiscovery);
 
         #[cfg(feature = "webgl")]
         let webgl_paint = WebGLPaint {
@@ -272,22 +274,28 @@ impl Paint {
         }
 
         let painter = Painter::new(rendering_context.clone(), self);
-        let connection = rendering_context
-            .connection()
-            .expect("Failed to get connection");
-        let adapter = connection
-            .create_adapter()
-            .expect("Failed to create adapter");
-
-        let painter_surfman_details = PainterSurfmanDetails {
-            connection,
-            adapter,
-        };
-        self.painter_surfman_details_map
-            .insert(painter.painter_id, painter_surfman_details);
-
         let painter_id = painter.painter_id;
         self.painters.push(Rc::new(RefCell::new(painter)));
+
+        // These are only used to serve WebGL external images, which handles their
+        // absence from the map
+        let Some(connection) = rendering_context.connection() else {
+            warn!("The rendering context has no surfman connection, WebGL will be unavailable");
+            return painter_id;
+        };
+        let Some(adapter) = rendering_context.adapter() else {
+            warn!("Could not retrieve surfman adapter, WebGL will be unavailable");
+            return painter_id;
+        };
+
+        self.painter_surfman_details_map.insert(
+            painter_id,
+            PainterSurfmanDetails {
+                connection,
+                adapter,
+            },
+        );
+
         painter_id
     }
 
@@ -545,13 +553,21 @@ impl Paint {
                 font_key,
                 size,
                 flags,
+                platform_options,
                 variations,
             ) => {
                 debug_assert!(painter_id == font_key.into());
                 debug_assert!(painter_id == font_instance_key.into());
 
                 if let Some(mut painter) = self.maybe_painter_mut(painter_id) {
-                    painter.add_font_instance(font_instance_key, font_key, size, flags, variations);
+                    painter.add_font_instance(
+                        font_instance_key,
+                        font_key,
+                        size,
+                        flags,
+                        platform_options,
+                        variations,
+                    );
                 }
             },
             PaintMessage::RemoveFonts(painter_id, keys, instance_keys) => {
@@ -580,11 +596,6 @@ impl Paint {
             PaintMessage::ScreenshotReadinessReponse(webview_id, pipelines_and_epochs) => {
                 if let Some(painter) = self.maybe_painter(webview_id.into()) {
                     painter.handle_screenshot_readiness_reply(webview_id, pipelines_and_epochs);
-                }
-            },
-            PaintMessage::SendLCPCandidate(lcp_candidate, webview_id, pipeline_id, epoch) => {
-                if let Some(mut painter) = self.maybe_painter_mut(webview_id.into()) {
-                    painter.append_lcp_candidate(lcp_candidate, webview_id, pipeline_id, epoch);
                 }
             },
         }
@@ -975,5 +986,19 @@ impl Paint {
             .collect();
 
         let _ = result_sender.send((font_keys, font_instance_keys));
+    }
+
+    /// Map the given [`PipelineRect`] into the device coordinates relative to the WebView origin,
+    /// returning `None` if the pipeline isn't known or active.
+    pub fn map_pipeline_rect_to_device_rect(
+        &self,
+        webview_id: WebViewId,
+        pipeline_rect: PipelineRect,
+    ) -> Option<DeviceRect> {
+        Some(
+            self.maybe_painter(webview_id.into())?
+                .webview_renderer(webview_id)?
+                .map_rect_to_device_pixel(pipeline_rect.pipeline_id, pipeline_rect.rect),
+        )
     }
 }

@@ -10,11 +10,12 @@ import android.content.SharedPreferences
 import android.os.Bundle
 import android.system.ErrnoException
 import android.system.Os
-import android.util.Log
-import android.view.inputmethod.InputMethodManager
 import androidx.activity.ComponentActivity
-import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
+import androidx.activity.result.ActivityResultLauncher
+import androidx.activity.result.component1
+import androidx.activity.result.component2
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.padding
@@ -38,60 +39,72 @@ import androidx.compose.material3.TextButton
 import androidx.compose.material3.adaptive.currentWindowAdaptiveInfo
 import androidx.compose.material3.rememberSearchBarState
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.unit.dp
-import androidx.core.content.getSystemService
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.compose.LifecycleEventEffect
 import androidx.preference.PreferenceManager
 import androidx.window.core.layout.WindowSizeClass
 import kotlinx.coroutines.launch
+import org.servo.servoview.LoadingState
 import org.servo.servoview.Servo
-import org.servo.servoview.ServoView
+import org.servo.servoview.ServoNavigator
 
 class MainActivity : ComponentActivity(), Servo.Client {
-    private lateinit var servoView: ServoView
-
     private val urlTextFieldState = TextFieldState()
-    private var canGoBackState = mutableStateOf(false)
-    private var canGoForwardState = mutableStateOf(false)
-    private var isRefreshingState = mutableStateOf(false)
-    private var mediaSession: MediaSession? = null
-    private lateinit var historyManager: HistoryManager
-    private var currentUrl = ""
-    private var currentTitle = ""
-    private var alertMessageState = mutableStateOf<String?>(null)
+    private var currentUrl: String? = null
+    private var currentTitle: String? = null
+    private var alertMessage by mutableStateOf<String?>(null)
 
     private class Settings(preferences: SharedPreferences) {
         var experimental = preferences.getBoolean("experimental", false)
     }
 
-    private lateinit var sharedPreferences: SharedPreferences
-    private lateinit var settings: Settings
-
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
-        sharedPreferences = PreferenceManager.getDefaultSharedPreferences(applicationContext)
-        settings = Settings(sharedPreferences)
+        val sharedPreferences = PreferenceManager.getDefaultSharedPreferences(applicationContext)
+        val settings = Settings(sharedPreferences)
+        val navigator = ServoNavigator()
+        var experimentalModeEnabled by mutableStateOf(settings.experimental)
 
-        servoView = ServoView(
-            context = this,
-            client = this,
-            servoArgs = intent.getStringExtra("servoargs"),
-            servoLog = intent.getStringExtra("servolog"),
-            experimentalMode = settings.experimental,
-        )
-
-        historyManager = HistoryManager(this)
+        val historyActivityResultLauncher =
+            registerForActivityResult(ActivityResultContracts.StartActivityForResult()) {
+                (resultCode, data) ->
+                if (resultCode == RESULT_OK && data != null) {
+                    val url = data.getStringExtra("url")
+                    if (!url.isNullOrEmpty()) {
+                        urlTextFieldState.edit { replace(0, length, url) }
+                        navigator.navigate(urlTextFieldState.text.toString())
+                    }
+                }
+            }
 
         setContent {
-            val isWindowWidthAtLeastMedium = currentWindowAdaptiveInfo().windowSizeClass.isWidthAtLeastBreakpoint(WindowSizeClass.WIDTH_DP_MEDIUM_LOWER_BOUND)
+            LifecycleEventEffect(Lifecycle.Event.ON_RESUME) {
+                val settings = Settings(sharedPreferences)
+                experimentalModeEnabled = settings.experimental
+            }
 
+            val isWindowWidthAtLeastMedium =
+                currentWindowAdaptiveInfo()
+                    .windowSizeClass
+                    .isWidthAtLeastBreakpoint(WindowSizeClass.WIDTH_DP_MEDIUM_LOWER_BOUND)
+
+            var loadingState by remember { mutableStateOf(LoadingState.Loading) }
+            val servoFocusRequester = remember { FocusRequester() }
             Scaffold(
                 topBar = {
                     Row(
@@ -104,43 +117,75 @@ class MainActivity : ComponentActivity(), Servo.Client {
                         modifier = Modifier.windowInsetsPadding(WindowInsets.statusBars),
                     ) {
                         if (isWindowWidthAtLeastMedium) {
-                            IconButton(onClick = ::onHistoryBackMenuItemClicked, enabled = canGoBackState.value) {
-                                Icon(painterResource(R.drawable.arrow_back), stringResource(R.string.history_back))
+                            IconButton(
+                                onClick = { onHistoryBackMenuItemClicked(navigator) },
+                                enabled = navigator.canGoBack,
+                            ) {
+                                Icon(
+                                    painterResource(R.drawable.arrow_back),
+                                    stringResource(R.string.history_back),
+                                )
                             }
-                            IconButton(onClick = ::onHistoryForwardMenuItemClicked, enabled = canGoForwardState.value) {
-                                Icon(painterResource(R.drawable.arrow_forward), stringResource(R.string.history_forward))
+                            IconButton(
+                                onClick = { onHistoryForwardMenuItemClicked(navigator) },
+                                enabled = navigator.canGoForward,
+                            ) {
+                                Icon(
+                                    painterResource(R.drawable.arrow_forward),
+                                    stringResource(R.string.history_forward),
+                                )
                             }
-                            IconButton(onClick = { if (isRefreshingState.value) onCancelMenuItemClicked() else onRefreshMenuItemClicked() }) {
-                                if (isRefreshingState.value) {
-                                    Icon(painterResource(R.drawable.cancel), stringResource(R.string.cancel))
-                                } else {
-                                    Icon(painterResource(R.drawable.refresh), stringResource(R.string.refresh))
+                            IconButton(
+                                onClick = {
+                                    when (loadingState) {
+                                        LoadingState.Loading -> onCancelMenuItemClicked(navigator)
+                                        LoadingState.Finished -> onRefreshMenuItemClicked(navigator)
+                                    }
+                                },
+                            ) {
+                                when (loadingState) {
+                                    LoadingState.Loading ->
+                                        Icon(
+                                            painterResource(R.drawable.cancel),
+                                            stringResource(R.string.cancel),
+                                        )
+                                    LoadingState.Finished ->
+                                        Icon(
+                                            painterResource(R.drawable.refresh),
+                                            stringResource(R.string.refresh),
+                                        )
                                 }
                             }
                         }
                         Omnibox(
                             urlTextFieldState,
                             onSearch = { search ->
-                                servoView.loadUri(search)
-                                servoView.requestFocus()
+                                navigator.navigate(search)
+                                servoFocusRequester.requestFocus()
                             },
-                            modifier = Modifier
-                                .weight(1f)
-                                .padding(end = 10.dp),
+                            modifier = Modifier.weight(1f).padding(end = 10.dp),
                         )
-                        if (isRefreshingState.value) {
+                        if (loadingState == LoadingState.Loading) {
                             CircularProgressIndicator(
-                                modifier = Modifier
-                                    .padding(end = 10.dp)
-                                    .size(20.dp),
+                                modifier = Modifier.padding(end = 10.dp).size(20.dp),
                             )
                         }
                         if (isWindowWidthAtLeastMedium) {
                             IconButton(onClick = ::onSettingsMenuItemClicked) {
-                                Icon(painterResource(R.drawable.settings), stringResource(R.string.options))
+                                Icon(
+                                    painterResource(R.drawable.settings),
+                                    stringResource(R.string.options),
+                                )
                             }
-                            IconButton(onClick = ::onHistoryMenuItemClicked) {
-                                Icon(painterResource(R.drawable.history), stringResource(R.string.history_title))
+                            IconButton(
+                                onClick = {
+                                    onHistoryMenuItemClicked(historyActivityResultLauncher)
+                                },
+                            ) {
+                                Icon(
+                                    painterResource(R.drawable.history),
+                                    stringResource(R.string.history_title),
+                                )
                             }
                         }
                     }
@@ -150,32 +195,33 @@ class MainActivity : ComponentActivity(), Servo.Client {
                         NavigationBar {
                             NavigationBarItem(
                                 selected = false,
-                                enabled = canGoBackState.value,
-                                onClick = ::onHistoryBackMenuItemClicked,
+                                enabled = navigator.canGoBack,
+                                onClick = { onHistoryBackMenuItemClicked(navigator) },
                                 icon = { Icon(painterResource(R.drawable.arrow_back), null) },
                                 label = { Text(stringResource(R.string.history_back)) },
                             )
                             NavigationBarItem(
                                 selected = false,
-                                enabled = canGoForwardState.value,
-                                onClick = { onHistoryForwardMenuItemClicked() },
+                                enabled = navigator.canGoForward,
+                                onClick = { onHistoryForwardMenuItemClicked(navigator) },
                                 icon = { Icon(painterResource(R.drawable.arrow_forward), null) },
                                 label = { Text(stringResource(R.string.history_forward)) },
                             )
-                            if (isRefreshingState.value) {
-                                NavigationBarItem(
-                                    selected = false,
-                                    onClick = ::onCancelMenuItemClicked,
-                                    icon = { Icon(painterResource(R.drawable.cancel), null) },
-                                    label = { Text(stringResource(R.string.cancel)) },
-                                )
-                            } else {
-                                NavigationBarItem(
-                                    selected = false,
-                                    onClick = ::onRefreshMenuItemClicked,
-                                    icon = { Icon(painterResource(R.drawable.refresh), null) },
-                                    label = { Text(stringResource(R.string.refresh)) },
-                                )
+                            when (loadingState) {
+                                LoadingState.Loading ->
+                                    NavigationBarItem(
+                                        selected = false,
+                                        onClick = { onCancelMenuItemClicked(navigator) },
+                                        icon = { Icon(painterResource(R.drawable.cancel), null) },
+                                        label = { Text(stringResource(R.string.cancel)) },
+                                    )
+                                LoadingState.Finished ->
+                                    NavigationBarItem(
+                                        selected = false,
+                                        onClick = { onRefreshMenuItemClicked(navigator) },
+                                        icon = { Icon(painterResource(R.drawable.refresh), null) },
+                                        label = { Text(stringResource(R.string.refresh)) },
+                                    )
                             }
                             NavigationBarItem(
                                 selected = false,
@@ -185,7 +231,9 @@ class MainActivity : ComponentActivity(), Servo.Client {
                             )
                             NavigationBarItem(
                                 selected = false,
-                                onClick = ::onHistoryMenuItemClicked,
+                                onClick = {
+                                    onHistoryMenuItemClicked(historyActivityResultLauncher)
+                                },
                                 icon = { Icon(painterResource(R.drawable.history), null) },
                                 label = { Text(stringResource(R.string.history_title)) },
                             )
@@ -194,17 +242,28 @@ class MainActivity : ComponentActivity(), Servo.Client {
                 },
             ) { innerPadding ->
                 Servo(
-                    servoView = servoView,
-                    modifier = Modifier.padding(innerPadding),
+                    experimentalModeEnabled = experimentalModeEnabled,
+                    args = intent.getStringExtra("servoargs"),
+                    initialUrl =
+                        if (Intent.ACTION_VIEW == intent.action) intent.data.toString() else null,
+                    logStr = intent.getStringExtra("servolog"),
+                    onLoadingStateChange = { loadingState = it },
+                    client = this,
+                    navigator = navigator,
+                    modifier = Modifier.padding(innerPadding).focusRequester(servoFocusRequester),
                 )
-                BackHandler(enabled = canGoBackState.value) {
-                    servoView.goBack()
+                val historyManager = remember { HistoryManager(this) }
+                if (loadingState == LoadingState.Finished) {
+                    currentUrl?.let { currentUrl ->
+                        historyManager.addEntry(currentUrl, currentTitle)
+                    }
                 }
-                alertMessageState.value?.let { alertMessage ->
+                LaunchedEffect(servoFocusRequester) { servoFocusRequester.requestFocus() }
+                alertMessage?.let { alertMessage ->
                     AlertDialog(
-                        onDismissRequest = { alertMessageState.value = null },
+                        onDismissRequest = { this.alertMessage = null },
                         confirmButton = {
-                            TextButton(onClick = { alertMessageState.value = null }) {
+                            TextButton(onClick = { this.alertMessage = null }) {
                                 Text(stringResource(android.R.string.ok))
                             }
                         },
@@ -214,8 +273,6 @@ class MainActivity : ComponentActivity(), Servo.Client {
             }
         }
 
-        servoView.requestFocus()
-
         val sdcard = getExternalFilesDir("")
         val host = sdcard!!.toPath().resolve("android_hosts").toString()
         try {
@@ -223,82 +280,36 @@ class MainActivity : ComponentActivity(), Servo.Client {
         } catch (e: ErrnoException) {
             e.printStackTrace()
         }
-
-        if (Intent.ACTION_VIEW == intent.action) {
-            servoView.loadUri(intent.data.toString())
-        }
     }
 
-    override fun onDestroy() {
-        super.onDestroy()
-        mediaSession?.hideMediaSessionControls()
+    private fun onHistoryBackMenuItemClicked(navigator: ServoNavigator) {
+        navigator.back()
     }
 
-    /**
-     * We’re unsetting all the loading UI just in case loading got stuck, and we’re
-     * navigating to a cached page, which doesn’t trigger [onLoadEnded]. The "stop
-     * loading" button is implemented by [onCancelMenuItemClicked], but the underlying
-     * Servo view can’t actually [ServoView.stop] yet.
-     */
-    private fun onHistoryItemClicked() {
-        onLoadEnded()
+    private fun onHistoryForwardMenuItemClicked(navigator: ServoNavigator) {
+        navigator.forward()
     }
 
-    private fun onHistoryBackMenuItemClicked() {
-        onHistoryItemClicked()
-        servoView.goBack()
+    private fun onRefreshMenuItemClicked(navigator: ServoNavigator) {
+        navigator.reload()
     }
 
-    private fun onHistoryForwardMenuItemClicked() {
-        onHistoryItemClicked()
-        servoView.goForward()
-    }
-
-    private fun onRefreshMenuItemClicked() {
-        servoView.reload()
-    }
-
-    private fun onCancelMenuItemClicked() {
-        servoView.stop()
+    private fun onCancelMenuItemClicked(navigator: ServoNavigator) {
+        navigator.stop()
     }
 
     private fun onSettingsMenuItemClicked() {
         startActivity(Intent(this, SettingsActivity::class.java))
     }
 
-    private fun onHistoryMenuItemClicked() {
-        startActivityForResult(Intent(this, HistoryActivity::class.java), HISTORY_REQUEST_CODE)
-    }
-
-    override fun onImeShow() {
-        getSystemService<InputMethodManager>()?.showSoftInput(servoView, InputMethodManager.SHOW_IMPLICIT)
-    }
-
-    override fun onImeHide() {
-        getSystemService<InputMethodManager>()?.hideSoftInputFromWindow(servoView.windowToken, InputMethodManager.SHOW_IMPLICIT)
+    private fun onHistoryMenuItemClicked(
+        historyActivityResultLauncher: ActivityResultLauncher<Intent>,
+    ) {
+        historyActivityResultLauncher.launch(Intent(this, HistoryActivity::class.java))
     }
 
     override fun onAlert(message: String) {
-        alertMessageState.value = message
-    }
-
-    override fun onLoadStarted() {
-        // This doesn’t seem to actually happen when navigating
-        // back to a page that is already cached.
-        Log.i(TAG, "onLoadStarted: ")
-        isRefreshingState.value = true
-    }
-
-    // INFO: This currently gets called multiple times on each load.
-    override fun onLoadEnded() {
-        Log.i(TAG, "onLoadEnded: ")
-        if (currentUrl.isNotEmpty()) {
-            // HistoryManager has a basic method of preventing clobbering
-            // by the fact that onLoadEnded gets called multiple times
-            // per page. 
-            historyManager.addEntry(currentUrl, currentTitle)
-        }
-        isRefreshingState.value = false
+        alertMessage = message
     }
 
     override fun onTitleChanged(title: String) {
@@ -308,68 +319,6 @@ class MainActivity : ComponentActivity(), Servo.Client {
     override fun onUrlChanged(url: String) {
         urlTextFieldState.edit { replace(0, length, url) }
         currentUrl = url
-    }
-
-    override fun onHistoryChanged(canGoBack: Boolean, canGoForward: Boolean) {
-        Log.i(TAG, "onHistoryChanged: $canGoBack<->$canGoForward")
-        canGoBackState.value = canGoBack
-        canGoForwardState.value = canGoForward
-    }
-
-    public override fun onResume() {
-        super.onResume()
-        val updatedSettings = Settings(sharedPreferences)
-        if (updatedSettings.experimental != settings.experimental) {
-            servoView.setExperimentalMode(updatedSettings.experimental)
-        }
-        settings = updatedSettings
-    }
-
-    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
-        super.onActivityResult(requestCode, resultCode, data)
-
-        if (requestCode == HISTORY_REQUEST_CODE && resultCode == RESULT_OK && data != null) {
-            val url = data.getStringExtra("url")
-            if (!url.isNullOrEmpty()) {
-                urlTextFieldState.edit { replace(0, length, url) }
-                servoView.loadUri(urlTextFieldState.text.toString())
-            }
-        }
-    }
-
-    override fun onMediaSessionMetadata(title: String, artist: String, album: String) {
-        Log.d("onMediaSessionMetadata", "$title $artist $album")
-        val mediaSession = mediaSession ?: MediaSession(servoView, applicationContext).also { mediaSession = it }
-        mediaSession.updateMetadata(title, artist, album)
-    }
-
-    override fun onMediaSessionPlaybackStateChange(state: Int) {
-        Log.d("onMediaSessionPlaybackStateChange", state.toString())
-        val mediaSession = mediaSession ?: MediaSession(servoView, applicationContext).also { mediaSession = it }
-
-        mediaSession.setPlaybackState(state)
-
-        if (state == MediaSession.PLAYBACK_STATE_NONE) {
-            mediaSession.hideMediaSessionControls()
-            return
-        }
-        if (state == MediaSession.PLAYBACK_STATE_PLAYING ||
-            state == MediaSession.PLAYBACK_STATE_PAUSED
-        ) {
-            mediaSession.showMediaSessionControls()
-        }
-    }
-
-    override fun onMediaSessionSetPositionState(duration: Float, position: Float, playbackRate: Float) {
-        Log.d("onMediaSessionSetPositionState", "$duration $position $playbackRate")
-    }
-
-    companion object {
-        private const val TAG = "MainActivity"
-
-        // Identify which activity a result came from, if we ever have more
-        // than one
-        private const val HISTORY_REQUEST_CODE = 1
     }
 }
 
@@ -391,12 +340,10 @@ private fun Omnibox(
                 textFieldState = textFieldState,
                 searchBarState = searchBarState,
                 onSearch = onSearch,
-                modifier = Modifier
-                    .onFocusChanged { focusState ->
+                modifier =
+                    Modifier.onFocusChanged { focusState ->
                         if (focusState.isFocused) {
-                            coroutineScope.launch {
-                                textFieldState.edit { selectAll() }
-                            }
+                            coroutineScope.launch { textFieldState.edit { selectAll() } }
                         }
                     },
                 placeholder = { Text(stringResource(R.string.url_or_search)) },

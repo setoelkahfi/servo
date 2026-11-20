@@ -3,12 +3,13 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 use std::cmp::min;
+use std::sync::Arc;
 
 use dom_struct::dom_struct;
 use js::context::JSContext;
 use js::rust::{CustomAutoRooterGuard, HandleObject};
 use js::typedarray::{Float32, Float32Array, HeapFloat32Array};
-use script_bindings::cell::{DomRefCell, Ref};
+use script_bindings::cell::DomRefCell;
 use script_bindings::reflector::{Reflector, reflect_dom_object_with_proto};
 use script_bindings::trace::RootedTraceableBox;
 use servo_media::audio::buffer_source_node::AudioBuffer as ServoMediaAudioBuffer;
@@ -45,9 +46,9 @@ pub(crate) struct AudioBuffer {
     js_channels: DomRefCell<Vec<HeapBufferSource<Float32>>>,
     /// Aggregates the data from js_channels.
     /// This is `Some<T>` iff the buffers in js_channels are detached.
-    #[ignore_malloc_size_of = "servo_media"]
     #[no_trace]
-    shared_channels: DomRefCell<Option<ServoMediaAudioBuffer>>,
+    #[conditional_malloc_size_of]
+    shared_channels: DomRefCell<Option<Arc<ServoMediaAudioBuffer>>>,
     /// <https://webaudio.github.io/web-audio-api/#dom-audiobuffer-samplerate>
     sample_rate: f32,
     /// <https://webaudio.github.io/web-audio-api/#dom-audiobuffer-length>
@@ -98,6 +99,23 @@ impl AudioBuffer {
         )
     }
 
+    /// Initialize a buffer by taking ownership of already rendered channel data.
+    #[cfg_attr(crown, expect(crown::unrooted_must_root))]
+    pub(crate) fn new_with_channel_data(
+        cx: &mut JSContext,
+        global: &Window,
+        length: u32,
+        sample_rate: f32,
+        channels: Vec<Vec<f32>>,
+    ) -> DomRoot<AudioBuffer> {
+        let buffer = AudioBuffer::new_inherited(channels.len() as u32, length, sample_rate);
+        let buffer = reflect_dom_object_with_proto(cx, Box::new(buffer), global, None);
+        *buffer.shared_channels.safe_borrow_mut(cx.no_gc()) = Some(Arc::new(
+            ServoMediaAudioBuffer::from_buffers(channels, sample_rate),
+        ));
+        buffer
+    }
+
     #[cfg_attr(crown, expect(crown::unrooted_must_root))]
     fn new_with_proto(
         cx: &mut JSContext,
@@ -128,7 +146,7 @@ impl AudioBuffer {
                 None => vec![0.; self.length as usize],
             };
         }
-        *self.shared_channels.borrow_mut() = Some(channels);
+        *self.shared_channels.borrow_mut() = Some(Arc::new(channels));
     }
 
     fn restore_js_channel_data(&self, cx: &mut JSContext) -> bool {
@@ -151,7 +169,7 @@ impl AudioBuffer {
             }
         }
 
-        *self.shared_channels.borrow_mut() = None;
+        *self.shared_channels.safe_borrow_mut(cx.no_gc()) = None;
 
         true
     }
@@ -169,6 +187,16 @@ impl AudioBuffer {
                 return None;
             }
 
+            // <https://webaudio.github.io/web-audio-api/#acquire-the-content>
+            // > If any of the AudioBuffer’s ArrayBuffers are detached, return true,
+            // > abort these steps, and return a zero-length channel data buffer to the invoker.
+            if channel.is_detached_buffer(cx) {
+                return Some(ServoMediaAudioBuffer::new(
+                    self.number_of_channels as u8,
+                    0,
+                    self.sample_rate,
+                ));
+            }
             // Step 3.
             result.buffers[i] = channel.acquire_data(cx).ok()?;
         }
@@ -176,17 +204,14 @@ impl AudioBuffer {
         Some(result)
     }
 
-    pub(crate) fn get_channels(
-        &self,
-        cx: &mut JSContext,
-    ) -> Ref<'_, Option<ServoMediaAudioBuffer>> {
+    pub(crate) fn get_channels(&self, cx: &mut JSContext) -> Option<Arc<ServoMediaAudioBuffer>> {
         if self.shared_channels.borrow().is_none() {
-            let channels = self.acquire_contents(cx);
+            let channels = self.acquire_contents(cx).map(Arc::new);
             if channels.is_some() {
                 *self.shared_channels.safe_borrow_mut(cx.no_gc()) = channels;
             }
         }
-        self.shared_channels.borrow()
+        self.shared_channels.borrow().clone()
     }
 }
 
@@ -204,7 +229,9 @@ impl AudioBufferMethods<crate::DomTypeHolder> for AudioBuffer {
             *options.sampleRate < MIN_SAMPLE_RATE ||
             *options.sampleRate > MAX_SAMPLE_RATE
         {
-            return Err(Error::NotSupported(None));
+            return Err(Error::NotSupported(Some(
+                "Invalid number of channels, length or sample rate".into(),
+            )));
         }
         Ok(AudioBuffer::new_with_proto(
             cx,
@@ -244,7 +271,9 @@ impl AudioBufferMethods<crate::DomTypeHolder> for AudioBuffer {
         channel: u32,
     ) -> Fallible<RootedTraceableBox<HeapFloat32Array>> {
         if channel >= self.number_of_channels {
-            return Err(Error::IndexSize(None));
+            return Err(Error::IndexSize(Some(
+                "Channel index is out of range".into(),
+            )));
         }
 
         if !self.restore_js_channel_data(cx) {
@@ -256,7 +285,7 @@ impl AudioBufferMethods<crate::DomTypeHolder> for AudioBuffer {
             .map_err(|_| Error::JSFailed)
     }
 
-    // https://webaudio.github.io/web-audio-api/#dom-audiobuffer-copyfromchannel
+    /// <https://webaudio.github.io/web-audio-api/#dom-audiobuffer-copyfromchannel>
     fn CopyFromChannel(
         &self,
         cx: &mut JSContext,
@@ -268,28 +297,42 @@ impl AudioBufferMethods<crate::DomTypeHolder> for AudioBuffer {
             return Err(Error::Type(c"Cannot copy to shared buffer".to_owned()));
         }
 
-        if channel_number >= self.number_of_channels || start_in_channel >= self.length {
-            return Err(Error::IndexSize(None));
+        // > If channelNumber is greater than or equal to numberOfChannels, an IndexSizeError MUST
+        // > be thrown.
+        if channel_number >= self.number_of_channels {
+            return Err(Error::IndexSize(Some(
+                "Channel number is out of range".into(),
+            )));
         }
 
-        let bytes_to_copy = min(self.length - start_in_channel, destination.len() as u32) as usize;
+        // > Let buffer be the AudioBuffer with Nb frames, let Nf be the number of elements in the
+        // > destination array, and k be the value of bufferOffset. Then the number of frames copied
+        // > from buffer to destination is max(0, min(Nb - k, Nf)).
+        let count = min(
+            self.length.saturating_sub(start_in_channel),
+            destination.len() as u32,
+        ) as usize;
+        if count == 0 {
+            return Ok(());
+        }
+
         let channel_number = channel_number as usize;
         let offset = start_in_channel as usize;
-        let mut dest = vec![0.0_f32; bytes_to_copy];
+        let mut dest = vec![0.0_f32; count];
 
         // We either copy form js_channels or shared_channels.
         let js_channel = &self.js_channels.borrow()[channel_number];
         if js_channel.is_initialized() {
             if js_channel
-                .copy_data_to(cx, &mut dest, offset, offset + bytes_to_copy)
+                .copy_data_to(cx, &mut dest, offset, offset + count)
                 .is_err()
             {
-                return Err(Error::IndexSize(None));
+                return Err(Error::IndexSize(Some("Failed to copy channel data".into())));
             }
         } else if let Some(ref shared_channels) = *self.shared_channels.borrow() &&
             let Some(shared_channel) = shared_channels.buffers.get(channel_number)
         {
-            dest.extend_from_slice(&shared_channel.as_slice()[offset..offset + bytes_to_copy]);
+            dest.copy_from_slice(&shared_channel.as_slice()[offset..offset + count]);
         }
 
         destination.update(&dest);
@@ -309,8 +352,23 @@ impl AudioBufferMethods<crate::DomTypeHolder> for AudioBuffer {
             return Err(Error::Type(c"Cannot copy from shared buffer".to_owned()));
         }
 
-        if channel_number >= self.number_of_channels || start_in_channel > (source.len() as u32) {
-            return Err(Error::IndexSize(None));
+        // > If channelNumber is greater than or equal to numberOfChannels, an IndexSizeError MUST
+        // > be thrown.
+        if channel_number >= self.number_of_channels {
+            return Err(Error::IndexSize(Some(
+                "Channel number is out of range".into(),
+            )));
+        }
+
+        // > Let buffer be the AudioBuffer with Nb frames, let Nf be the number of elements in the
+        // > source array, and k be the value of bufferOffset. Then the number of frames copied
+        // > from source to the buffer is max(0, min(Nb - k, Nf)).
+        let count = min(
+            self.length.saturating_sub(start_in_channel),
+            source.len() as u32,
+        ) as usize;
+        if count == 0 {
+            return Ok(());
         }
 
         if !self.restore_js_channel_data(cx) {
@@ -320,12 +378,13 @@ impl AudioBufferMethods<crate::DomTypeHolder> for AudioBuffer {
         let js_channel = &self.js_channels.borrow()[channel_number as usize];
         if !js_channel.is_initialized() {
             // The array buffer was detached.
-            return Err(Error::IndexSize(None));
+            return Err(Error::IndexSize(Some(
+                "Channel data buffer is detached".into(),
+            )));
         }
 
-        let bytes_to_copy = min(self.length - start_in_channel, source.len() as u32) as usize;
         js_channel
-            .copy_data_from(cx, source, start_in_channel as usize, bytes_to_copy)
-            .map_err(|_| Error::IndexSize(None))
+            .copy_data_from(cx, source, start_in_channel as usize, count)
+            .map_err(|_| Error::IndexSize(Some("Failed to copy channel data".into())))
     }
 }

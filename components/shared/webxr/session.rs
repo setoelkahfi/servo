@@ -6,12 +6,12 @@ use std::thread;
 use std::time::Duration;
 
 use euclid::{Point2D, Rect, RigidTransform3D, Size2D};
-use ipc_channel::ipc::IpcSender;
 use log::warn;
 use malloc_size_of_derive::MallocSizeOf;
 use profile_traits::generic_callback::GenericCallback as ProfileGenericCallback;
 use serde::{Deserialize, Serialize};
 use servo_base::generic_channel::{self, GenericReceiver, GenericSender};
+use servo_base::id::PainterId;
 
 use crate::{
     ContextId, DeviceAPI, Error, Event, Floor, Frame, FrameUpdateEvent, HitTestId, HitTestSource,
@@ -38,6 +38,7 @@ pub struct SessionInit {
     /// but for performance reasons we also ask users to enable this pref
     /// for now.
     pub first_person_observer_view: bool,
+    pub painter_id: PainterId,
 }
 
 impl SessionInit {
@@ -91,6 +92,7 @@ enum SessionMsg {
     DestroyLayer(ContextId, LayerId),
     SetLayers(Vec<(ContextId, LayerId)>),
     SetEventDest(ProfileGenericCallback<Event>),
+    SetFrameDest(ProfileGenericCallback<Frame>),
     UpdateClipPlanes(/* near */ f32, /* far */ f32),
     StartRenderLoop,
     RenderAnimationFrame,
@@ -203,6 +205,10 @@ impl Session {
         let _ = self.sender.send(SessionMsg::SetEventDest(dest));
     }
 
+    pub fn set_frame_dest(&mut self, dest: ProfileGenericCallback<Frame>) {
+        let _ = self.sender.send(SessionMsg::SetFrameDest(dest));
+    }
+
     pub fn render_animation_frame(&mut self) {
         let _ = self.sender.send(SessionMsg::RenderAnimationFrame);
     }
@@ -254,7 +260,7 @@ pub struct SessionThread<Device> {
     layers: Vec<(ContextId, LayerId)>,
     pending_layers: Option<Vec<(ContextId, LayerId)>>,
     frame_count: u64,
-    frame_sender: IpcSender<Frame>,
+    frame_sender: Option<ProfileGenericCallback<Frame>>,
     running: bool,
     device: Device,
     id: SessionId,
@@ -265,11 +271,7 @@ impl<Device> SessionThread<Device>
 where
     Device: DeviceAPI,
 {
-    pub fn new(
-        mut device: Device,
-        frame_sender: IpcSender<Frame>,
-        id: SessionId,
-    ) -> Result<Self, Error> {
+    pub fn new(mut device: Device, id: SessionId) -> Result<Self, Error> {
         let Some((sender, receiver)) = generic_channel::channel() else {
             return Err(Error::CommunicationError);
         };
@@ -287,7 +289,7 @@ where
             layers,
             pending_layers,
             frame_count,
-            frame_sender,
+            frame_sender: None,
             running,
             id,
             render_state: RenderState::NotInRenderLoop,
@@ -329,6 +331,9 @@ where
             SessionMsg::SetEventDest(dest) => {
                 self.device.set_event_dest(dest);
             },
+            SessionMsg::SetFrameDest(dest) => {
+                self.frame_sender = Some(dest);
+            },
             SessionMsg::RequestHitTest(source) => {
                 self.device.request_hit_test(source);
             },
@@ -358,7 +363,7 @@ where
                     },
                 };
                 self.render_state = RenderState::InRenderLoop;
-                let _ = self.frame_sender.send(frame);
+                self.send_frame(frame);
             },
             SessionMsg::UpdateClipPlanes(near, far) => self.device.update_clip_planes(near, far),
             SessionMsg::RenderAnimationFrame => {
@@ -383,7 +388,7 @@ where
                     },
                 };
 
-                let _ = self.frame_sender.send(frame);
+                self.send_frame(frame);
             },
             SessionMsg::UpdateFrameRate(rate, sender) => {
                 let new_framerate = self.device.update_frame_rate(rate);
@@ -403,6 +408,12 @@ where
             },
         }
         true
+    }
+
+    fn send_frame(&self, frame: Frame) {
+        if let Some(frame_sender) = &self.frame_sender {
+            let _ = frame_sender.send(frame);
+        }
     }
 
     fn quit(&mut self) {
@@ -440,7 +451,6 @@ where
 /// A type for building XR sessions
 pub struct SessionBuilder<'a, GL> {
     sessions: &'a mut Vec<Box<dyn MainThreadSession>>,
-    frame_sender: IpcSender<Frame>,
     layer_grand_manager: LayerGrandManager<GL>,
     id: SessionId,
 }
@@ -452,13 +462,11 @@ impl<'a, GL: 'static> SessionBuilder<'a, GL> {
 
     pub(crate) fn new(
         sessions: &'a mut Vec<Box<dyn MainThreadSession>>,
-        frame_sender: IpcSender<Frame>,
         layer_grand_manager: LayerGrandManager<GL>,
         id: SessionId,
     ) -> Self {
         SessionBuilder {
             sessions,
-            frame_sender,
             layer_grand_manager,
             id,
         }
@@ -473,13 +481,10 @@ impl<'a, GL: 'static> SessionBuilder<'a, GL> {
         let Some((acks, ackr)) = generic_channel::channel() else {
             return Err(Error::CommunicationError);
         };
-        let frame_sender = self.frame_sender;
         let layer_grand_manager = self.layer_grand_manager;
         let id = self.id;
         thread::spawn(move || {
-            match factory(layer_grand_manager)
-                .and_then(|device| SessionThread::new(device, frame_sender, id))
-            {
+            match factory(layer_grand_manager).and_then(|device| SessionThread::new(device, id)) {
                 Ok(mut thread) => {
                     let session = thread.new_session();
                     let _ = acks.send(Ok(session));
@@ -500,8 +505,7 @@ impl<'a, GL: 'static> SessionBuilder<'a, GL> {
         Device: DeviceAPI,
     {
         let device = factory(self.layer_grand_manager)?;
-        let frame_sender = self.frame_sender;
-        let mut session_thread = SessionThread::new(device, frame_sender, self.id)?;
+        let mut session_thread = SessionThread::new(device, self.id)?;
         let session = session_thread.new_session();
         self.sessions.push(Box::new(session_thread));
         Ok(session)

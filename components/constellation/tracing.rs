@@ -63,13 +63,12 @@ mod from_embedder {
                 Self::LogEntry(..) => target!("LogEntry"),
                 Self::NewWebView(..) => target!("NewWebView"),
                 Self::CloseWebView(..) => target!("CloseWebView"),
-                Self::FocusWebView(..) => target!("FocusWebView"),
-                Self::BlurWebView => target!("BlurWebView"),
+                Self::SetWebViewHasSystemFocus(..) => target!("SetWebViewHasSystemFocus"),
                 Self::ForwardInputEvent(_webview_id, event, ..) => event.log_target(),
                 Self::RefreshCursor(..) => target!("RefreshCursor"),
                 Self::ExitFullScreen(_) => target!("ExitFullScreen"),
                 Self::MediaSessionAction(_) => target!("MediaSessionAction"),
-                Self::SetWebViewThrottled(_, _) => target!("SetWebViewThrottled"),
+                Self::SetWebViewHidden(_, _) => target!("SetWebViewHidden"),
                 Self::SetScrollStates(..) => target!("SetScrollStates"),
                 Self::PaintMetric(..) => target!("PaintMetric"),
                 Self::EvaluateJavaScript(..) => target!("EvaluateJavaScript"),
@@ -84,6 +83,10 @@ mod from_embedder {
                 Self::UserContentManagerAction(..) => target!("UserContentManagerAction"),
                 Self::UpdatePinchZoomInfos(..) => target!("UpdatePinchZoomInfos"),
                 Self::SetAccessibilityActive(..) => target!("SetAccessibilityActive"),
+                Self::ForwardAccessibilityAction(..) => target!("ForwardAccessibilityAction"),
+                Self::ClearSessionHistory(..) => target!("ClearHistory"),
+                Self::SetNetworkOnlineState(..) => target!("SetNetworkOnlineState"),
+                Self::StoreCacheToDisk(..) => target!("StoreCacheToDisk"),
             }
         }
     }
@@ -123,6 +126,7 @@ mod from_script {
     impl LogTarget for servo_constellation_traits::ScriptToConstellationMessage {
         fn log_target(&self) -> &'static str {
             match self {
+                Self::ServiceWorkerStateUpdateDone(..) => target!("ServiceWorkerStateUpdateDone"),
                 Self::ServiceWorkerAlgorithm(..) => target!("ServiceWorkerAlgorithm"),
                 Self::CompleteMessagePortTransfer(..) => target!("CompleteMessagePortTransfer"),
                 Self::MessagePortTransferResult(..) => target!("MessagePortTransferResult"),
@@ -164,11 +168,12 @@ mod from_script {
                 Self::GetBrowsingContextInfo(..) => target!("GetBrowsingContextInfo"),
                 Self::GetDocumentOrigin(..) => target!("GetDocumentOrigin"),
                 Self::IsCurrentlyFullyActive(..) => target!("IsCurrentlyFullyActive"),
-                Self::GetInternalAncestorOriginObjectsList(..) => {
-                    target!("GetInternalAncestorOriginObjectsList")
+                Self::GetDocumentOriginDetails(..) => {
+                    target!("GetDocumentOriginDetails")
                 },
+                Self::GetChildBrowsingContextCount(..) => target!("GetChildBrowsingContextCount"),
                 Self::GetChildBrowsingContextId(..) => target!("GetChildBrowsingContextId"),
-                Self::LoadComplete => target!("LoadComplete"),
+                Self::LoadFinished { .. } => target!("LoadFinished"),
                 Self::LoadUrl(..) => target!("LoadUrl"),
                 Self::AbortLoadUrl => target!("AbortLoadUrl"),
                 Self::PostMessage { .. } => target!("PostMessage"),
@@ -178,7 +183,6 @@ mod from_script {
                 Self::ReplaceHistoryState(..) => target!("ReplaceHistoryState"),
                 Self::JointSessionHistoryLength(..) => target!("JointSessionHistoryLength"),
                 Self::RemoveIFrame(..) => target!("RemoveIFrame"),
-                Self::SetThrottledComplete(..) => target!("SetThrottledComplete"),
                 Self::ScriptLoadedURLInIFrame(..) => target!("ScriptLoadedURLInIFrame"),
                 Self::ScriptNewIFrame(..) => target!("ScriptNewIFrame"),
                 Self::CreateAuxiliaryWebView(..) => target!("ScriptNewAuxiliary"),
@@ -205,6 +209,9 @@ mod from_script {
                 Self::TriggerGarbageCollection => target!("TriggerGarbageCollection"),
                 Self::AcquireWakeLock(..) => target!("AcquireWakeLock"),
                 Self::ReleaseWakeLock(..) => target!("ReleaseWakeLock"),
+                Self::AddTupleToUpgradeInsecureNavigationsSet(..) => {
+                    target!("AddTupleToUpgradeInsecureNavigationsSet")
+                },
             }
         }
     }

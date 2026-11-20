@@ -23,6 +23,9 @@ extern crate stylo_atoms;
 #[macro_use]
 mod tasks;
 
+#[macro_use]
+extern crate script_bindings;
+
 pub(crate) mod conversions;
 mod css;
 mod fetch;
@@ -32,24 +35,23 @@ pub(crate) use dom::canvas_context;
 mod drag;
 mod engine;
 mod event_loop;
-mod runtime;
-mod url;
-
 pub mod layout_dom;
 pub(crate) mod messaging;
 pub(crate) mod mime;
-pub(crate) mod modules;
 mod navigation;
 mod realms;
 mod routed_promise;
+mod runtime;
+mod scripting;
 pub mod test;
 mod unminify;
+mod url;
 mod window_named_properties;
 mod xpath;
 
 pub use event_loop::script_thread::ScriptThread;
 pub(crate) use script_bindings::DomTypes;
-pub(crate) use script_bindings::reflector::{AssociatedMemory, DomObject, MutDomObject, Reflector};
+pub(crate) use script_bindings::reflector::{DomObject, MutDomObject, Reflector};
 
 pub(crate) use crate::dom::bindings::codegen::DomTypeHolder::DomTypeHolder;
 // These trait exports are public, because they are used in the DOM bindings.
@@ -57,6 +59,7 @@ pub(crate) use crate::dom::bindings::codegen::DomTypeHolder::DomTypeHolder;
 // it is useful that they are accessible at the root of the crate.
 pub(crate) use crate::dom::bindings::inheritance::HasParent;
 pub(crate) use crate::dom::bindings::trace::{CustomTraceable, JSTraceable};
+pub use crate::dom::html::form_controls::input_type::submit_input_type::DEFAULT_SUBMIT_VALUE as HTML_INPUT_TYPE_SUBMIT_DEFAULT_VALUE;
 pub use crate::dom::serviceworker::serviceworker_manager::ServiceWorkerManager;
 pub use crate::engine::handle::JSEngineSetup;
 pub use crate::engine::init::init;

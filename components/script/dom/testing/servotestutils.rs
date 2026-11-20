@@ -5,12 +5,10 @@
 // check-tidy: no specs after this line
 
 use backtrace::Backtrace;
-use dom_struct::dom_struct;
 use js::context::{JSContext, NoGC};
 use layout_api::ReflowPhasesRun;
 use script_bindings::codegen::GenericBindings::WindowBinding::WindowMethods;
 use script_bindings::domstring::DOMString;
-use script_bindings::reflector::Reflector;
 use script_bindings::root::DomRoot;
 use servo_base::Epoch;
 use time::Duration;
@@ -20,10 +18,7 @@ use crate::dom::globalscope::GlobalScope;
 use crate::dom::layoutresult::LayoutResult;
 use crate::dom::types::AccessibilityUpdateResult;
 
-#[dom_struct]
-pub(crate) struct ServoTestUtils {
-    reflector_: Reflector,
-}
+pub(crate) struct ServoTestUtils;
 
 impl ServoTestUtilsMethods<crate::DomTypeHolder> for ServoTestUtils {
     fn AdvanceClock(no_gc: &NoGC, global: &GlobalScope, ms: i32) {
@@ -89,7 +84,7 @@ impl ServoTestUtilsMethods<crate::DomTypeHolder> for ServoTestUtils {
         global: &GlobalScope,
     ) -> DomRoot<AccessibilityUpdateResult> {
         let window = global.as_window();
-        window.layout().set_force_accessibility_update();
+        window.layout().set_force_accessibility_update_if_active();
         let (_, statistics) = window.Document().update_the_rendering(cx);
 
         AccessibilityUpdateResult::new(

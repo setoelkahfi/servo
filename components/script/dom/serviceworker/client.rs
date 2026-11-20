@@ -4,8 +4,8 @@
 
 use dom_struct::dom_struct;
 use js::context::JSContext;
-use js::jsapi::{Heap, JSObject};
-use js::rust::{CustomAutoRooter, CustomAutoRooterGuard, HandleValue};
+use js::jsapi::JSObject;
+use js::rust::{CustomAutoRooterGuard, HandleValue};
 use script_bindings::error::ErrorResult;
 use script_bindings::reflector::{Reflector, reflect_dom_object};
 use script_bindings::root::DomRoot;
@@ -20,7 +20,6 @@ use crate::dom::bindings::error::Error;
 use crate::dom::bindings::reflector::DomGlobal;
 use crate::dom::bindings::str::{DOMString, USVString};
 use crate::dom::bindings::structuredclone;
-use crate::dom::bindings::trace::RootedTraceableBox;
 use crate::dom::globalscope::GlobalScope;
 
 #[dom_struct]
@@ -125,17 +124,14 @@ impl ClientMethods<crate::DomTypeHolder> for Client {
         &self,
         cx: &mut JSContext,
         message: HandleValue,
-        options: RootedTraceableBox<StructuredSerializeOptions>,
+        options: &StructuredSerializeOptions,
     ) -> ErrorResult {
-        let mut rooted = CustomAutoRooter::new(
+        auto_root!(&in(cx) let guard =
             options
                 .transfer
                 .iter()
-                .map(|js: &RootedTraceableBox<Heap<*mut JSObject>>| js.get())
-                .collect(),
-        );
-        #[expect(unsafe_code)]
-        let guard = unsafe { CustomAutoRooterGuard::new(cx.raw_cx(), &mut rooted) };
+                .map(|js| js.get())
+                .collect::<Vec<_>>());
         self.post_message_impl(cx, message, guard)
     }
 

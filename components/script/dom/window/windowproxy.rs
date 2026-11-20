@@ -3,6 +3,7 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 use std::cell::Cell;
+use std::collections::HashSet;
 use std::ptr::{self, NonNull};
 use std::rc::Rc;
 
@@ -30,9 +31,8 @@ use js::jsapi::{
 use js::jsval::{NullValue, PrivateValue, UndefinedValue};
 use js::realm::{AutoRealm, CurrentRealm};
 use js::rust::wrappers2::{
-    AppendToIdVector, GetPropertyKeys, JS_ForwardGetPropertyTo, JS_GetOwnPropertyDescriptorById,
-    JS_HasOwnPropertyById, JS_HasPropertyById, JS_TransplantObject, NewWindowProxy, SetWindowProxy,
-    int_to_jsid,
+    AppendToIdVector, JS_ForwardGetPropertyTo, JS_HasOwnPropertyById, JS_HasPropertyById,
+    JS_TransplantObject, NewWindowProxy, SetWindowProxy, int_to_jsid,
 };
 use js::rust::{Handle, MutableHandle, MutableHandleValue, get_object_class};
 use js::typedarray::JSObjectStorage;
@@ -48,15 +48,18 @@ use script_bindings::codegen::GenericBindings::WindowBinding::{
     self, GetProtoObject, WindowMethods,
 };
 use script_bindings::conversions::jsid_to_string;
+use script_bindings::domstring::TracedDOMString;
+use script_bindings::js::{GetPropertyKeys, JS_GetOwnPropertyDescriptorById};
 use script_bindings::proxyhandler::{
-    self, CrossOriginProperties, cross_origin_get_own_property_helper,
-    cross_origin_own_property_keys, cross_origin_property_fallback, cross_origin_set,
-    is_extensible, is_platform_object_same_origin, maybe_cross_origin_get_prototype,
+    self, CROSS_ORIGIN_PROPERTY_HOLDER_WEAK_MAP_SLOT, CrossOriginProperties,
+    cross_origin_get_own_property_helper, cross_origin_own_property_keys,
+    cross_origin_property_fallback, cross_origin_set, is_extensible,
+    is_platform_object_same_origin, maybe_cross_origin_get_prototype,
     maybe_cross_origin_set_prototype_rawcx, prevent_extensions, report_cross_origin_denial,
     set_property_descriptor,
 };
 use script_bindings::reflector::{DomObject, MutDomObject, Reflector};
-use script_traits::NewPipelineInfo;
+use script_traits::{NewPipelineInfo, WebViewState};
 use serde::{Deserialize, Serialize};
 use servo_base::generic_channel;
 use servo_base::generic_channel::GenericSend;
@@ -89,6 +92,13 @@ use crate::event_loop::script_thread::{ScriptThread, with_script_thread};
 use crate::event_loop::script_window_proxies::ScriptWindowProxies;
 use crate::navigation::navigate;
 
+#[derive(Clone, Copy, PartialEq)]
+pub(crate) enum WindowOpenType {
+    ExistingOrNone,
+    NewAndUnrestricted,
+    NewWithNoOpener,
+}
+
 #[dom_struct]
 // NOTE: the browsing context for a window is managed in two places:
 // here, in script, but also in the constellation. The constellation
@@ -118,7 +128,7 @@ pub(crate) struct WindowProxy {
 
     /// The name of the browsing context (sometimes, but not always,
     /// equal to the name of a container element)
-    name: DomRefCell<DOMString>,
+    name: DomRefCell<TracedDOMString>,
     /// The pipeline id of the currently active document.
     /// May be None, when the currently active document is in another script thread.
     /// We do not try to keep the pipeline id for documents in other threads,
@@ -177,7 +187,7 @@ impl WindowProxy {
             reflector: Reflector::new(),
             browsing_context_id,
             webview_id,
-            name: DomRefCell::new(name),
+            name: DomRefCell::new(name.traced()),
             currently_active: Cell::new(currently_active),
             discarded: Cell::new(false),
             disowned: Cell::new(false),
@@ -321,42 +331,17 @@ impl WindowProxy {
         }
     }
 
-    /// <https://html.spec.whatwg.org/multipage/#auxiliary-browsing-context>
-    fn create_auxiliary_browsing_context(
+    /// <https://html.spec.whatwg.org/multipage/#creating-a-new-top-level-traversable>
+    fn creating_a_new_top_level_traversable(
         &self,
         cx: &mut JSContext,
-        name: DOMString,
         noopener: bool,
+        name: DOMString,
+        document: &Document,
+        sandboxing_flag_set: SandboxingFlagSet,
     ) -> Option<DomRoot<WindowProxy>> {
+        let window = document.window();
         let (response_sender, response_receiver) = generic_channel::channel().unwrap();
-        let window = self
-            .currently_active
-            .get()
-            .and_then(ScriptThread::find_document)
-            .map(|doc| DomRoot::from_ref(doc.window()))
-            .unwrap();
-
-        let document = self
-            .currently_active
-            .get()
-            .and_then(ScriptThread::find_document)
-            .expect("A WindowProxy creating an auxiliary to have an active document");
-
-        // <https://html.spec.whatwg.org/multipage/#navigable-target-names>
-        // > If the user agent has been configured such that in this instance it
-        // > will create a new top-level traversable
-        // >
-        // Step 9. If sandboxingFlagSet's sandbox propagates to auxiliary browsing
-        //   contexts flag is set, then all the flags that are set in sandboxingFlagSet
-        // must be set in chosen's active browsing context's popup sandboxing flag set.
-        let sandboxing_flag_set = document.active_sandboxing_flag_set();
-        let propagate_sandbox = sandboxing_flag_set
-            .contains(SandboxingFlagSet::SANDBOX_PROPOGATES_TO_AUXILIARY_BROWSING_CONTEXTS_FLAG);
-        let sandboxing_flag_set = if propagate_sandbox {
-            sandboxing_flag_set
-        } else {
-            SandboxingFlagSet::empty()
-        };
 
         let blank_url = ServoUrl::parse("about:blank").ok().unwrap();
         let mut load_data = LoadData::new(
@@ -370,6 +355,7 @@ impl WindowProxy {
             document.get_referrer_policy(),
             None, // Doesn't inherit secure context
             None,
+            HashSet::new(),
             false,
             sandboxing_flag_set,
         );
@@ -386,17 +372,21 @@ impl WindowProxy {
         let response = response_receiver.recv().unwrap()?;
         let new_browsing_context_id = BrowsingContextId::from(response.new_webview_id);
         let new_pipeline_info = NewPipelineInfo {
+            webview_state: WebViewState {
+                id: response.new_webview_id,
+                // Use the current `WebView`'s theme initially, but the embedder may change
+                // this later.
+                theme: Cell::new(window.webview_theme()),
+                // WebViews start focused by default for now.
+                has_system_focus: Cell::new(true),
+            },
             parent_info: None,
             new_pipeline_id: response.new_pipeline_id,
             browsing_context_id: new_browsing_context_id,
-            webview_id: response.new_webview_id,
             opener: Some(self.browsing_context_id),
             load_data,
             viewport_details: window.viewport_details(),
             user_content_manager_id: response.user_content_manager_id,
-            // Use the current `WebView`'s theme initially, but the embedder may
-            // change this later.
-            embedder_theme: window.embedder_theme(),
             target_snapshot_params: TargetSnapshotParams {
                 sandboxing_flags: sandboxing_flag_set,
                 iframe_element_referrer_policy: ReferrerPolicy::EmptyString,
@@ -413,6 +403,8 @@ impl WindowProxy {
         if !name.eq_ignore_ascii_case("_blank") {
             new_window_proxy.set_name(name);
         }
+        // Step 2. If opener is null, then set document to the second return value
+        // of creating a new top-level browsing context and document.
         if noopener {
             new_window_proxy.disown();
         } else {
@@ -431,6 +423,7 @@ impl WindowProxy {
             GenericSend::send(document.global().storage_threads(), msg).unwrap();
             receiver.recv().unwrap();
         }
+        // Step 13. Return traversable.
         Some(new_window_proxy)
     }
 
@@ -444,7 +437,7 @@ impl WindowProxy {
         self.delaying_load_events_mode.set(false);
     }
 
-    // https://html.spec.whatwg.org/multipage/#disowned-its-opener
+    /// <https://html.spec.whatwg.org/multipage/#disowned-its-opener>
     pub(crate) fn disown(&self) {
         self.disowned.set(true);
     }
@@ -460,7 +453,7 @@ impl WindowProxy {
         self.is_closing.get()
     }
 
-    // https://html.spec.whatwg.org/multipage/#dom-opener
+    /// <https://html.spec.whatwg.org/multipage/#dom-opener>
     pub(crate) fn opener(&self, cx: &mut CurrentRealm, mut retval: MutableHandleValue) {
         if self.disowned.get() {
             return retval.set(NullValue());
@@ -503,7 +496,7 @@ impl WindowProxy {
         opener_proxy.to_jsval(cx, retval);
     }
 
-    // https://html.spec.whatwg.org/multipage/#window-open-steps
+    /// <https://html.spec.whatwg.org/multipage/#window-open-steps>
     pub(crate) fn open(
         &self,
         cx: &mut JSContext,
@@ -551,104 +544,123 @@ impl WindowProxy {
         };
         // Step 6. Let tokenizedFeatures be the result of tokenizing features.
         let tokenized_features = tokenize_open_features(features);
-        // Step 7 - 8.
-        // If tokenizedFeatures["noreferrer"] exists, then set noreferrer to
-        // the result of parsing tokenizedFeatures["noreferrer"] as a boolean feature.
+        // Step 7. Let noreferrer be false.
+        // Step 8. If tokenizedFeatures["noreferrer"] exists,
+        // then set noreferrer to the result of parsing tokenizedFeatures["noreferrer"] as a boolean feature.
         let noreferrer = parse_open_feature_boolean(&tokenized_features, "noreferrer");
 
-        // Step 9. Let noopener be the result of getting noopener for window
-        // open with sourceDocument, tokenizedFeatures, and urlRecord.
-        let noopener = if noreferrer {
-            true
+        // Step 12. If noreferrer is true, then set noopener to true
+        // and set referrerPolicy to "no-referrer".
+        let (noopener, referrer_policy) = if noreferrer {
+            (true, ReferrerPolicy::NoReferrer)
         } else {
-            parse_open_feature_boolean(&tokenized_features, "noopener")
+            // Step 9. Let noopener be the result of getting noopener for window open with sourceDocument,
+            // tokenizedFeatures, and urlRecord.
+            // Step 11. Let referrerPolicy be the empty string.
+            (
+                parse_open_feature_boolean(&tokenized_features, "noopener"),
+                ReferrerPolicy::EmptyString,
+            )
         };
         // (TODO) Step 10. Remove tokenizedFeatures["noopener"] and tokenizedFeatures["noreferrer"].
 
-        // (TODO) Step 11. Let referrerPolicy be the empty string.
-        // (TODO) Step 12. If noreferrer is true, then set referrerPolicy to "no-referrer".
-
-        // Step 13 - 14
-        // Let targetNavigable and windowType be the result of applying the rules for
+        // Step 13. Let targetNavigable and windowType be the result of applying the rules for
         // choosing a navigable given target, sourceDocument's node navigable, and noopener.
-        // If targetNavigable is null, then return null.
-        let (chosen, new) = match self.choose_a_navigable(cx, non_empty_target, noopener) {
-            (Some(chosen), new) => (chosen, new),
+        let (chosen, window_type) = match self.choose_a_navigable(cx, &non_empty_target, noopener) {
+            (Some(chosen), window_type) => (chosen, window_type),
+            // Step 14. If targetNavigable is null, then return null.
             (None, _) => return Ok(None),
         };
-        // TODO Step 15.2, Set up browsing context features for targetNavigable's
-        // active browsing context given tokenizedFeatures.
         let target_document = match chosen.document() {
             Some(target_document) => target_document,
             None => return Ok(None),
         };
-        let has_trustworthy_ancestor_origin = if new {
-            target_document.has_trustworthy_ancestor_or_current_origin()
-        } else {
-            false
-        };
         let target_window = target_document.window();
-        // Step 15.3. If urlRecord is null, then set urlRecord to a URL record representing about:blank.
-        let url_record = url_record.unwrap_or(ServoUrl::parse("about:blank").unwrap());
-        // Step 15.4. If urlRecord matches about:blank, then perform the URL and history update steps given targetNavigable's active document and urlRecord.
-        //
-        // This happened in the constellation as part of creating the auxiliary browsing context.
-        if !url_record.matches_about_blank() {
-            let referrer = if noreferrer {
-                Referrer::NoReferrer
+        let referrer = if noreferrer {
+            Referrer::NoReferrer
+        } else {
+            target_window.as_global_scope().get_referrer()
+        };
+
+        // Step 15. If windowType is either "new and unrestricted" or "new with no opener":
+        if matches!(
+            window_type,
+            WindowOpenType::NewAndUnrestricted | WindowOpenType::NewWithNoOpener
+        ) {
+            // Step 15.1. Set targetNavigable's active browsing context's is popup to
+            // the result of checking if a popup window is requested, given tokenizedFeatures.
+            // TODO
+
+            // TODO Step 15.2, Set up browsing context features for targetNavigable's
+            // active browsing context given tokenizedFeatures.
+            let has_trustworthy_ancestor_origin = if window_type != WindowOpenType::ExistingOrNone {
+                target_document.has_trustworthy_ancestor_or_current_origin()
             } else {
-                target_window.as_global_scope().get_referrer()
+                false
             };
-            // Propagate CSP list and about-base-url from opener to new document
-            let csp_list = source_document.get_csp_list().clone();
-            target_document.set_csp_list(csp_list);
+            // Step 15.3. If urlRecord is null, then set urlRecord to a URL record representing about:blank.
+            let url_record = url_record.unwrap_or(ServoUrl::parse("about:blank").unwrap());
+            // Step 15.4. If urlRecord matches about:blank,
+            // then perform the URL and history update steps given targetNavigable's active document and urlRecord.
+            //
+            // This happened in the constellation as part of creating the auxiliary browsing context.
+            if !url_record.matches_about_blank() {
+                // Propagate CSP list and about-base-url from opener to new document
+                let csp_list = source_document.get_csp_list().clone();
+                target_document.set_csp_list(csp_list);
 
-            // Step 15.5 Otherwise, navigate targetNavigable to urlRecord using sourceDocument,
-            // with referrerPolicy set to referrerPolicy and exceptionsEnabled set to true.
-            // FIXME: referrerPolicy may not be used properly here. exceptionsEnabled not used.
-            let mut load_data = LoadData::new(
-                LoadOrigin::Script(source_document.origin().snapshot()),
-                url_record,
-                target_document.about_base_url(),
-                Some(target_window.pipeline_id()),
-                referrer,
-                target_document.get_referrer_policy(),
-                Some(target_window.as_global_scope().is_secure_context()),
-                Some(target_document.insecure_requests_policy()),
-                has_trustworthy_ancestor_origin,
-                target_document.creation_sandboxing_flag_set_considering_parent_iframe(),
-            );
+                // Step 15.5 Otherwise, navigate targetNavigable to urlRecord using sourceDocument,
+                // with referrerPolicy set to referrerPolicy and exceptionsEnabled set to true.
+                // FIXME: exceptionsEnabled not used.
+                let mut load_data =
+                    target_window.load_data_for_document(url_record, source_document.pipeline_id());
+                load_data.referrer = referrer;
+                load_data.referrer_policy = referrer_policy;
+                load_data.has_trustworthy_ancestor_origin = has_trustworthy_ancestor_origin;
 
-            // Handle javascript: URLs specially to report CSP violations to the source window
-            // https://html.spec.whatwg.org/multipage/#navigate-to-a-javascript:-url
-            if load_data.url.scheme() == "javascript" {
-                let existing_global = source_document.global();
-
-                // Check CSP and report violations to the source (existing) window
-                if !ScriptThread::can_navigate_to_javascript_url(
+                navigate(
                     cx,
-                    &existing_global,
-                    target_window.as_global_scope(),
-                    &mut load_data,
-                    None,
-                ) {
-                    // CSP blocked the navigation, don't proceed
-                    return Ok(target_document.browsing_context());
-                }
+                    target_window,
+                    NavigationHistoryBehavior::Replace,
+                    false,
+                    load_data,
+                );
             }
-
-            let history_handling = if new {
-                NavigationHistoryBehavior::Replace
-            } else {
-                NavigationHistoryBehavior::Push
-            };
-            navigate(cx, target_window, history_handling, false, load_data);
+        } else {
+            // Step 16. Otherwise:
+            // Step 16.1. If urlRecord is not null, then navigate targetNavigable
+            // to urlRecord using sourceDocument, with referrerPolicy set to referrerPolicy
+            // and exceptionsEnabled set to true.
+            if let Some(url_record) = url_record {
+                let mut load_data =
+                    target_window.load_data_for_document(url_record, target_window.pipeline_id());
+                load_data.referrer = referrer;
+                load_data.referrer_policy = referrer_policy;
+                navigate(
+                    cx,
+                    target_window,
+                    NavigationHistoryBehavior::Push,
+                    false,
+                    load_data,
+                );
+            }
         }
-        // Step 17 (Dis-owning has been done in create_auxiliary_browsing_context).
-        if noopener {
+
+        // Step 17. If windowType is "new with no opener", then return null.
+        if window_type == WindowOpenType::NewWithNoOpener {
             return Ok(None);
         }
-        // Step 18
+        // Step 18. If noopener is true and target is not an ASCII case-insensitive match
+        // for "_self", "_parent", or "_top", then return null.
+        if noopener &&
+            !(non_empty_target.eq_ignore_ascii_case("_self") ||
+                non_empty_target.eq_ignore_ascii_case("_parent") ||
+                non_empty_target.eq_ignore_ascii_case("_top"))
+        {
+            return Ok(None);
+        }
+
+        // Step 19. Return targetNavigable's active WindowProxy.
         Ok(target_document.browsing_context())
     }
 
@@ -656,12 +668,9 @@ impl WindowProxy {
     pub(crate) fn choose_a_navigable(
         &self,
         cx: &mut JSContext,
-        name: DOMString,
+        name: &DOMString,
         noopener: bool,
-    ) -> (Option<DomRoot<WindowProxy>>, bool) {
-        // Step 1. Let chosen be null.
-        // Step 2. Let windowType be "existing or none".
-
+    ) -> (Option<DomRoot<WindowProxy>>, WindowOpenType) {
         // Step 3. Let sandboxingFlagSet be currentNavigable's active document's active
         // sandboxing flag set.
         let sandboxing_flag_set = self
@@ -672,20 +681,19 @@ impl WindowProxy {
         let chosen = if name.is_empty() || name.eq_ignore_ascii_case("_self") {
             // Step 4. If name is the empty string or an ASCII case-insensitive match for
             // "_self", then set chosen to currentNavigable.
-            Some((Some(DomRoot::from_ref(self)), false))
+            Some(DomRoot::from_ref(self))
         } else if name.eq_ignore_ascii_case("_parent") {
             // Step 5. Otherwise, if name is an ASCII case-insensitive match for
             // "_parent", set chosen to currentNavigable's parent, if any, and
             // currentNavigable otherwise.
             Some(
                 self.parent()
-                    .map(|parent| (Some(DomRoot::from_ref(parent)), false))
-                    .unwrap_or_else(|| (Some(DomRoot::from_ref(self)), false)),
+                    .map_or_else(|| DomRoot::from_ref(self), DomRoot::from_ref),
             )
         } else if name.eq_ignore_ascii_case("_top") {
             // Step 6. Otherwise, if name is an ASCII case-insensitive match for "_top",
             // set chosen to currentNavigable's traversable navigable.
-            Some((Some(DomRoot::from_ref(self.top())), false))
+            Some(DomRoot::from_ref(self.top()))
         } else if !name.eq_ignore_ascii_case("_blank") {
             // Step 7. Otherwise, if name is not an ASCII case-insensitive match for
             // "_blank" and noopener is false, then set chosen to the result of finding a
@@ -694,14 +702,18 @@ impl WindowProxy {
             // Note: The noopener==false condition here seems to break WPT tests and
             // is likely a specification bug.
             // See <https://github.com/whatwg/html/issues/12839>
-            self.find_navigable_by_target_name(&name)
-                .map(|proxy| (Some(proxy), false))
+            self.find_navigable_by_target_name(name)
         } else {
+            // Step 1. Let chosen be null.
             None
         };
 
+        // Step 9. Return chosen and windowType.
+        //
+        // Early-return here to save indentation on all the other steps
         if let Some(chosen) = chosen {
-            return chosen;
+            // Step 2. Let windowType be "existing or none".
+            return (Some(chosen), WindowOpenType::ExistingOrNone);
         }
 
         // Step 8. If chosen is null, then a new top-level traversable is being requested,
@@ -720,17 +732,90 @@ impl WindowProxy {
         if sandboxing_flag_set
             .contains(SandboxingFlagSet::SANDBOXED_AUXILIARY_NAVIGATION_BROWSING_CONTEXT_FLAG)
         {
-            (None, false)
+            return (None, WindowOpenType::ExistingOrNone);
         }
         // ↪ If the user agent has been configured such that in this instance it
         // will create a new top-level traversable
-        // TODO: Integrate `create_auxiliary_browsing_context` here and have it follow the spec.
-        else {
-            (
-                self.create_auxiliary_browsing_context(cx, name, noopener),
+
+        // Substep 2. Set windowType to "new and unrestricted".
+        let mut window_type = WindowOpenType::NewAndUnrestricted;
+
+        // Substep 3. Let currentDocument be currentNavigable's active document.
+        let current_document = self
+            .currently_active
+            .get()
+            .and_then(ScriptThread::find_document)
+            .unwrap();
+
+        // Substep 1. Consume user activation of currentNavigable's active window.
+        current_document.window().consume_user_activation();
+
+        // Substep 4. If currentDocument's opener policy's value is "same-origin" or "same-origin-plus-COEP",
+        // and currentDocument's origin is not same origin with currentDocument's
+        // relevant settings object's top-level origin:
+        // TODO
+
+        // Substep 6. If name is not an ASCII case-insensitive match for "_blank", then set targetName to name.
+        let target_name = if !name.eq_ignore_ascii_case("_blank") {
+            name.clone()
+        } else {
+            // Substep 5. Let targetName be the empty string.
+            Default::default()
+        };
+
+        // Substep 9. If sandboxingFlagSet's sandbox propagates to auxiliary browsing contexts flag is set,
+        // then all the flags that are set in sandboxingFlagSet must be set in chosen's
+        // active browsing context's popup sandboxing flag set.
+        //
+        // We do this step first so we can pass it to LoadData
+        let sandboxing_flag_set = current_document.active_sandboxing_flag_set();
+        let propagate_sandbox = sandboxing_flag_set
+            .contains(SandboxingFlagSet::SANDBOX_PROPOGATES_TO_AUXILIARY_BROWSING_CONTEXTS_FLAG);
+        let sandboxing_flag_set = if propagate_sandbox {
+            sandboxing_flag_set
+        } else {
+            SandboxingFlagSet::empty()
+        };
+
+        // Substep 7. If noopener is true:
+        let chosen = if noopener {
+            // Substep 7.1. Set windowType to "new with no opener"
+            window_type = WindowOpenType::NewWithNoOpener;
+
+            // Substep 7.2. Set chosen to the result of creating a new top-level traversable
+            // given null, targetName, and currentNavigable.
+            // TODO: pass `null` here instead
+            self.creating_a_new_top_level_traversable(
+                cx,
                 true,
+                target_name,
+                &current_document,
+                sandboxing_flag_set,
             )
-        }
+        } else {
+            // Substep 8. Otherwise:
+            // Substep 8.1. Set chosen to the result of creating a new top-level traversable given
+            // currentNavigable's active browsing context, targetName, and currentNavigable.
+            // TODO: instead of the boolean, pass the browsing context here
+            self.creating_a_new_top_level_traversable(
+                cx,
+                false,
+                target_name,
+                &current_document,
+                sandboxing_flag_set,
+            )
+
+            // Substep 8.2. If sandboxingFlagSet's sandboxed navigation browsing context flag is set,
+            // then set chosen's active browsing context's one permitted sandboxed navigator
+            // to currentNavigable's active browsing context.
+            // TODO
+        };
+
+        // Substep 10. Set chosen's is created by web content to true.
+        // TODO
+
+        // Step 9. Return chosen and windowType.
+        (chosen, window_type)
     }
 
     /// <https://html.spec.whatwg.org/multipage/#find-a-navigable-by-target-name>
@@ -878,7 +963,13 @@ impl WindowProxy {
     /// If the containing `<iframe>` of this [`WindowProxy`] is from a same-origin page,
     /// this will return an [`Element`] of the `<iframe>` element in the realm of the parent
     /// page.
+    ///
+    /// This returns `None` if the browsing context for this [`WindowProxy`]
+    /// has been discarded.
     pub(crate) fn frame_element(&self) -> Option<&Element> {
+        if self.is_browsing_context_discarded() {
+            return None;
+        }
         self.frame_element.as_deref()
     }
 
@@ -900,30 +991,17 @@ impl WindowProxy {
         result
     }
 
-    pub(crate) fn document_origin(&self) -> Option<OriginSnapshot> {
+    pub(crate) fn document_origin_and_internal_ancestor_origin_objects_list(
+        &self,
+    ) -> Option<(OriginSnapshot, Vec<ImmutableOrigin>)> {
         let pipeline_id = self.currently_active()?;
         let (result_sender, result_receiver) = generic_channel::channel().unwrap();
         self.global()
             .script_to_constellation_chan()
-            .send(ScriptToConstellationMessage::GetDocumentOrigin(
+            .send(ScriptToConstellationMessage::GetDocumentOriginDetails(
                 pipeline_id,
                 result_sender,
             ))
-            .ok()?;
-        result_receiver.recv().ok()?
-    }
-
-    pub(crate) fn internal_ancestor_origin_objects_list(&self) -> Option<Vec<ImmutableOrigin>> {
-        let pipeline_id = self.currently_active()?;
-        let (result_sender, result_receiver) = generic_channel::channel().unwrap();
-        self.global()
-            .script_to_constellation_chan()
-            .send(
-                ScriptToConstellationMessage::GetInternalAncestorOriginObjectsList(
-                    pipeline_id,
-                    result_sender,
-                ),
-            )
             .ok()?;
         result_receiver.recv().ok()?
     }
@@ -949,14 +1027,7 @@ impl WindowProxy {
         } else if let Some(parent_proxy) = self.parent() {
             // Step 4. Assert: parentDoc is fully active.
             assert!(parent_proxy.currently_active().is_some());
-
-            let origin = parent_proxy
-                .document_origin()
-                .expect("Must always be active");
-            let list = parent_proxy
-                .internal_ancestor_origin_objects_list()
-                .expect("Must always be active");
-            Some((origin, list))
+            parent_proxy.document_origin_and_internal_ancestor_origin_objects_list()
         } else {
             None
         }
@@ -983,6 +1054,12 @@ impl WindowProxy {
 
             // The old window proxy no longer owns this browsing context.
             SetProxyReservedSlot(old_js_proxy.get(), 0, &PrivateValue(ptr::null_mut()));
+            // Also drop any cached cross-origin property holders.
+            SetProxyReservedSlot(
+                old_js_proxy.get(),
+                CROSS_ORIGIN_PROPERTY_HOLDER_WEAK_MAP_SLOT,
+                &UndefinedValue(),
+            );
 
             // Brain transplant the window proxy. Brain transplantation is
             // usually done to move a window proxy between compartments, but
@@ -1055,11 +1132,11 @@ impl WindowProxy {
     }
 
     pub(crate) fn get_name(&self) -> DOMString {
-        self.name.borrow().clone()
+        self.name.borrow().clone().root()
     }
 
     pub(crate) fn set_name(&self, name: DOMString) {
-        *self.name.borrow_mut() = name;
+        *self.name.borrow_mut() = name.traced();
     }
 }
 
@@ -1106,26 +1183,29 @@ impl CreatorBrowsingContextInfo {
 /// <https://html.spec.whatwg.org/multipage/#concept-window-open-features-tokenize>
 fn tokenize_open_features(features: DOMString) -> IndexMap<String, String> {
     let is_feature_sep = |c: char| c.is_ascii_whitespace() || ['=', ','].contains(&c);
-    // Step 1
+    // Step 1. Let tokenizedFeatures be a new ordered map.
     let mut tokenized_features = IndexMap::new();
-    // Step 2
+    // Step 2. Let position point at the first code point of features.
     let features = features.str();
     let mut iter = features.chars();
     let mut cur = iter.next();
 
-    // Step 3
+    // Step 3. While position is not past the end of features:
     while cur.is_some() {
-        // Step 3.1 & 3.2
+        // Step 3.1. Let name be the empty string.
+        // Step 3.2. Let value be the empty string.
         let mut name = String::new();
         let mut value = String::new();
-        // Step 3.3
+        // Step 3.3. Collect a sequence of code points that are feature separators
+        // from features given position. This skips past leading separators before the name.
         while let Some(cur_char) = cur {
             if !is_feature_sep(cur_char) {
                 break;
             }
             cur = iter.next();
         }
-        // Step 3.4
+        // Step 3.4. Collect a sequence of code points that are not feature separators
+        // from features given position. Set name to the collected characters, converted to ASCII lowercase.
         while let Some(cur_char) = cur {
             if is_feature_sep(cur_char) {
                 break;
@@ -1133,7 +1213,7 @@ fn tokenize_open_features(features: DOMString) -> IndexMap<String, String> {
             name.push(cur_char.to_ascii_lowercase());
             cur = iter.next();
         }
-        // Step 3.5
+        // Step 3.5. Set name to the result of normalizing the feature name name.
         let normalized_name = String::from(match name.as_ref() {
             "screenx" => "left",
             "screeny" => "top",
@@ -1141,23 +1221,36 @@ fn tokenize_open_features(features: DOMString) -> IndexMap<String, String> {
             "innerheight" => "height",
             _ => name.as_ref(),
         });
-        // Step 3.6
-        while let Some(cur_char) = cur {
-            if cur_char == '=' || cur_char == ',' || !is_feature_sep(cur_char) {
+        // Step 3.6. While position is not past the end of features
+        // and the code point at position in features is not U+003D (=):
+        while let Some(cur_char) = cur &&
+            cur_char != '='
+        {
+            // Step 3.6.1. If the code point at position in features is U+002C (,),
+            // or if it is not a feature separator, then break.
+            if cur_char == ',' || !is_feature_sep(cur_char) {
                 break;
             }
+            // Step 3.6.2. Advance position by 1.
             cur = iter.next();
         }
-        // Step 3.7
+        // Step 3.7. If the code point at position in features is a feature separator:
         if cur.is_some() && is_feature_sep(cur.unwrap()) {
-            // Step 3.7.1
-            while let Some(cur_char) = cur {
-                if !is_feature_sep(cur_char) || cur_char == ',' {
+            // Step 3.7.1. While position is not past the end of features and
+            // the code point at position in features is a feature separator:
+            while let Some(cur_char) = cur &&
+                is_feature_sep(cur_char)
+            {
+                // Step 3.7.1.1. If the code point at position in features is U+002C (,), then break.
+                if cur_char == ',' {
                     break;
                 }
+                // Step 3.7.1.2. Advance position by 1.
                 cur = iter.next();
             }
-            // Step 3.7.2
+            // Step 3.7.2. Collect a sequence of code points that are not feature separators
+            // code points from features given position.
+            // Set value to the collected code points, converted to ASCII lowercase.
             while let Some(cur_char) = cur {
                 if is_feature_sep(cur_char) {
                     break;
@@ -1166,12 +1259,12 @@ fn tokenize_open_features(features: DOMString) -> IndexMap<String, String> {
                 cur = iter.next();
             }
         }
-        // Step 3.8
+        // Step 3.8. If name is not the empty string, then set tokenizedFeatures[name] to value.
         if !name.is_empty() {
             tokenized_features.insert(normalized_name, value);
         }
     }
-    // Step 4
+    // Step 4. Return tokenizedFeatures.
     tokenized_features
 }
 
@@ -1263,9 +1356,13 @@ unsafe extern "C" fn get_own_property_descriptor(
 
     // Step 3. If IsPlatformObjectSameOrigin(W) is true, then return ! OrdinaryGetOwnProperty(W, P).
     if is_platform_object_same_origin(cx, proxy) {
-        return unsafe {
-            JS_GetOwnPropertyDescriptorById(cx, target.handle(), id, property_descriptor, is_none)
-        };
+        return JS_GetOwnPropertyDescriptorById(
+            cx,
+            target.handle(),
+            id,
+            property_descriptor,
+            is_none,
+        );
     }
 
     // Step 4. Let property be CrossOriginGetOwnPropertyHelper(W, P).
@@ -1649,11 +1746,7 @@ unsafe extern "C" fn own_property_keys(
     rooted!(&in(cx) let target = window_proxy_target(proxy));
     let window = WindowOrDissimilarOriginWindow::new(cx, target.handle());
 
-    // Step 2. Let maxProperties be W's associated Document's document-tree child navigables's
-    // size.
-    //
-    // TODO: DissimilarOriginWindow currently always returns 0 for the length,
-    // so this has the effect of not exposing any indexable attributes.
+    // Step 2. Let maxProperties be W's associated Document's document-tree child navigables's size.
     let max_properties = window.iframe_count();
 
     // Step 3. Let keys be the range 0 to maxProperties, exclusive.
@@ -1666,18 +1759,72 @@ unsafe extern "C" fn own_property_keys(
     if is_platform_object_same_origin(cx, proxy) {
         // Step 4. If IsPlatformObjectSameOrigin(W) is true, then return the concatenation of keys and
         // OrdinaryOwnPropertyKeys(W).
-        return unsafe {
-            GetPropertyKeys(
-                cx,
-                target.handle(),
-                JSITER_OWNONLY | JSITER_HIDDEN | JSITER_SYMBOLS,
-                property_keys,
-            )
-        };
+        return GetPropertyKeys(
+            cx,
+            target.handle(),
+            JSITER_OWNONLY | JSITER_HIDDEN | JSITER_SYMBOLS,
+            property_keys,
+        );
     }
 
     // Step 5. Return the concatenation of keys and ! CrossOriginOwnPropertyKeys(W).
     cross_origin_own_property_keys(cx, proxy, window.cross_origin_properties(), property_keys)
+}
+
+/// A version of <https://html.spec.whatwg.org/multipage#windowproxy-ownpropertykeys>
+/// that hands back only the enumerable properties. This is necessary because the
+/// default implementation of this method returns all enumerable properties which
+/// isn't correct in the cross-origin case.
+#[expect(unsafe_code)]
+unsafe extern "C" fn get_own_enumerable_property_keys(
+    cx: *mut RawJSContext,
+    proxy: RawHandleObject,
+    property_keys: RawMutableHandleIdVector,
+) -> bool {
+    let mut cx = unsafe { JSContext::from_ptr(ptr::NonNull::new(cx).unwrap()) };
+    let mut cx = CurrentRealm::assert(&mut cx);
+    let cx = &mut cx;
+    let proxy = unsafe { Handle::from_raw(proxy) };
+
+    // Step 1. Let W be the value of the [[Window]] internal slot of this.
+    rooted!(&in(cx) let target = window_proxy_target(proxy));
+    let window = WindowOrDissimilarOriginWindow::new(cx, target.handle());
+
+    // Step 2. Let maxProperties be W's associated Document's document-tree child navigables's size.
+    let max_properties = window.iframe_count();
+
+    // Step 3. Let keys be the range 0 to maxProperties, exclusive.
+    rooted!(&in(cx) let mut rooted_index_jsid: jsid);
+    for index in 0..max_properties {
+        unsafe { int_to_jsid(index as i32, rooted_index_jsid.handle_mut()) };
+        unsafe { AppendToIdVector(property_keys, rooted_index_jsid.handle()) };
+    }
+
+    if is_platform_object_same_origin(cx, proxy) {
+        // Step 4. If IsPlatformObjectSameOrigin(W) is true, then return the concatenation of keys and
+        // OrdinaryOwnPropertyKeys(W).
+        return GetPropertyKeys(cx, target.handle(), JSITER_OWNONLY, property_keys);
+    }
+
+    // There are no other enumerable property keys for cross-origin WindowProxy other than
+    // the child navigable indices.
+    true
+}
+
+#[expect(unsafe_code)]
+unsafe extern "C" fn enumerate(
+    cx: *mut RawJSContext,
+    proxy: RawHandleObject,
+    property_keys: RawMutableHandleIdVector,
+) -> bool {
+    // Just get the property keys from ourselves, in whatever Realm we happen to
+    // be in. It's important to not enter the Realm of "proxy" here, because that
+    // would affect the list of keys we claim to have.
+    let mut cx = unsafe { JSContext::from_ptr(ptr::NonNull::new(cx).unwrap()) };
+    let cx = &mut cx;
+    let proxy = unsafe { Handle::from_raw(proxy) };
+
+    GetPropertyKeys(cx, proxy, 0, property_keys)
 }
 
 static PROXY_TRAPS: ProxyTraps = ProxyTraps {
@@ -1686,7 +1833,7 @@ static PROXY_TRAPS: ProxyTraps = ProxyTraps {
     defineProperty: Some(define_property),
     ownPropertyKeys: Some(own_property_keys),
     delete_: Some(delete),
-    enumerate: None,
+    enumerate: Some(enumerate),
     getPrototypeIfOrdinary: Some(get_prototype_if_ordinary),
     getPrototype: Some(get_prototype),
     setPrototype: Some(maybe_cross_origin_set_prototype_rawcx),
@@ -1699,7 +1846,7 @@ static PROXY_TRAPS: ProxyTraps = ProxyTraps {
     call: None,
     construct: None,
     hasOwn: Some(has_own),
-    getOwnEnumerablePropertyKeys: None,
+    getOwnEnumerablePropertyKeys: Some(get_own_enumerable_property_keys),
     nativeCall: None,
     objectClassIs: None,
     className: None,
@@ -1867,20 +2014,22 @@ impl WindowOrDissimilarOriginWindow {
         &self,
         index: u32,
     ) -> Option<DomRoot<WindowProxy>> {
-        let browsing_context_id = self.window_proxy().browsing_context_id();
-        let (result_sender, result_receiver) = generic_channel::channel().unwrap();
-        let _ = self.global_scope().script_to_constellation_chan().send(
-            ScriptToConstellationMessage::GetChildBrowsingContextId(
-                browsing_context_id,
-                index as usize,
-                result_sender,
-            ),
-        );
-        result_receiver
-            .recv()
-            .ok()
-            .flatten()
-            .and_then(|id| ScriptThread::window_proxies().find_window_proxy(id))
+        let window_proxy = self.window_proxy();
+        let browsing_context_id = if let Some(document) = window_proxy.document() {
+            document.iframes().at_insertion_index(index as usize)?
+        } else {
+            let parent_browsing_context_id = window_proxy.browsing_context_id();
+            let (result_sender, result_receiver) = generic_channel::channel().unwrap();
+            let _ = self.global_scope().script_to_constellation_chan().send(
+                ScriptToConstellationMessage::GetChildBrowsingContextId(
+                    parent_browsing_context_id,
+                    index as usize,
+                    result_sender,
+                ),
+            );
+            result_receiver.recv().ok().flatten()?
+        };
+        ScriptThread::window_proxies().find_window_proxy(browsing_context_id)
     }
 
     /// <https://html.spec.whatwg.org/multipage/#document-tree-child-navigable-target-name-property-set>

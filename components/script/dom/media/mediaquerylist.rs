@@ -7,7 +7,9 @@ use std::rc::Rc;
 
 use dom_struct::dom_struct;
 use js::context::JSContext;
+use script_bindings::callback::RootedCallback;
 use script_bindings::reflector::reflect_weak_referenceable_dom_object;
+use script_bindings::trace::RootedTraceableBox;
 use style::media_queries::MediaList;
 use style::stylesheets::CustomMediaEvaluator;
 use style_traits::ToCss;
@@ -103,24 +105,25 @@ impl MediaQueryListMethods<crate::DomTypeHolder> for MediaQueryList {
     }
 
     /// <https://drafts.csswg.org/cssom-view/#dom-mediaquerylist-addlistener>
-    fn AddListener(&self, listener: Option<Rc<EventListener>>) {
+    fn AddListener(&self, listener: Option<RootedCallback<EventListener>>) {
+        let event_listener_options = RootedTraceableBox::new(AddEventListenerOptions {
+            parent: EventListenerOptions { capture: false },
+            once: false,
+            passive: None,
+            signal: None,
+        });
         self.upcast::<EventTarget>().add_event_listener(
-            "change".into(),
+            DOMString::from_static("change"),
             listener,
-            AddEventListenerOptions {
-                parent: EventListenerOptions { capture: false },
-                once: false,
-                passive: None,
-                signal: None,
-            },
+            &event_listener_options,
         );
     }
 
     /// <https://drafts.csswg.org/cssom-view/#dom-mediaquerylist-removelistener>
-    fn RemoveListener(&self, listener: Option<Rc<EventListener>>) {
+    fn RemoveListener(&self, listener: Option<RootedCallback<EventListener>>) {
         self.upcast::<EventTarget>().remove_event_listener(
-            "change".into(),
-            &listener,
+            DOMString::from_static("change"),
+            listener.as_deref(),
             &EventListenerOptions { capture: false },
         );
     }

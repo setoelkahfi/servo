@@ -131,9 +131,9 @@ pub(crate) fn value_for_fontsize_command(
     // the effective command value of the active range's start node,
     // in either case interpreted as a number of pixels.
     let command_value = active_range
-        .first_formattable_contained_node(cx.no_gc())
+        .first_formattable_contained_node(cx)
         .unwrap_or_else(|| active_range.start_container())
-        .effective_command_value(&CommandName::FontSize)?;
+        .effective_command_value(cx, &CommandName::FontSize)?;
     // Step 3. Return the legacy font size for pixel size.
     maybe_normalize_pixels(&command_value, document)
 }
@@ -146,8 +146,8 @@ pub(crate) fn maybe_normalize_pixels(
     command_value: &DOMString,
     document: &Document,
 ) -> Option<DOMString> {
-    if command_value.ends_with_str("px") {
-        command_value.str()[0..command_value.len() - 2]
+    if let Some(px_value) = command_value.str().strip_suffix("px") {
+        px_value
             .parse::<f32>()
             .ok()
             .map(|value| legacy_font_size_for(value, document))

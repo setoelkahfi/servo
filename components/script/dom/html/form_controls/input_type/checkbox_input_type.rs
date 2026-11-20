@@ -1,17 +1,20 @@
 /* This Source Code Form is subject to the terms of the Mozilla Public
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
-use js::context::JSContext;
+use js::context::{JSContext, NoGC};
 use script_bindings::cell::DomRefCell;
 use script_bindings::codegen::GenericBindings::HTMLInputElementBinding::HTMLInputElementMethods;
 use script_bindings::domstring::DOMString;
 use script_bindings::inheritance::Castable;
+use script_bindings::traits::DomEventTrait;
 
-use crate::dom::event::{Event, EventBubbles, EventCancelable, EventComposed};
+use crate::dom::event::Event;
 use crate::dom::eventtarget::EventTarget;
 use crate::dom::html::form_controls::htmlinputelement::{HTMLInputElement, InputActivationState};
 use crate::dom::html::form_controls::input_type::text_value_widget::TextValueWidget;
-use crate::dom::html::form_controls::input_type::{SpecificInputActivationType, SpecificInputType};
+use crate::dom::html::form_controls::input_type::{
+    SpecificInputActivationType, SpecificInputType, ValueChangeEvents,
+};
 use crate::dom::input_type::text_input_widget::TextInputWidget;
 use crate::dom::node::Node;
 
@@ -30,7 +33,12 @@ impl SpecificInputType for CheckboxInputType {
     }
 
     /// <https://html.spec.whatwg.org/multipage/#checkbox-state-(type=checkbox):suffering-from-being-missing>
-    fn suffers_from_being_missing(&self, input: &HTMLInputElement, _value: &DOMString) -> bool {
+    fn suffers_from_being_missing(
+        &self,
+        _no_gc: &NoGC,
+        input: &HTMLInputElement,
+        _value: &DOMString,
+    ) -> bool {
         input.Required() && !input.Checked()
     }
 
@@ -77,7 +85,7 @@ impl SpecificInputActivationType for CheckboxInputActivation {
         &self,
         cx: &mut js::context::JSContext,
         input: &HTMLInputElement,
-        _event: &Event,
+        event: &Event,
         _target: &EventTarget,
     ) {
         // Step 1: If the element is not connected, then return.
@@ -85,20 +93,17 @@ impl SpecificInputActivationType for CheckboxInputActivation {
             return;
         }
 
-        let target = input.upcast::<EventTarget>();
+        // According to the spec, because this input type has its own activation behavior,
+        // it shouldn't go through the flow which changes the user validity to true,
+        // but other browsers and tests disagree.
+        if event.IsTrusted() {
+            input.set_user_validity(cx.no_gc(), true);
+        }
 
         // Step 2: Fire an event named input at the element with the bubbles and composed
         // attributes initialized to true.
-        target.fire_event_with_params(
-            cx,
-            atom!("input"),
-            EventBubbles::Bubbles,
-            EventCancelable::NotCancelable,
-            EventComposed::Composed,
-        );
-
         // Step 3: Fire an event named change at the element with the bubbles attribute
         // initialized to true.
-        target.fire_bubbling_event(cx, atom!("change"));
+        input.fire_value_change_events(cx, ValueChangeEvents::Input | ValueChangeEvents::Change);
     }
 }

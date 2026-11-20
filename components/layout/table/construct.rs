@@ -50,16 +50,18 @@ impl ResolvedSlotAndLocation<'_> {
     }
 }
 
+pub(crate) struct AnonymousTableContentElement<'dom> {
+    pub(crate) info: NodeAndStyleInfo<'dom>,
+    pub(crate) display: DisplayGeneratingBox,
+    pub(crate) contents: Contents,
+    pub(crate) box_slot: BoxSlot<'dom>,
+}
+
 pub(crate) enum AnonymousTableContent<'dom> {
     Text(NodeAndStyleInfo<'dom>, BoxTreeString<'dom>),
     EnterDisplayContents(SharedInlineStyles),
     LeaveDisplayContents,
-    Element {
-        info: NodeAndStyleInfo<'dom>,
-        display: DisplayGeneratingBox,
-        contents: Contents,
-        box_slot: BoxSlot<'dom>,
-    },
+    Element(Box<AnonymousTableContentElement<'dom>>),
 }
 
 impl AnonymousTableContent<'_> {
@@ -123,13 +125,13 @@ impl Table {
 
         for content in contents {
             match content {
-                AnonymousTableContent::Element {
-                    info,
-                    display,
-                    contents,
-                    box_slot,
-                } => {
-                    table_builder.handle_element(&info, display, contents, box_slot);
+                AnonymousTableContent::Element(element) => {
+                    table_builder.handle_element(
+                        &element.info,
+                        element.display,
+                        element.contents,
+                        element.box_slot,
+                    );
                 },
                 AnonymousTableContent::Text(..) => {
                     // This only happens if there was whitespace between our internal table elements.
@@ -725,13 +727,13 @@ impl<'style, 'dom> TableBuilderTraversal<'style, 'dom> {
         let mut enter_display_contents = vec![];
         for cell_content in row_content {
             match cell_content {
-                AnonymousTableContent::Element {
-                    info,
-                    display,
-                    contents,
-                    box_slot,
-                } => {
-                    row_builder.handle_element(&info, display, contents, box_slot);
+                AnonymousTableContent::Element(element) => {
+                    row_builder.handle_element(
+                        &element.info,
+                        element.display,
+                        element.contents,
+                        element.box_slot,
+                    );
                 },
                 AnonymousTableContent::Text(info, text) => {
                     row_builder.handle_text(&info, text);
@@ -930,6 +932,7 @@ impl<'dom> TraversalHandler<'dom> for TableBuilderTraversal<'_, 'dom> {
                                 non_replaced_contents,
                                 self.current_propagated_data,
                                 false, /* is_list_item */
+                                false, /* is_table_cell */
                             ),
                         );
                         let base = LayoutBoxBase::new(info.into(), info.style.clone());
@@ -947,22 +950,26 @@ impl<'dom> TraversalHandler<'dom> for TableBuilderTraversal<'_, 'dom> {
                 },
                 DisplayLayoutInternal::TableCell => {
                     self.current_anonymous_row_content
-                        .push(AnonymousTableContent::Element {
-                            info: info.clone(),
-                            display,
-                            contents,
-                            box_slot,
-                        });
+                        .push(AnonymousTableContent::Element(Box::new(
+                            AnonymousTableContentElement {
+                                info: info.clone(),
+                                display,
+                                contents,
+                                box_slot,
+                            },
+                        )));
                 },
             },
             _ => {
                 self.current_anonymous_row_content
-                    .push(AnonymousTableContent::Element {
-                        info: info.clone(),
-                        display,
-                        contents,
-                        box_slot,
-                    });
+                    .push(AnonymousTableContent::Element(Box::new(
+                        AnonymousTableContentElement {
+                            info: info.clone(),
+                            display,
+                            contents,
+                            box_slot,
+                        },
+                    )));
             },
         }
     }
@@ -1020,13 +1027,13 @@ impl<'style, 'builder, 'dom, 'a> TableRowGroupBuilder<'style, 'builder, 'dom, 'a
         let mut enter_display_contents = vec![];
         for cell_content in row_content {
             match cell_content {
-                AnonymousTableContent::Element {
-                    info,
-                    display,
-                    contents,
-                    box_slot,
-                } => {
-                    row_builder.handle_element(&info, display, contents, box_slot);
+                AnonymousTableContent::Element(element) => {
+                    row_builder.handle_element(
+                        &element.info,
+                        element.display,
+                        element.contents,
+                        element.box_slot,
+                    );
                 },
                 AnonymousTableContent::Text(info, text) => {
                     row_builder.handle_text(&info, text);
@@ -1110,12 +1117,14 @@ impl<'dom> TraversalHandler<'dom> for TableRowGroupBuilder<'_, '_, 'dom, '_> {
 
             _ => {
                 self.current_anonymous_row_content
-                    .push(AnonymousTableContent::Element {
-                        info: info.clone(),
-                        display,
-                        contents,
-                        box_slot,
-                    });
+                    .push(AnonymousTableContent::Element(Box::new(
+                        AnonymousTableContentElement {
+                            info: info.clone(),
+                            display,
+                            contents,
+                            box_slot,
+                        },
+                    )));
             },
         }
     }
@@ -1171,13 +1180,13 @@ impl<'style, 'builder, 'dom, 'a> TableRowBuilder<'style, 'builder, 'dom, 'a> {
         let mut enter_display_contents = vec![];
         for cell_content in self.current_anonymous_cell_content.drain(..) {
             match cell_content {
-                AnonymousTableContent::Element {
-                    info,
-                    display,
-                    contents,
-                    box_slot,
-                } => {
-                    builder.handle_element(&info, display, contents, box_slot);
+                AnonymousTableContent::Element(element) => {
+                    builder.handle_element(
+                        &element.info,
+                        element.display,
+                        element.contents,
+                        element.box_slot,
+                    );
                 },
                 AnonymousTableContent::Text(info, text) => {
                     builder.handle_text(&info, text);
@@ -1199,7 +1208,11 @@ impl<'style, 'builder, 'dom, 'a> TableRowBuilder<'style, 'builder, 'dom, 'a> {
             context: IndependentFormattingContext::new(
                 LayoutBoxBase::new(BaseFragmentInfo::anonymous(), anonymous_info.style),
                 IndependentFormattingContextContents::Flow(
-                    BlockFormattingContext::from_block_container(block_container),
+                    BlockFormattingContext::from_block_container(
+                        block_container,
+                        /* is_table_cell = */ true,
+                        /* textarea_size = */ None,
+                    ),
                 ),
                 propagated_data,
             ),
@@ -1243,7 +1256,6 @@ impl<'dom> TraversalHandler<'dom> for TableRowBuilder<'_, '_, 'dom, '_> {
         contents: Contents,
         box_slot: BoxSlot<'dom>,
     ) {
-        #[allow(clippy::collapsible_match)] //// TODO: Remove once the other cases are handled
         match display {
             DisplayGeneratingBox::LayoutInternal(internal) => match internal {
                 DisplayLayoutInternal::TableCell => {
@@ -1284,6 +1296,7 @@ impl<'dom> TraversalHandler<'dom> for TableRowBuilder<'_, '_, 'dom, '_> {
                             non_replaced_contents,
                             propagated_data,
                             false, /* is_list_item */
+                            true,  /* is_table_cell */
                         );
 
                         ArcRefCell::new(TableSlotCell {
@@ -1303,22 +1316,26 @@ impl<'dom> TraversalHandler<'dom> for TableRowBuilder<'_, '_, 'dom, '_> {
                 _ => {
                     //// TODO: Properly handle other table-like elements in the middle of a row.
                     self.current_anonymous_cell_content
-                        .push(AnonymousTableContent::Element {
-                            info: info.clone(),
-                            display,
-                            contents,
-                            box_slot,
-                        });
+                        .push(AnonymousTableContent::Element(Box::new(
+                            AnonymousTableContentElement {
+                                info: info.clone(),
+                                display,
+                                contents,
+                                box_slot,
+                            },
+                        )));
                 },
             },
             _ => {
                 self.current_anonymous_cell_content
-                    .push(AnonymousTableContent::Element {
-                        info: info.clone(),
-                        display,
-                        contents,
-                        box_slot,
-                    });
+                    .push(AnonymousTableContent::Element(Box::new(
+                        AnonymousTableContentElement {
+                            info: info.clone(),
+                            display,
+                            contents,
+                            box_slot,
+                        },
+                    )));
             },
         }
     }

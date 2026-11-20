@@ -12,13 +12,12 @@
 from __future__ import annotations
 
 import json
-import sys
-from typing import ClassVar, Optional, Any
-import unittest
 import logging
-
+import sys
+import unittest
 from dataclasses import dataclass
 from enum import Enum
+from typing import Any, ClassVar, Optional
 
 
 class Workflow(str, Enum):
@@ -30,6 +29,7 @@ class Workflow(str, Enum):
     ANDROID = "android"
     OHOS = "ohos"
     LINT = "lint"
+    PERF_ANALYSIS = "perf-analysis"
 
 
 @dataclass
@@ -73,17 +73,19 @@ class JobConfig(object):
         if self.workflow is Workflow.LINUX:
             self.name = "Linux"
         elif self.workflow is Workflow.LINUX_ARM:
-            self.name = "Linux Arm64"
+            self.name = "Linux arm64"
         elif self.workflow is Workflow.MACOS:
-            self.name = "MacOS"
+            self.name = "macOS"
         elif self.workflow is Workflow.MACOS_ARM:
-            self.name = "MacOS Arm64"
+            self.name = "macOS arm64"
         elif self.workflow is Workflow.WINDOWS:
             self.name = "Windows"
         elif self.workflow is Workflow.ANDROID:
             self.name = "Android"
         elif self.workflow is Workflow.OHOS:
             self.name = "OpenHarmony"
+        elif self.workflow is Workflow.PERF_ANALYSIS:
+            self.name = "Perf analysis"
         modifier = []
         if self.profile != "checked-release":
             modifier.append(self.profile.title())
@@ -111,13 +113,13 @@ def handle_preset(s: str) -> Optional[JobConfig]:
     s = s.lower()
 
     if any(word in s for word in ["linux-arm", "linux-arm64"]):
-        return JobConfig("Linux Arm64", Workflow.LINUX_ARM)
+        return JobConfig("Linux arm64", Workflow.LINUX_ARM)
     elif any(word in s for word in ["linux"]):
         return JobConfig("Linux", Workflow.LINUX)
     elif any(word in s for word in ["mac-arm", "macos-arm", "mac-arm64", "macos-arm64"]):
-        return JobConfig("MacOS Arm64", Workflow.MACOS_ARM)
+        return JobConfig("macOS arm64", Workflow.MACOS_ARM)
     elif any(word in s for word in ["mac", "macos"]):
-        return JobConfig("MacOS", Workflow.MACOS)
+        return JobConfig("macOS", Workflow.MACOS)
     elif any(word in s for word in ["win", "windows"]):
         return JobConfig("Windows", Workflow.WINDOWS)
     elif any(word in s for word in ["android"]):
@@ -159,6 +161,8 @@ def handle_preset(s: str) -> Optional[JobConfig]:
         )
     elif any(word in s for word in ["lint", "tidy"]):
         return JobConfig("Lint", Workflow.LINT)
+    elif any(word in s for word in ["perf-analysis", "perfanalysis"]):
+        return JobConfig("Perf analysis", Workflow.PERF_ANALYSIS, profile="release")
     else:
         return None
 
@@ -238,7 +242,6 @@ class Config(object):
                 words.extend(
                     [
                         "linux-bencher",
-                        "macos-bencher",
                         "macos-arm-bencher",
                         "windows-bencher",
                         "android-bencher",
@@ -250,7 +253,6 @@ class Config(object):
                 words.extend(
                     [
                         "linux-production-bencher",
-                        "macos-production-bencher",
                         "macos-arm-production-bencher",
                         "windows-production-bencher",
                         "ohos-production-bencher",
@@ -353,7 +355,7 @@ class TestParser(unittest.TestCase):
                         "number_of_wpt_chunks": 20,
                     },
                     {
-                        "name": "MacOS Arm64 (Unit Tests)",
+                        "name": "macOS arm64 (Unit Tests)",
                         "workflow": "macos-arm64",
                         "wpt": False,
                         "profile": "checked-release",
@@ -529,6 +531,13 @@ class TestParser(unittest.TestCase):
         self.assertTrue(matrix_result["devtools_tests"])
         self.assertFalse(matrix_result["unit_tests"])
         self.assertFalse(matrix_result["wpt"])
+
+    def test_perf_analysis(self) -> None:
+        matrix_result = json.loads(Config("perf-analysis").to_json())["matrix"][0]
+
+        self.assertEqual(matrix_result["name"], "Perf analysis (Release)")
+        self.assertEqual(matrix_result["workflow"], "perf-analysis")
+        self.assertEqual(matrix_result["profile"], "release")
 
 
 def run_tests() -> bool:

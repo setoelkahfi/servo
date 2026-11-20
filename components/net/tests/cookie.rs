@@ -21,6 +21,15 @@ fn test_domain_match() {
     assert!(!ServoCookie::domain_match("foo.com", "bar.com"));
 
     assert!(!ServoCookie::domain_match("bar.com", "bbar.com"));
+
+    assert!(ServoCookie::domain_match("FOO.com", "foo.com"));
+    assert!(ServoCookie::domain_match("foo.com", "FOO.COM"));
+    assert!(ServoCookie::domain_match("BAR.foo.com", "foo.com"));
+    assert!(ServoCookie::domain_match("bar.FOO.com", "FOO.COM"));
+    assert!(!ServoCookie::domain_match("bar.foo.com", "BAR.COM"));
+    assert!(!ServoCookie::domain_match("foo.com", "BAR.COM"));
+    assert!(!ServoCookie::domain_match("bar.com", "BBAR.COM"));
+
     assert!(ServoCookie::domain_match("235.132.2.3", "235.132.2.3"));
     assert!(!ServoCookie::domain_match("235.132.2.3", "1.1.1.1"));
     assert!(!ServoCookie::domain_match("235.132.2.3", ".2.3"));
@@ -609,5 +618,56 @@ fn test_delete_cookie_with_name_does_not_affect_other_domains() {
     assert_eq!(
         storage.cookies_for_url(&other_url, source).as_deref(),
         Some("foo=bar")
+    );
+}
+
+#[test]
+fn test_expired_cookie_removes_existing_cookie_without_being_stored() {
+    let mut storage = CookieStorage::new(5);
+    let source = CookieSource::HTTP;
+    let url = ServoUrl::parse("http://example.com/").unwrap();
+
+    add_cookie_to_storage(&mut storage, &url, "foo=bar");
+    add_cookie_to_storage(&mut storage, &url, "baz=qux");
+    add_cookie_to_storage(&mut storage, &url, "foo=bar; max-age=0");
+
+    // The existing cookie is removed right away, without waiting for expired cookies to be evicted.
+    assert_eq!(
+        storage.cookies_for_url(&url, source).as_deref(),
+        Some("baz=qux")
+    );
+}
+
+#[test]
+fn test_expired_cookie_is_not_stored() {
+    let mut storage = CookieStorage::new(5);
+    let source = CookieSource::HTTP;
+    let url = ServoUrl::parse("http://example.com/").unwrap();
+
+    add_cookie_to_storage(&mut storage, &url, "foo=bar; max-age=0");
+    add_cookie_to_storage(
+        &mut storage,
+        &url,
+        "baz=qux; expires=Sun, 18-Apr-2000 21:06:29 GMT",
+    );
+
+    assert_eq!(storage.cookies_for_url(&url, source), None);
+}
+
+#[test]
+fn test_expired_cookie_does_not_evict_cookie_when_storage_is_full() {
+    let mut storage = CookieStorage::new(5);
+    let source = CookieSource::HTTP;
+    let url = ServoUrl::parse("http://example.com/").unwrap();
+
+    for i in 1..6 {
+        add_cookie_to_storage(&mut storage, &url, &format!("extra{i}=bar"));
+    }
+    add_cookie_to_storage(&mut storage, &url, "foo=bar; max-age=0");
+
+    storage.remove_expired_cookies_for_url(&url);
+    assert_eq!(
+        storage.cookies_for_url(&url, source).as_deref(),
+        Some("extra1=bar; extra2=bar; extra3=bar; extra4=bar; extra5=bar")
     );
 }

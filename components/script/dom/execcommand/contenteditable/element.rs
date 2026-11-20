@@ -23,17 +23,22 @@ use crate::dom::html::htmlfontelement::HTMLFontElement;
 use crate::dom::node::node::{Node, NodeTraits};
 
 impl Element {
-    pub(crate) fn resolved_display_value(&self) -> Option<DisplayOutside> {
-        self.style().map(|style| style.get_box().display.outside())
+    pub(crate) fn resolved_display_value(&self, cx: &mut JSContext) -> Option<DisplayOutside> {
+        self.style(cx)
+            .map(|style| style.get_box().display.outside())
     }
 
     /// <https://w3c.github.io/editing/docs/execCommand/#specified-command-value>
-    pub(crate) fn specified_command_value(&self, command: &CommandName) -> Option<DOMString> {
+    pub(crate) fn specified_command_value(
+        &self,
+        cx: &mut JSContext,
+        command: &CommandName,
+    ) -> Option<DOMString> {
         match command {
             // Step 1. If command is "backColor" or "hiliteColor" and the Element's display property does not have resolved value "inline", return null.
             CommandName::BackColor | CommandName::HiliteColor
                 if self
-                    .resolved_display_value()
+                    .resolved_display_value(cx)
                     .is_none_or(|display| display != DisplayOutside::Inline) =>
             {
                 return None;
@@ -56,11 +61,11 @@ impl Element {
             CommandName::Subscript | CommandName::Superscript => {
                 // Step 3.1. If element is a sup, return "superscript".
                 if matches!(*self.local_name(), local_name!("sup")) {
-                    return Some("superscript".into());
+                    return Some(DOMString::from_static("superscript"));
                 }
                 // Step 3.2. If element is a sub, return "subscript".
                 if matches!(*self.local_name(), local_name!("sub")) {
-                    return Some("subscript".into());
+                    return Some(DOMString::from_static("subscript"));
                 }
                 // Step 3.3. Return null.
                 return None;
@@ -72,11 +77,11 @@ impl Element {
                     // Step 4.2. Return null.
                     return value
                         .contains("line-through")
-                        .then_some("line-through".into());
+                        .then_some(DOMString::from_static("line-through"));
                 }
                 // Step 5. If command is "strikethrough" and element is an s or strike element, return "line-through".
                 if matches!(*self.local_name(), local_name!("s") | local_name!("strike")) {
-                    return Some("line-through".into());
+                    return Some(DOMString::from_static("line-through"));
                 }
             },
             CommandName::Underline => {
@@ -84,11 +89,13 @@ impl Element {
                 if let Some(value) = CssPropertyName::TextDecorationLine.value_set_for_style(self) {
                     // Step 6.1. If element's style attribute sets "text-decoration" to a value containing "underline", return "underline".
                     // Step 6.2. Return null.
-                    return value.contains("underline").then_some("underline".into());
+                    return value
+                        .contains("underline")
+                        .then_some(DOMString::from_static("underline"));
                 }
                 // Step 7. If command is "underline" and element is a u element, return "underline".
                 if *self.local_name() == local_name!("u") {
-                    return Some("underline".into());
+                    return Some(DOMString::from_static("underline"));
                 }
             },
             _ => {},
@@ -124,12 +131,12 @@ impl Element {
             CssPropertyName::FontWeight
                 if element_name == &local_name!("b") || element_name == &local_name!("strong") =>
             {
-                Some("bold".into())
+                Some(DOMString::from_static("bold"))
             },
             CssPropertyName::FontStyle
                 if element_name == &local_name!("i") || element_name == &local_name!("em") =>
             {
-                Some("italic".into())
+                Some(DOMString::from_static("italic"))
             },
             // Step 13. Return null.
             _ => None,

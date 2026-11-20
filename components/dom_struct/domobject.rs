@@ -8,7 +8,7 @@ use quote::{TokenStreamExt, quote};
 /// all other fields must not implement DomObject
 pub(crate) fn expand_dom_object(
     input: syn::ItemStruct,
-    associated_memory: bool,
+    no_has_parent: bool,
 ) -> proc_macro2::TokenStream {
     let fields = input.fields.iter().collect::<Vec<&syn::Field>>();
     let (first_field, fields) = fields
@@ -16,11 +16,7 @@ pub(crate) fn expand_dom_object(
         .expect("#[dom_struct] should not be applied on empty structs");
 
     let first_field_name = first_field.ident.as_ref().unwrap();
-    let reflector_type = if associated_memory {
-        quote! { crate::AssociatedMemory }
-    } else {
-        quote! { () }
-    };
+    let first_field_ty = &first_field.ty;
     let mut field_types_and_cfgs = vec![];
     for field in fields {
         if field_types_and_cfgs.contains(&(&field.ty, vec![])) {
@@ -36,6 +32,23 @@ pub(crate) fn expand_dom_object(
 
     let name = &input.ident;
     let (impl_generics, ty_generics, where_clause) = input.generics.split_for_impl();
+
+    let prototype_initializer = if no_has_parent {
+        quote! {}
+    } else {
+        quote! {
+            impl #impl_generics script_bindings::reflector::HasPrototype for #name #ty_generics #where_clause {
+                const PROTOTYPE_ID: script_bindings::codegen::PrototypeList::ID = script_bindings::codegen::PrototypeList::ID::#name;
+            }
+
+            impl #impl_generics script_bindings::reflector::PrototypeInitializer for #name #ty_generics #where_clause {
+                fn set_proto_id(&mut self, id: script_bindings::codegen::PrototypeList::ID) {
+                    self.#first_field_name.set_proto_id(id);
+                }
+            }
+        }
+    };
+
     let items = quote! {
         impl #impl_generics ::js::conversions::ToJSValConvertible for #name #ty_generics #where_clause {
             fn to_jsval(&self, cx: &mut js::context::JSContext, rval: js::rust::MutableHandleValue) {
@@ -44,8 +57,10 @@ pub(crate) fn expand_dom_object(
             }
         }
 
+        #prototype_initializer
+
         impl #impl_generics crate::DomObject for #name #ty_generics #where_clause {
-            type ReflectorType = #reflector_type;
+            type ReflectorType = <#first_field_ty as crate::DomObject>::ReflectorType;
 
             #[inline]
             fn reflector(&self) -> &crate::Reflector<Self::ReflectorType> {

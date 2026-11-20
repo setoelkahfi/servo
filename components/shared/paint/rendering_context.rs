@@ -22,8 +22,7 @@ pub use surfman::Error;
 use surfman::chains::{PreserveBuffer, SwapChain};
 use surfman::{
     Adapter, Connection, Context, ContextAttributeFlags, ContextAttributes, Device, GLApi,
-    GLVersion, NativeContext, NativeWidget, Surface, SurfaceAccess, SurfaceInfo, SurfaceTexture,
-    SurfaceType,
+    GLVersion, NativeWidget, Surface, SurfaceAccess, SurfaceInfo, SurfaceTexture, SurfaceType,
 };
 use webrender_api::units::{DeviceIntRect, DevicePixel};
 
@@ -85,6 +84,10 @@ pub trait RenderingContext {
     fn refresh_driver(&self) -> Option<Rc<dyn RefreshDriver>> {
         None
     }
+    /// The associated adapter to use for WebGL. Default to `None`.
+    fn adapter(&self) -> Option<Adapter> {
+        None
+    }
 }
 
 /// A rendering context that uses the Surfman library to create and manage
@@ -130,11 +133,18 @@ impl SurfmanRenderingContext {
         let context_descriptor =
             device.create_context_descriptor(&ContextAttributes { flags, version })?;
 
-        let context = device
+        let mut context = device
             .create_context(&context_descriptor, None)
             .inspect_err(|_| {
                 print_diagnostics_information_on_context_creation_failure(&device, gl_api, version)
             })?;
+
+        // `glow::Context::from_loader_function` immediately queries `GL_VERSION`, so the
+        // context must be current.
+        if let Err(error) = device.make_context_current(&context) {
+            let _ = device.destroy_context(&mut context);
+            return Err(error);
+        }
 
         #[expect(unsafe_code)]
         let gleam_gl = {
@@ -206,13 +216,6 @@ impl SurfmanRenderingContext {
             .present_bound_surface(&mut self.context.borrow_mut())
     }
 
-    #[expect(dead_code)]
-    fn native_context(&self) -> NativeContext {
-        let device = &self.device.borrow();
-        let context = &self.context.borrow();
-        device.native_context(context)
-    }
-
     fn framebuffer(&self) -> Option<NativeFramebuffer> {
         let device = &self.device.borrow();
         let context = &self.context.borrow();
@@ -278,6 +281,10 @@ impl SurfmanRenderingContext {
 
     fn refresh_driver(&self) -> Option<Rc<dyn RefreshDriver>> {
         self.refresh_driver.clone()
+    }
+
+    fn adapter(&self) -> Option<Adapter> {
+        Some(self.device.borrow().adapter())
     }
 }
 
@@ -393,6 +400,10 @@ impl RenderingContext for SoftwareRenderingContext {
 
     fn connection(&self) -> Option<Connection> {
         self.surfman_rendering_info.connection()
+    }
+
+    fn adapter(&self) -> Option<Adapter> {
+        self.surfman_rendering_info.adapter()
     }
 }
 
@@ -585,6 +596,10 @@ impl RenderingContext for WindowRenderingContext {
     fn refresh_driver(&self) -> Option<Rc<dyn RefreshDriver>> {
         self.surfman_context.refresh_driver()
     }
+
+    fn adapter(&self) -> Option<Adapter> {
+        self.surfman_context.adapter()
+    }
 }
 
 struct Framebuffer {
@@ -712,13 +727,11 @@ impl Framebuffer {
 
         // flip image vertically (texture is upside down)
         let source_rectangle = source_rectangle.to_usize();
-        let orig_pixels = pixels.clone();
         let stride = source_rectangle.width() * 4;
-        for y in 0..source_rectangle.height() {
-            let dst_start = y * stride;
-            let src_start = (source_rectangle.height() - y - 1) * stride;
-            let src_slice = &orig_pixels[src_start..src_start + stride];
-            pixels[dst_start..dst_start + stride].clone_from_slice(&src_slice[..stride]);
+        let height = source_rectangle.height();
+        for y in 0..height / 2 {
+            let (top, bottom) = pixels.split_at_mut((height - y - 1) * stride);
+            top[y * stride..(y + 1) * stride].swap_with_slice(&mut bottom[..stride]);
         }
 
         RgbaImage::from_raw(
@@ -900,6 +913,10 @@ impl RenderingContext for OffscreenRenderingContext {
 
     fn refresh_driver(&self) -> Option<Rc<dyn RefreshDriver>> {
         self.parent_context().refresh_driver()
+    }
+
+    fn adapter(&self) -> Option<Adapter> {
+        self.parent_context.adapter()
     }
 }
 

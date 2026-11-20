@@ -10,7 +10,9 @@
 //! thread pool implementation, which only performs GC or code loading on
 //! a backup thread, not on the primary worklet thread.
 
-use std::cell::{self, Cell, RefCell, RefMut};
+#![cfg_attr(crown, allow(crown::jscontext_first_arg))]
+
+use std::cell::{self, Cell, RefMut};
 use std::cmp::max;
 use std::collections::hash_map;
 use std::rc::Rc;
@@ -28,6 +30,7 @@ use malloc_size_of::malloc_size_of_is_0;
 use net_traits::policy_container::PolicyContainer;
 use net_traits::request::{Destination, Origin, PreloadedResources, RequestClient};
 use rustc_hash::FxHashMap;
+use script_bindings::cell::DomRefCell;
 use script_bindings::reflector::{Reflector, reflect_dom_object};
 use servo_base::id::PipelineId;
 use servo_url::{ImmutableOrigin, ServoUrl};
@@ -36,6 +39,7 @@ use swapper::{Swapper, swapper};
 use uuid::Uuid;
 
 use crate::conversions::Convert;
+use crate::dom::RootedPromise;
 use crate::dom::bindings::codegen::Bindings::RequestBinding::RequestCredentials;
 use crate::dom::bindings::codegen::Bindings::WindowBinding::Window_Binding::WindowMethods;
 use crate::dom::bindings::codegen::Bindings::WorkletBinding::{WorkletMethods, WorkletOptions};
@@ -52,10 +56,9 @@ use crate::dom::workletglobalscope::{
     WorkletGlobalScope, WorkletGlobalScopeInit, WorkletGlobalScopeType,
 };
 use crate::messaging::{CommonScriptMsg, MainThreadScriptMsg, ScriptEventLoopSender};
-use crate::modules::script_module::fetch_a_module_script_graph;
 use crate::realms::enter_auto_realm;
-use crate::runtime::microtask::MicrotaskQueue;
 use crate::runtime::script_runtime::{IntroductionType, Runtime, ScriptThreadEventCategory};
+use crate::scripting::script_module::fetch_a_module_script_graph;
 use crate::tasks::task_source::TaskSourceName;
 use crate::url::ensure_blob_referenced_by_url_is_kept_alive;
 
@@ -158,7 +161,7 @@ impl WorkletMethods<crate::DomTypeHolder> for Worklet {
         realm: &mut CurrentRealm,
         module_url: USVString,
         options: &WorkletOptions,
-    ) -> Rc<Promise> {
+    ) -> RootedPromise {
         let promise = Promise::new_in_realm(realm);
 
         // Step 1. Let outsideSettings be the relevant settings object of this.
@@ -260,10 +263,10 @@ pub trait WorkletThreadPool: JSTraceable {
         origin: ImmutableOrigin,
         base_url: ServoUrl,
         script_url: ServoUrl,
-        policy_container: PolicyContainer,
+        policy_container: Arc<PolicyContainer>,
         credentials: RequestCredentials,
         pending_tasks_struct: PendingTasksStruct,
-        promise: &Rc<Promise>,
+        promise: &RootedPromise,
         inherited_secure_context: Option<bool>,
     );
     /// Request that the [`WorkletGlobalScope`] associated with the [`WorkletId`]
@@ -393,10 +396,10 @@ impl WorkletThreadPool for StatelessWorkletThreadPool {
         origin: ImmutableOrigin,
         base_url: ServoUrl,
         script_url: ServoUrl,
-        policy_container: PolicyContainer,
+        policy_container: Arc<PolicyContainer>,
         credentials: RequestCredentials,
         pending_tasks_struct: PendingTasksStruct,
-        promise: &Rc<Promise>,
+        promise: &RootedPromise,
         inherited_secure_context: Option<bool>,
     ) {
         // Send each thread a control message asking it to load the script.
@@ -415,7 +418,7 @@ impl WorkletThreadPool for StatelessWorkletThreadPool {
                 policy_container: policy_container.clone(),
                 credentials,
                 pending_tasks_struct: pending_tasks_struct.clone(),
-                promise: TrustedPromise::new(promise.clone()),
+                promise: TrustedPromise::from(promise),
                 inherited_secure_context,
             });
         }
@@ -469,13 +472,13 @@ pub(crate) enum WorkletControl {
         origin: ImmutableOrigin,
         base_url: ServoUrl,
         script_url: ServoUrl,
-        policy_container: PolicyContainer,
+        policy_container: Arc<PolicyContainer>,
         credentials: RequestCredentials,
         pending_tasks_struct: PendingTasksStruct,
         promise: TrustedPromise,
         inherited_secure_context: Option<bool>,
     },
-    Common(CommonScriptMsg),
+    Common(WorkletId, CommonScriptMsg),
 }
 
 /// A role that a worklet thread can be playing.
@@ -703,7 +706,6 @@ impl WorkletThread {
 
     /// Get the worklet global scope for a given worklet.
     /// Creates the worklet global scope if it doesn't exist.
-    #[expect(clippy::too_many_arguments)]
     fn get_worklet_global_scope(
         &mut self,
         cx: &mut JSContext,
@@ -712,7 +714,6 @@ impl WorkletThread {
         inherited_secure_context: Option<bool>,
         global_type: WorkletGlobalScopeType,
         base_url: ServoUrl,
-        microtask_queue: Rc<MicrotaskQueue>,
     ) -> DomRoot<WorkletGlobalScope> {
         match self.global_scopes.entry(worklet_id) {
             hash_map::Entry::Occupied(entry) => DomRoot::from_ref(entry.get()),
@@ -739,7 +740,6 @@ impl WorkletThread {
                     &self.global_init,
                     cx,
                     self.closing.clone(),
-                    microtask_queue,
                 );
                 entry.insert(Dom::from_ref(&*result));
                 result
@@ -756,7 +756,7 @@ impl WorkletThread {
         pipeline_id: PipelineId,
         origin: ImmutableOrigin,
         script_url: ServoUrl,
-        policy_container: PolicyContainer,
+        policy_container: Arc<PolicyContainer>,
         credentials: RequestCredentials,
         pending_tasks_struct: PendingTasksStruct,
         promise: TrustedPromise,
@@ -776,7 +776,9 @@ impl WorkletThread {
             origin: Origin::Origin(origin),
             is_nested_browsing_context: global.is_nested_browsing_context(),
             insecure_requests_policy: global.insecure_requests_policy(),
+            upgrade_insecure_navigations_set: global.upgrade_insecure_navigations_set().clone(),
             has_trustworthy_ancestor_origin: global.has_trustworthy_ancestor_origin(),
+            network_partition_key: None,
         };
 
         // Step 2. If moduleResponsesMap[requestURL] is "fetching", wait in parallel until that entry's value changes, then queue a task on the networking task source to proceed with running the following steps.
@@ -785,7 +787,7 @@ impl WorkletThread {
 
         // `fetch_a_module_script_graph` requires the `on_complete` closure to be cloneable
         // therefore, we wrap the TrustedPromise in an Rc to make it cloneable and RefCell allows calling `reject_task` and `resolve_task`
-        let promise_task = Rc::new(RefCell::new(Some(promise)));
+        let promise_task = Rc::new(DomRefCell::new(Some(promise)));
         let script_thread_sender = self.global_init.to_script_thread_sender.clone();
         let rooted_global = DomRoot::from_ref(global);
         let script_url = ensure_blob_referenced_by_url_is_kept_alive(global, script_url);
@@ -813,7 +815,7 @@ impl WorkletThread {
 
                         reject_promise(
                             &pending_tasks_struct,
-                            promise_task.borrow_mut(),
+                            promise_task.safe_borrow_mut(cx.no_gc()),
                             script_thread_sender.clone(),
                         );
                     },
@@ -823,13 +825,13 @@ impl WorkletThread {
 
                         // Step 6.4.2. If script's error to rethrow is not null:
                         // NOTE: The `AddModule` specification in the Step 6.4.2.1.1.2. requires the promise to be rejected with the script's "rethrow error".
-                        // However, the `JSVal` from `get_rethrow_error` cannot be used with the `promise_task` here because they are from different runtimes.
+                        // However, the `JSVal` from `rethrow_error` cannot be used with the `promise_task` here because they are from different runtimes.
                         // So we throw an AbortError instead.
-                        if script.get_rethrow_error().take().is_some() {
+                        if script.has_rethrow_error() {
                             // Step 6.4.2.1. and its substeps are handled by `reject_promise` function
                             reject_promise(
                                 &pending_tasks_struct,
-                                promise_task.borrow_mut(),
+                                promise_task.safe_borrow_mut(cx.no_gc()),
                                 script_thread_sender.clone(),
                             );
 
@@ -838,7 +840,8 @@ impl WorkletThread {
                         }
 
                         // Step 6.4.4. Run a module script given script.
-                        rooted_global.run_a_module_script(cx, script, false);
+                        let module = RootedTraceableBox::new(script);
+                        rooted_global.run_a_module_script(cx, module, false);
 
                         // NOTE: we are treating all negative values as -1
                         // Step 6.4.5.1. If pendingTasks is not −1:
@@ -854,7 +857,7 @@ impl WorkletThread {
                                 .expect("Worklet thread outlived script thread.");
 
                             let task = promise_task
-                                .borrow_mut()
+                                .safe_borrow_mut(cx.no_gc())
                                 .take()
                                 .expect("promise_task must be consumed exactly once")
                                 .resolve_task(());
@@ -895,7 +898,13 @@ impl WorkletThread {
     fn process_control(&mut self, control: WorkletControl, cx: &mut js::context::JSContext) {
         match control {
             WorkletControl::ExitWorklet(worklet_id) => {
-                self.global_scopes.remove(&worklet_id);
+                if let Some(global_scope) = self
+                    .global_scopes
+                    .remove(&worklet_id)
+                    .map(|global_scope| global_scope.as_rooted())
+                {
+                    global_scope.upcast::<GlobalScope>().tear_down();
+                }
             },
             WorkletControl::FetchAndInvokeAWorkletScript {
                 pipeline_id,
@@ -920,7 +929,6 @@ impl WorkletThread {
                     inherited_secure_context,
                     global_type,
                     base_url,
-                    self.runtime.microtask_queue.clone(),
                 );
                 self.fetch_and_invoke_a_worklet_script(
                     &global,
@@ -934,8 +942,12 @@ impl WorkletThread {
                     cx,
                 )
             },
-            WorkletControl::Common(script_msg) => {
-                if let CommonScriptMsg::Task(_, task, _, _) = script_msg {
+            WorkletControl::Common(worklet_id, script_msg) => {
+                if let CommonScriptMsg::Task(_, task, _, _) = script_msg &&
+                    let Some(global) = self.global_scopes.get(&worklet_id)
+                {
+                    let mut realm = enter_auto_realm(cx, global.upcast::<GlobalScope>());
+                    let cx = &mut realm;
                     task.run_box(cx);
                 }
             },
@@ -1011,12 +1023,13 @@ impl WorkletExecutor {
             .send(WorkletData::Task(self.worklet_id, task));
     }
 
-    pub(crate) fn send_control_message(
+    /// Send a [`CommonScriptMsg`] to be send to the worklet thread pool.
+    pub(crate) fn send_common_message(
         &self,
-        control_message: WorkletControl,
+        common_message: CommonScriptMsg,
     ) -> Result<(), SendError<()>> {
         self.control_sender
-            .send(control_message)
+            .send(WorkletControl::Common(self.worklet_id, common_message))
             .map_err(|_| SendError(()))?;
         self.wake_threads()
     }

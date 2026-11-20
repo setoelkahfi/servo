@@ -21,16 +21,8 @@ name = "servoshell"
 path = "main.rs"
 bench = false
 
-[lints.rust]
-# These are not official flags but still used for testing and pgo.
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(coverage)', 'cfg(llvm_pgo)'] }
-
-# Some of these dependencies are only needed for a specific target OS, but
-# since build-scripts can't detect the Cargo target OS at build-time, we
-# must unconditionally add these dependencies. See https://github.com/rust-lang/cargo/issues/4932
-[build-dependencies]
-# macOS only
-cc = { workspace = true }
+[lints]
+workspace = true
 
 [target.'cfg(windows)'.build-dependencies]
 winresource = { workspace = true }
@@ -42,14 +34,25 @@ OriginalFilename = "servoshell.exe"
 ProductName = "ServoShell"
 
 [features]
-# Don't add new features to `default` directly. Add to `default_without_allocator` instead.
-default = ["default_without_allocator", "servo-allocator/use-jemalloc"]
+# Don't add new features to `default` directly. Add to `default_base` instead.
+default = ["default_base", "media-gstreamer"]
 # Feature groups:
-# default features, without a custom allocator.
-default_without_allocator = ["bundled", "default_web_features", "max_log_level", "js_jit"]
+# Base default features, without GStreamer media support.
+default_base = [
+    "bundled",
+    "default_web_features",
+    "default_tooling",
+    "jemalloc",
+    "max_log_level",
+    "multiprocess",
+    "js_jit",
+]
+# Enable jemalloc on platforms that support it (not OHOS and not Windows).
+jemalloc = ["servo-allocator/use-jemalloc"]
 # Default web features should be kept in sync with the list in servo/Cargo.toml.
 # We also need to enable our own features, since we also have `cfg` gated code here.
-default_web_features = ["servo/default_web_features", "gamepad", "webgpu", "webxr"]
+default_web_features = ["servo/default_web_features", "gamepad", "webgpu", "webgl", "webxr"]
+default_tooling = ["servo/default_tooling", "devtools"]
 # Bundle required resources in the binary.
 bundled = ["servo/bundled"]
 
@@ -58,14 +61,17 @@ baked-in-resources = ["servo/baked-in-resources"]
 bundled_freetype = ["servo/bundled_freetype"]
 crown = ["servo/crown"]
 debugmozjs = ["servo/debugmozjs"]
+devtools = ["servo/devtools"]
 gamepad = ["servo/gamepad"]
 jitspew = ["servo/jitspew"]
 js_backtrace = ["servo/js_backtrace"]
 js_jit = ["servo/js_jit"]
 max_log_level = ["log/release_max_level_info"]
 media-gstreamer = ["servo/media-gstreamer"]
+multiprocess = ["servo/multiprocess"]
 native-bluetooth = ["servo/native-bluetooth"]
 profilemozjs = ["servo/profilemozjs"]
+subtlecrypto = ["servo/subtlecrypto"]
 tracing = ["dep:tracing", "dep:tracing-subscriber", "servo/tracing"]
 tracing-hitrace = ["tracing", "dep:hitrace"]
 tracing-perfetto = ["tracing", "dep:tracing-perfetto"]
@@ -82,6 +88,7 @@ cfg-if = { workspace = true }
 crossbeam-channel = { workspace = true }
 dpi = { workspace = true }
 euclid = { workspace = true }
+flate2 = { workspace = true }
 hitrace = { workspace = true, optional = true }
 image = { workspace = true }
 keyboard-types = { workspace = true }
@@ -101,6 +108,10 @@ webdriver_server = { workspace = true }
 [target.'cfg(target_os = "android")'.dependencies]
 android_logger = { workspace = true }
 jni = { workspace = true }
+# https://github.com/servo/servo/issues/32175
+# By default Android enforce the tagged pointers feature, which does not work well with mozjs.
+# Like Gecko, replace the system allocator with jemalloc.
+servo-allocator = { workspace = true, features = ["use-jemalloc"] }
 
 [target.'cfg(not(target_os = "android"))'.dependencies]
 backtrace = { workspace = true }
@@ -121,6 +132,7 @@ ohos-vsync = { workspace = true }
 ohos-window-sys = { workspace = true }
 ohos-sys-opaque-types = { workspace = true }
 ohos-window-manager-sys = { workspace = true, features = ["api-14"] }
+memmap2 = { workspace = true }
 xcomponent-sys = { workspace = true, features = ["api-20", "keyboard-types"] }
 
 [target.'cfg(any(target_os = "android", target_env = "ohos"))'.dependencies]
@@ -132,17 +144,18 @@ surfman = { workspace = true, features = ["sm-angle-default"] }
 [target.'cfg(not(any(target_os = "android", target_os = "ios", target_env = "ohos")))'.dependencies]
 dirs = { workspace = true }
 egui = { workspace = true }
-egui-file-dialog = { workspace = true }
 egui-winit = { workspace = true, features = ["accesskit", "clipboard", "wayland"] }
 egui_glow = { workspace = true, features = ["winit"] }
 gilrs = { workspace = true }
 glow = { workspace = true }
 headers = { workspace = true }
 serde = { workspace = true }
+itertools = { workspace = true }
+rfd = { workspace = true }
 serde_json = { workspace = true }
 # For optional feature servo-allocator/use-jemalloc and servo-allocator/allocation-tracking
 servo-allocator = { workspace = true }
-surfman = { workspace = true, features = ["sm-raw-window-handle-06", "sm-x11"] }
+surfman = { workspace = true, features = ["sm-x11"] }
 winit = { workspace = true }
 
 [target.'cfg(target_os = "ios")'.dependencies]
@@ -150,7 +163,7 @@ ipc-channel = { workspace = true, features = ["force-inprocess"] }
 nix = { workspace = true, features = ["fs"] }
 serde_json = { workspace = true }
 servo-base = { workspace = true }
-surfman = { workspace = true, features = ["sm-raw-window-handle-06"] }
+surfman = { workspace = true }
 
 [target.'cfg(any(all(target_os = "linux", not(target_env = "ohos")), target_os = "macos"))'.dependencies]
 signal-hook-registry = { workspace = true }
@@ -163,6 +176,7 @@ windows-sys = { workspace = true, features = ["Win32_Graphics_Gdi", "Win32_Syste
 onde = { workspace = true }
 # Defining the target that answers the Settings menu item.
 objc2 = { workspace = true }
+mach2 = { workspace = true }
 objc2-app-kit = { workspace = true, features = [
     "std",
     # Extending the application menu winit builds.

@@ -69,6 +69,10 @@ on:
         required: false
         default: false
         type: boolean
+      perf-analysis:
+        required: false
+        default: false
+        type: boolean
 
 env:
   RUST_BACKTRACE: 1
@@ -85,7 +89,7 @@ jobs:
     steps:
       - name: Runner select
         id: select
-        uses: servo/ci-runners/actions/runner-select@a05e7e830e3f4d4c71bdc5a38f003f052b72668c
+        uses: servo/ci-runners/actions/runner-select@b42c96524cdd72126255602c69c4ad649c750ebf
         with:
           GITHUB_TOKEN: ${{ github.token }}
           github-hosted-runner-label: ${{ inputs.github-runner-label }}
@@ -105,7 +109,7 @@ jobs:
     outputs:
       artifact_ids: ${{ steps.artifact_ids.outputs.artifact_ids }}
     steps:
-      - uses: servo/ci-runners/actions/checkout@a05e7e830e3f4d4c71bdc5a38f003f052b72668c
+      - uses: servo/ci-runners/actions/checkout@b42c96524cdd72126255602c69c4ad649c750ebf
       - name: Free Disk Space (Ubuntu)
         uses: jlumbroso/free-disk-space@main
         if: ${{ runner.environment != 'self-hosted' }}
@@ -219,6 +223,26 @@ jobs:
           name: ${{ inputs.uploaded-artifact-name }}
           path: target/${{ inputs.profile }}/servo-tech-demo.tar.gz
           if-no-files-found: error
+      # Rebuild with `tracing-perfetto` for perf-analysis. This reuses the cargo
+      # cache from the build above, so only the crates affected by the feature are
+      # recompiled. It is kept separate from the packaged artifact so that the
+      # speedometer/dromaeo benchmarks do not run with tracing compiled in.
+      - name: Build with Perfetto tracing (${{ inputs.profile }})
+        if: ${{ inputs.perf-analysis }}
+        env:
+          RUSTFLAGS: ${{ inputs.profile == 'checked-release' && '-D warnings' || '' }}
+        run: |
+          ./mach build --use-crown --locked --profile ${{ inputs.profile }} ${{ inputs.build-args }} --features tracing-perfetto
+      - name: Package with Perfetto tracing
+        if: ${{ inputs.perf-analysis }}
+        run: ./mach package --profile ${{ inputs.profile }}
+      - name: Upload Perfetto package for perf-analysis
+        if: ${{ inputs.perf-analysis }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ inputs.profile }}-binary-linux-tracing
+          path: target/${{ inputs.profile }}/servo-tech-demo.tar.gz
+          if-no-files-found: error
       - name: Collect artifact IDs needed by the release workflow
         id: artifact_ids
         shell: bash
@@ -227,10 +251,10 @@ jobs:
 
   build-libservo:
     if: ${{ inputs.build-libservo }}
-    name: Build libservo and MSRV check (${{ inputs.arch }})
+    name: Build libservo / Check MSRV
     runs-on: ${{ inputs.github-runner-label }}
     steps:
-      - uses: servo/ci-runners/actions/checkout@a05e7e830e3f4d4c71bdc5a38f003f052b72668c
+      - uses: servo/ci-runners/actions/checkout@b42c96524cdd72126255602c69c4ad649c750ebf
       - name: Free Disk Space (Ubuntu)
         uses: jlumbroso/free-disk-space@main
         if: ${{ runner.environment != 'self-hosted' }}
@@ -269,10 +293,10 @@ jobs:
 
   capi:
     if: ${{ inputs.capi }}
-    name: Build and test Servo's C API (${{ inputs.arch }})
+    name: Build and Test C API
     runs-on: ${{ inputs.github-runner-label }}
     steps:
-      - uses: servo/ci-runners/actions/checkout@a05e7e830e3f4d4c71bdc5a38f003f052b72668c
+      - uses: servo/ci-runners/actions/checkout@b42c96524cdd72126255602c69c4ad649c750ebf
       - name: Free Disk Space (Ubuntu)
         uses: jlumbroso/free-disk-space@main
         with:

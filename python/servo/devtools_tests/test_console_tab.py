@@ -75,6 +75,67 @@ class TestConsoleTab:
             "writable": True,
         }
 
+    def test_console_log_object_prototype_does_not_repeat(self, run_servoshell):
+        run_servoshell(url="data:text/html,")
+
+        with Devtools.connect() as devtools:
+            devtools.watcher.watch_resources([Resources.CONSOLE_MESSAGE])
+            console = WebConsoleActor(devtools.client, devtools.targets[0]["consoleActor"])
+            evaluation_result = Future()
+
+            async def on_resource_available(data):
+                for resource in data["array"]:
+                    if resource[0] == "console-message":
+                        evaluation_result.set_result(resource[1][0])
+                        return
+
+            devtools.client.add_event_listener(
+                devtools.targets[0]["actor"], Events.Watcher.RESOURCES_AVAILABLE_ARRAY, on_resource_available
+            )
+            console.evaluate_js_async(
+                """
+                const personPrototype = {
+                    greet() {
+                        console.log("hello!");
+                    },
+                };
+                const carl = Object.create(personPrototype);
+                console.log(carl);
+                """
+            )
+
+            result = evaluation_result.result(1)
+            object_grip = result["arguments"][0]
+            prototype = devtools.client.send_receive({"to": object_grip["actor"], "type": "prototype"})["prototype"]
+
+            assert prototype["actor"] != object_grip["actor"]
+            assert prototype["class"] == "Object"
+            assert prototype["preview"]["ownPropertiesLength"] == 1
+            assert prototype["preview"]["ownProperties"]["greet"]["value"]["class"] == "Function"
+
+            object_prototype = devtools.client.send_receive({"to": prototype["actor"], "type": "prototype"})[
+                "prototype"
+            ]
+            assert devtools.client.send_receive({"to": object_prototype["actor"], "type": "prototype"})[
+                "prototype"
+            ] == {"type": "null"}
+
+    def test_console_log_object_prototype_failure(self, run_servoshell):
+        run_servoshell(url="data:text/html,")
+
+        result = evaluate_and_capture_console_log_output(
+            """
+            const broken = new Proxy({}, {
+                getPrototypeOf() {
+                    throw new Error("prototype lookup failed");
+                },
+            });
+            console.log(broken);
+            """
+        )
+
+        assert result["arguments"] == ["<error>"]
+
     def test_console_log_booleans(self, run_servoshell):
         script_tag = "<script>let log_booleans = () => console.log(true, false, !false, !true);</script>"
         run_servoshell(url=f"data:text/html,{script_tag}")
@@ -132,7 +193,25 @@ class TestConsoleTab:
         preview = function["preview"]
         assert preview["kind"] == "Object"
 
-    @pytest.mark.xfail
+    @pytest.mark.parametrize("method", ["log", "dir"])
+    @pytest.mark.parametrize(
+        "js, expected_class",
+        [
+            ("document", "Document"),
+            ("navigator", "Navigator"),
+            ("new URLSearchParams('a=1').entries()", "URLSearchParamsIterator"),
+            ("({ a: 1 })", "Object"),
+        ],
+    )
+    def test_console_object_class_name(self, run_servoshell, method, js, expected_class):
+        run_servoshell(url="data:text/html,")
+
+        result = evaluate_and_capture_console_log_output(f"console.{method}({js});")
+
+        logged_object = result["arguments"][0]
+        assert logged_object["class"] == expected_class
+        assert logged_object["preview"]["kind"] == "Object"
+
     def test_console_log_function_arguments(self, run_servoshell):
         script_tag = (
             "<script>function test_arguments(a, b) { return a + b; }"
@@ -144,16 +223,35 @@ class TestConsoleTab:
         result = evaluate_and_capture_console_log_output("log_arguments();")
         assert result["arguments"][0]["parameterNames"] == ["a", "b"]
 
+    def test_console_log_function_default_and_rest_arguments(self, run_servoshell):
+        script_tag = (
+            "<script>function test_arguments(a, b = 1, ...rest) { return a; }"
+            "let log_arguments = () => console.log(test_arguments);"
+            "</script>"
+        )
+        run_servoshell(url=f"data:text/html,{script_tag}")
+
+        result = evaluate_and_capture_console_log_output("log_arguments();")
+        assert result["arguments"][0]["parameterNames"] == ["a", "b", "rest"]
+
     def test_console_log_sprintf_substitutions(self, run_servoshell):
         script_tag = (
             "<script>let log_sprintf = () => "
-            "console.log('String %s Int %d Int %i Float %f', 'string', 32, 46, Math.PI);"
+            "console.log('String %s Int %d Int %i Float %f ANonConsumedArgument %f', 'string', 32, 46, Math.PI);"
             "</script>"
         )
         run_servoshell(url=f"data:text/html,{script_tag}")
 
         result = evaluate_and_capture_console_log_output("log_sprintf();")
-        assert result["arguments"] == ["String string Int 32 Int 46 Float 3.141592653589793"]
+        assert result["arguments"] == ["String string Int 32 Int 46 Float 3.141592653589793 ANonConsumedArgument %f"]
+
+    def test_console_unhandled_promise_rejection(self, run_servoshell):
+        run_servoshell(url="data:text/html,")
+
+        result = evaluate_and_capture_console_log_output("Promise.reject(5);")
+
+        assert result["level"] == "error"
+        assert result["arguments"] == ["Unhandled promise rejection: 5"]
 
     def test_console_actor_can_handle_self_referential_objects(self, run_servoshell, web_server_urls):
         run_servoshell(url="data:text/html,")
@@ -238,6 +336,33 @@ class TestConsoleTab:
             assert result3["result"]["type"] == "undefined"
             assert not result3["exception"]
 
+    def test_console_throw_primitives(self, run_servoshell):
+        run_servoshell(url="data:text/html,")
+        testCases = [
+            {"input": "throw 0;", "exceptionMessage": "Uncaught 0"},
+            {"input": 'throw "";', "exceptionMessage": "Uncaught "},
+            {"input": "throw {};", "exceptionMessage": "Uncaught [object Object]"},
+            {"input": "throw true;", "exceptionMessage": "Uncaught true"},
+            {"input": "const fn=()=>{};throw fn;", "exceptionMessage": "Uncaught [object Object]"},
+            {"input": "throw NaN;", "exceptionMessage": "Uncaught NaN"},
+            {"input": "throw Infinity;", "exceptionMessage": "Uncaught Infinity"},
+        ]
+        queue = Queue()
+
+        with Devtools.connect() as devtools:
+            console = WebConsoleActor(devtools.client, devtools.targets[0]["consoleActor"])
+
+            def on_evaluation(data):
+                queue.put_nowait(data)
+
+            devtools.client.add_event_listener(console.actor_id, Events.WebConsole.EVALUATION_RESULT, on_evaluation)
+            for testCase in testCases:
+                console.evaluate_js_async(testCase["input"])
+                data = queue.get(timeout=1)
+                assert not data["result"]
+                assert data["hasException"]
+                assert testCase["exceptionMessage"] in data["exceptionMessage"]
+
     def test_global_autocomplete(self, run_servoshell):
         script_tag = "<script>console_test_value = 5;</script>"
         run_servoshell(url=f"data:text/html,{script_tag}")
@@ -314,3 +439,176 @@ class TestConsoleTab:
 
             assert "case_" in result_ll["matches"]
             assert "CASE_" in result_ll["matches"]
+
+    # Firefox expects (see `prepareConsoleMessageForRemote` in devtools/server/actors/resources/console-messages.js):
+    # - level == "table"
+    # - at most 2 arguments (data, columns)
+    # - arguments[0]["preview"] is None and arguments[0]["ownProperties"] holds the rows,
+    #   with one level of sub-properties loaded on each row's value grip.
+
+    def test_console_table_array_of_objects(self, run_servoshell):
+        run_servoshell(url="data:text/html,")
+
+        result = evaluate_and_capture_console_log_output(
+            "console.table([{ name: 'Anna', age: 31 }, { name: 'Marco', age: 27 }]);"
+        )
+
+        assert result["level"] == "table"
+        assert len(result["arguments"]) == 1
+
+        data = result["arguments"][0]
+        assert data["class"] == "Array"
+        assert data.get("preview") is None
+
+        rows = data["ownProperties"]
+        assert list(rows.keys()) == ["0", "1"]
+
+        first_row = rows["0"]
+        assert first_row["configurable"] is True
+        assert first_row["enumerable"] is True
+        assert first_row["writable"] is True
+        assert first_row["value"]["class"] == "Object"
+
+        cells = first_row["value"]["ownProperties"]
+        assert cells["name"]["value"] == "Anna"
+        assert cells["age"]["value"] == 31
+
+        cells = rows["1"]["value"]["ownProperties"]
+        assert cells["name"]["value"] == "Marco"
+        assert cells["age"]["value"] == 27
+
+    def test_console_table_array_ignores_non_indexed_properties(self, run_servoshell):
+        run_servoshell(url="data:text/html,")
+
+        result = evaluate_and_capture_console_log_output("const a = [{ x: 1 }]; a.extra = 'no'; console.table(a);")
+
+        rows = result["arguments"][0]["ownProperties"]
+        # Firefox uses ignoreNonIndexedProperties for arrays: no `length`, no `extra`.
+        assert list(rows.keys()) == ["0"]
+
+    def test_console_table_array_of_primitives(self, run_servoshell):
+        run_servoshell(url="data:text/html,")
+
+        result = evaluate_and_capture_console_log_output("console.table(['apple', 2, true]);")
+
+        assert result["level"] == "table"
+        rows = result["arguments"][0]["ownProperties"]
+        assert rows["0"]["value"] == "apple"
+        assert rows["1"]["value"] == 2
+        assert rows["2"]["value"] is True
+        # Primitive rows have no sub-properties.
+        assert not isinstance(rows["0"]["value"], dict)
+
+    def test_console_table_nested_arrays(self, run_servoshell):
+        run_servoshell(url="data:text/html,")
+
+        result = evaluate_and_capture_console_log_output("console.table([[1, 2], [3, 4]]);")
+
+        rows = result["arguments"][0]["ownProperties"]
+        first_row = rows["0"]["value"]
+        assert first_row["class"] == "Array"
+        assert first_row["ownProperties"]["0"]["value"] == 1
+        assert first_row["ownProperties"]["1"]["value"] == 2
+        assert "length" not in first_row["ownProperties"]
+
+        second_row = rows["1"]["value"]
+        assert second_row["ownProperties"]["0"]["value"] == 3
+        assert second_row["ownProperties"]["1"]["value"] == 4
+
+    def test_console_table_object_of_objects(self, run_servoshell):
+        run_servoshell(url="data:text/html,")
+
+        result = evaluate_and_capture_console_log_output(
+            "console.table({ first: { a: 1 }, second: { a: 2, b: 'x' } });"
+        )
+
+        assert result["level"] == "table"
+        data = result["arguments"][0]
+        assert data["class"] == "Object"
+        assert data.get("preview") is None
+
+        rows = data["ownProperties"]
+        assert set(rows.keys()) == {"first", "second"}
+        assert rows["first"]["value"]["ownProperties"]["a"]["value"] == 1
+        assert rows["second"]["value"]["ownProperties"]["a"]["value"] == 2
+        assert rows["second"]["value"]["ownProperties"]["b"]["value"] == "x"
+
+    def test_console_table_sub_properties_are_one_level_deep(self, run_servoshell):
+        run_servoshell(url="data:text/html,")
+
+        result = evaluate_and_capture_console_log_output("console.table([{ inner: { deep: 1 } }]);")
+
+        row = result["arguments"][0]["ownProperties"]["0"]["value"]
+        inner = row["ownProperties"]["inner"]["value"]
+        assert inner["class"] == "Object"
+        # Firefox only loads one level of sub-properties.
+        assert "ownProperties" not in inner
+
+    def test_console_table_map(self, run_servoshell):
+        run_servoshell(url="data:text/html,")
+
+        result = evaluate_and_capture_console_log_output("console.table(new Map([['a', 1], ['b', true]]));")
+
+        assert result["level"] == "table"
+        data = result["arguments"][0]
+        assert data["class"] == "Map"
+        assert data.get("preview") is None
+
+        rows = data["ownProperties"]
+        assert rows["0"] == {
+            "configurable": False,
+            "enumerable": True,
+            "writable": False,
+            "value": {"type": "mapEntry", "preview": {"key": "a", "value": 1}},
+        }
+        assert rows["1"]["value"] == {"type": "mapEntry", "preview": {"key": "b", "value": True}}
+
+    def test_console_table_with_columns(self, run_servoshell):
+        run_servoshell(url="data:text/html,")
+
+        result = evaluate_and_capture_console_log_output("console.table([{ a: 1, b: 2 }], ['a']);")
+
+        assert result["level"] == "table"
+        assert len(result["arguments"]) == 2
+
+        columns = result["arguments"][1]
+        assert columns["class"] == "Array"
+        assert columns["preview"]["items"] == ["a"]
+
+        # Like Firefox, the server doesn't filter; the frontend uses arguments[1] to pick columns.
+        cells = result["arguments"][0]["ownProperties"]["0"]["value"]["ownProperties"]
+        assert cells["a"]["value"] == 1
+        assert cells["b"]["value"] == 2
+
+    def test_console_table_only_sends_two_arguments(self, run_servoshell):
+        run_servoshell(url="data:text/html,")
+
+        result = evaluate_and_capture_console_log_output("console.table([{ a: 1 }], ['a'], 'extra', 42);")
+
+        assert result["level"] == "table"
+        assert len(result["arguments"]) == 2
+
+    def test_console_table_empty_array(self, run_servoshell):
+        run_servoshell(url="data:text/html,")
+
+        result = evaluate_and_capture_console_log_output("console.table([]);")
+
+        assert result["level"] == "table"
+        assert result["arguments"][0]["ownProperties"] == {}
+
+    @pytest.mark.parametrize(
+        "js, expected",
+        [
+            ("console.table(5);", [5]),
+            ("console.table('hello');", ["hello"]),
+            ("console.table(true);", [True]),
+        ],
+    )
+    def test_console_table_non_tabular_data_falls_back_to_log(self, run_servoshell, js, expected):
+        run_servoshell(url="data:text/html,")
+
+        result = evaluate_and_capture_console_log_output(js)
+
+        # Spec: "Fall back to just logging the argument if it can't be parsed as tabular."
+        assert result["level"] == "log"
+        assert result["arguments"] == expected

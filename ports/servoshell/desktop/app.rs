@@ -30,11 +30,13 @@ use crate::prefs::ServoShellPreferences;
 use crate::running_app_state::RunningAppState;
 #[cfg(feature = "gamepad")]
 use crate::running_app_state::ServoshellGamepadDelegate;
-use crate::window::{PlatformWindow, ServoShellWindowId};
+use crate::window::{PlatformWindow, ServoShellWindowId, TopLevelWebViewCreationRequest};
 
 pub(crate) enum AppState {
     Initializing,
     Running(Rc<RunningAppState>),
+    /// A state were we are in the process of shutting down but still need the reference to the [`RunningAppState`].
+    Teardown(Rc<RunningAppState>),
     ShuttingDown,
 }
 
@@ -138,7 +140,11 @@ impl App {
                 .map(ServoshellGamepadDelegate::new)
                 .map(Rc::new),
         ));
-        running_state.open_window(platform_window, self.initial_url.as_url().clone());
+        let initial_url = self.initial_url.as_url().clone();
+        running_state.open_window(
+            platform_window,
+            TopLevelWebViewCreationRequest::WithUrl(initial_url),
+        );
 
         self.state = AppState::Running(running_state);
     }
@@ -175,7 +181,7 @@ impl App {
 
         let create_platform_window = |url: Url| self.create_platform_window(url, active_event_loop);
         if !state.spin_event_loop(Some(&create_platform_window)) {
-            self.state = AppState::ShuttingDown;
+            self.state = AppState::Teardown(state.clone());
             return false;
         }
         true
@@ -240,6 +246,11 @@ impl ApplicationHandler<AppEvent> for App {
                     headed_window.handle_winit_app_event(state.clone(), app_event);
                 }
             },
+            AppEvent::RequestRepaint(window_id) => {
+                if let Some(window) = state.window(window_id) {
+                    window.set_needs_repaint();
+                }
+            },
             #[cfg(feature = "gamepad")]
             AppEvent::Gamepad(event, gamepad_name, gamepad_index) => {
                 state.handle_gamepad_events(event, gamepad_name, gamepad_index);
@@ -252,6 +263,15 @@ impl ApplicationHandler<AppEvent> for App {
 
         // Block until the window gets an event
         event_loop.set_control_flow(ControlFlow::Wait);
+    }
+
+    fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
+        if !self.preferences.network_http_disk_cache.is_empty() &&
+            let AppState::Teardown(state) = &self.state
+        {
+            state.servo.network_manager().store_http_cache_to_disk();
+        }
+        self.state = AppState::ShuttingDown;
     }
 }
 

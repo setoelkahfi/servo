@@ -4,6 +4,7 @@
 
 use layout_api::LayoutNode;
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
+use script::layout_dom::ServoLayoutNode;
 use servo_arc::Arc;
 use style::properties::ComputedValues;
 use style::properties::longhands::list_style_position::computed_value::T as ListStylePosition;
@@ -25,7 +26,7 @@ use crate::dom_traversal::{
 };
 use crate::flow::float::FloatBox;
 use crate::flow::same_formatting_context_block::SameFormattingContextBlock;
-use crate::flow::{BlockContainer, BlockFormattingContext, BlockLevelBox};
+use crate::flow::{BlockContainer, BlockFormattingContext, BlockLevelBox, TextareaSize};
 use crate::formatting_contexts::{
     IndependentFormattingContext, IndependentFormattingContextContents,
 };
@@ -33,7 +34,7 @@ use crate::fragment_tree::FragmentFlags;
 use crate::layout_box_base::LayoutBoxBase;
 use crate::positioned::AbsolutelyPositionedBox;
 use crate::style_ext::{ComputedValuesExt, DisplayGeneratingBox, DisplayInside, DisplayOutside};
-use crate::table::{AnonymousTableContent, Table};
+use crate::table::{AnonymousTableContent, AnonymousTableContentElement, Table};
 
 impl BlockFormattingContext {
     pub(crate) fn construct(
@@ -42,21 +43,32 @@ impl BlockFormattingContext {
         contents: NonReplacedContents,
         propagated_data: PropagatedBoxTreeData,
         is_list_item: bool,
+        is_table_cell: bool,
     ) -> Self {
-        Self::from_block_container(BlockContainer::construct(
-            context,
-            info,
-            contents,
-            propagated_data,
-            is_list_item,
-        ))
+        Self::from_block_container(
+            BlockContainer::construct(context, info, contents, propagated_data, is_list_item),
+            is_table_cell,
+            Self::textarea_size(&info.node),
+        )
     }
 
-    pub(crate) fn from_block_container(contents: BlockContainer) -> Self {
+    /// Calculates the content size for textareas that are instead dictated by
+    /// their rows.
+    fn textarea_size(node: &ServoLayoutNode) -> Option<TextareaSize> {
+        node.textarea_rows().map(|rows| TextareaSize { rows })
+    }
+
+    pub(crate) fn from_block_container(
+        contents: BlockContainer,
+        is_table_cell: bool,
+        textarea_size: Option<TextareaSize>,
+    ) -> Self {
         let contains_floats = contents.contains_floats();
         Self {
             contents,
             contains_floats,
+            is_table_cell,
+            textarea_size,
         }
     }
 }
@@ -172,9 +184,11 @@ pub(crate) struct BlockContainerBuilder<'dom, 'style> {
     /// (see `handle_block_level_element`).
     block_level_boxes: Vec<BlockLevelJob<'dom>>,
 
-    /// Whether or not this builder has yet produced a block which would be
-    /// be considered the first line for the purposes of `text-indent`.
-    have_already_seen_first_line_for_text_indent: bool,
+    /// Whether or not this builder has yet produced an inline formatting context
+    /// with the first formatted line:
+    /// <https://www.w3.org/TR/css-pseudo-4/#first-formatted-line>.
+    /// This is used for `text-indent` and `::first-letter`.
+    have_already_seen_first_formatted_line: bool,
 
     /// The propagated data to use for BoxTree construction.
     propagated_data: PropagatedBoxTreeData,
@@ -213,7 +227,7 @@ impl BlockContainer {
         if is_list_item &&
             let Some((marker_info, marker_contents)) = crate::lists::make_marker(context, info)
         {
-            match marker_info.style.clone_list_style_position() {
+            match marker_info.style.get_list_style_position() {
                 ListStylePosition::Inside => {
                     builder.handle_list_item_marker_inside(&marker_info, marker_contents)
                 },
@@ -241,7 +255,7 @@ impl<'dom, 'style> BlockContainerBuilder<'dom, 'style> {
             info,
             block_level_boxes: Vec::new(),
             propagated_data,
-            have_already_seen_first_line_for_text_indent: false,
+            have_already_seen_first_formatted_line: false,
             anonymous_box_info: None,
             anonymous_table_content: Vec::new(),
             inline_formatting_context_builder: None,
@@ -258,7 +272,13 @@ impl<'dom, 'style> BlockContainerBuilder<'dom, 'style> {
     fn ensure_inline_formatting_context_builder(&mut self) -> &mut InlineFormattingContextBuilder {
         self.inline_formatting_context_builder
             .get_or_insert_with(|| {
-                let mut builder = InlineFormattingContextBuilder::new(self.info, self.context);
+                // ::first-letter must be on the first formatted line.
+                let should_process_first_letter = !self.have_already_seen_first_formatted_line;
+                let mut builder = InlineFormattingContextBuilder::new(
+                    self.info,
+                    self.context,
+                    should_process_first_letter,
+                );
                 for shared_inline_styles in self.display_contents_shared_styles.iter() {
                     builder.enter_display_contents(shared_inline_styles.clone());
                 }
@@ -269,7 +289,7 @@ impl<'dom, 'style> BlockContainerBuilder<'dom, 'style> {
     fn finish_ongoing_inline_formatting_context(&mut self) -> Option<InlineFormattingContext> {
         self.inline_formatting_context_builder.take()?.finish(
             self.context,
-            !self.have_already_seen_first_line_for_text_indent,
+            !self.have_already_seen_first_formatted_line,
             self.info.node.is_single_line_text_input(),
             self.info.style.to_bidi_level(),
         )
@@ -324,7 +344,7 @@ impl<'dom, 'style> BlockContainerBuilder<'dom, 'style> {
         let inline_table = self.currently_processing_inline_box();
 
         let mut contents: Vec<AnonymousTableContent<'dom>> =
-            self.anonymous_table_content.drain(..).collect();
+            std::mem::take(&mut self.anonymous_table_content);
         let last_element_index = contents
             .iter()
             .rposition(|content| matches!(content, AnonymousTableContent::Element { .. }))
@@ -417,18 +437,20 @@ impl<'dom> TraversalHandler<'dom> for BlockContainerBuilder<'dom, '_> {
             },
             DisplayGeneratingBox::LayoutInternal(_) => {
                 self.anonymous_table_content
-                    .push(AnonymousTableContent::Element {
-                        info: info.clone(),
-                        display,
-                        contents,
-                        box_slot,
-                    });
+                    .push(AnonymousTableContent::Element(Box::new(
+                        AnonymousTableContentElement {
+                            info: info.clone(),
+                            display,
+                            contents,
+                            box_slot,
+                        },
+                    )));
             },
         }
     }
 
     fn handle_text(&mut self, info: &NodeAndStyleInfo<'dom>, text: BoxTreeString<'dom>) {
-        if text.is_empty() {
+        if text.is_empty() && !info.node.text_node_needs_caret_placeholder() {
             return;
         }
 
@@ -555,6 +577,10 @@ impl<'dom> BlockContainerBuilder<'dom, '_> {
         );
         box_slot.set(LayoutBox::InlineLevel(inline_item));
 
+        if info.node.is_html_wbr_element() {
+            inline_builder.push_soft_wrap_opportunity();
+        }
+
         if is_list_item &&
             let Some((marker_info, marker_contents)) =
                 crate::lists::make_marker(self.context, info)
@@ -608,7 +634,7 @@ impl<'dom> BlockContainerBuilder<'dom, '_> {
 
         // Any block also counts as the first line for the purposes of text indent. Even if
         // they don't actually indent.
-        self.have_already_seen_first_line_for_text_indent = true;
+        self.have_already_seen_first_formatted_line = true;
     }
 
     fn handle_absolutely_positioned_element(
@@ -723,7 +749,7 @@ impl<'dom> BlockContainerBuilder<'dom, '_> {
             propagated_data: self.propagated_data,
         });
 
-        self.have_already_seen_first_line_for_text_indent = true;
+        self.have_already_seen_first_formatted_line = true;
     }
 }
 
@@ -802,6 +828,8 @@ impl BlockLevelJob<'_> {
                 let block_formatting_context = BlockFormattingContext {
                     contents: block_container,
                     contains_floats: false,
+                    is_table_cell: false,
+                    textarea_size: None,
                 };
                 ArcRefCell::new(BlockLevelBox::OutsideMarker(OutsideMarker {
                     context: IndependentFormattingContext::new(

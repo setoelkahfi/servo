@@ -5,6 +5,7 @@
 use html5ever::{LocalName, Prefix, QualName, local_name, ns};
 use js::context::JSContext;
 use js::rust::HandleObject;
+use servo_config::pref;
 
 use crate::dom::bindings::error::{report_pending_exception, throw_dom_exception};
 use crate::dom::bindings::inheritance::Castable;
@@ -86,6 +87,8 @@ use crate::dom::html::htmlulistelement::HTMLUListElement;
 use crate::dom::html::htmlunknownelement::HTMLUnknownElement;
 use crate::dom::html::htmlvideoelement::HTMLVideoElement;
 use crate::dom::htmlmarqueeelement::HTMLMarqueeElement;
+use crate::dom::mathmlelement::MathMLElement;
+use crate::dom::svg::svgaelement::SVGAElement;
 use crate::dom::svg::svgcircleelement::SVGCircleElement;
 use crate::dom::svg::svgdefselement::SVGDefsElement;
 use crate::dom::svg::svgelement::SVGElement;
@@ -95,6 +98,7 @@ use crate::dom::svg::svgimageelement::SVGImageElement;
 use crate::dom::svg::svglineargradientelement::SVGLinearGradientElement;
 use crate::dom::svg::svglineelement::SVGLineElement;
 use crate::dom::svg::svgpathelement::SVGPathElement;
+use crate::dom::svg::svgpatternelement::SVGPatternElement;
 use crate::dom::svg::svgpolygonelement::SVGPolygonElement;
 use crate::dom::svg::svgpolylineelement::SVGPolylineElement;
 use crate::dom::svg::svgradialgradientelement::SVGRadialGradientElement;
@@ -102,6 +106,8 @@ use crate::dom::svg::svgrectelement::SVGRectElement;
 use crate::dom::svg::svgstopelement::SVGStopElement;
 use crate::dom::svg::svgsvgelement::SVGSVGElement;
 use crate::dom::svg::svgsymbolelement::SVGSymbolElement;
+use crate::dom::svg::svgtextelement::SVGTextElement;
+use crate::dom::svg::svgtspanelement::SVGTSpanElement;
 use crate::dom::svg::svguseelement::SVGUseElement;
 use crate::event_loop::script_thread::ScriptThread;
 use crate::realms::enter_auto_realm;
@@ -123,6 +129,7 @@ fn create_svg_element(
     );
 
     match name.local {
+        local_name!("a") => make!(SVGAElement),
         local_name!("circle") => make!(SVGCircleElement),
         local_name!("defs") => make!(SVGDefsElement),
         local_name!("ellipse") => make!(SVGEllipseElement),
@@ -131,6 +138,7 @@ fn create_svg_element(
         local_name!("line") => make!(SVGLineElement),
         local_name!("linearGradient") => make!(SVGLinearGradientElement),
         local_name!("path") => make!(SVGPathElement),
+        local_name!("pattern") => make!(SVGPatternElement),
         local_name!("polygon") => make!(SVGPolygonElement),
         local_name!("polyline") => make!(SVGPolylineElement),
         local_name!("radialGradient") => make!(SVGRadialGradientElement),
@@ -138,8 +146,27 @@ fn create_svg_element(
         local_name!("rect") => make!(SVGRectElement),
         local_name!("svg") => make!(SVGSVGElement),
         local_name!("symbol") => make!(SVGSymbolElement),
+        local_name!("text") => make!(SVGTextElement),
+        local_name!("tspan") => make!(SVGTSpanElement),
         local_name!("use") => make!(SVGUseElement),
         _ => make!(SVGElement),
+    }
+}
+
+fn create_mathml_element(
+    cx: &mut JSContext,
+    name: QualName,
+    prefix: Option<Prefix>,
+    document: &Document,
+    proto: Option<HandleObject>,
+) -> DomRoot<Element> {
+    assert_eq!(name.ns, ns!(mathml));
+
+    if pref!(mathml_core_enabled) {
+        let obj = MathMLElement::new(cx, name.local, prefix, document, proto);
+        DomRoot::upcast(obj)
+    } else {
+        Element::new(cx, name.local, name.ns, prefix, document, proto)
     }
 }
 
@@ -180,7 +207,7 @@ fn create_html_element(
             // Step 4.2. Set result to the result of creating an element internal given document,
             // interface, localName, the HTML namespace, prefix, "undefined", is, and registry.
             let element = create_native_html_element(cx, name, prefix, document, creator, proto);
-            element.set_is(definition.name.clone());
+            element.set_is(definition.name.clone(), cx.no_gc());
             element.set_custom_element_state(CustomElementState::Undefined, cx.no_gc());
             element.set_custom_element_registry(registry.as_deref(), cx.no_gc());
 
@@ -272,7 +299,7 @@ fn create_html_element(
     // is is non-null, then set result’s custom element state to "undefined".
     match is {
         Some(is) => {
-            result.set_is(is);
+            result.set_is(is, cx.no_gc());
             result.set_custom_element_state(CustomElementState::Undefined, cx.no_gc());
             result.set_custom_element_registry(registry.as_deref(), cx.no_gc());
         },
@@ -480,6 +507,7 @@ pub(crate) fn create_element(
     match name.ns {
         ns!(html) => create_html_element(cx, name, prefix, is, document, creator, mode, proto),
         ns!(svg) => create_svg_element(cx, name, prefix, document, proto),
+        ns!(mathml) => create_mathml_element(cx, name, prefix, document, proto),
         _ => Element::new(cx, name.local, name.ns, prefix, document, proto),
     }
 }

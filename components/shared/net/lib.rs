@@ -4,6 +4,7 @@
 
 #![deny(unsafe_code)]
 
+use std::collections::hash_map::Entry;
 use std::fmt::{self, Debug, Display};
 use std::sync::{LazyLock, OnceLock};
 use std::thread::{self, JoinHandle};
@@ -16,17 +17,20 @@ use headers::{ContentType, HeaderMapExt, ReferrerPolicy as ReferrerPolicyHeader}
 use http::{HeaderMap, HeaderValue, StatusCode, header};
 use hyper_serde::Serde;
 use hyper_util::client::legacy::Error as HyperError;
-use ipc_channel::ipc::IpcSender;
 use malloc_size_of::malloc_size_of_is_0;
 use malloc_size_of_derive::MallocSizeOf;
 use mime::Mime;
 use parking_lot::RwLock;
+use pixels::CorsStatus;
+use profile_traits::generic_callback::GenericCallback as ProfileGenericCallback;
 use profile_traits::mem::ReportsChan;
 use rand::{Rng, rng};
 use request::RequestId;
 use rustc_hash::FxHashMap;
+use rustls::{CipherSuite, NamedGroup, ProtocolVersion};
 use rustls_pki_types::CertificateDer;
 use serde::{Deserialize, Serialize};
+use serde_with::{FromInto, serde_as};
 use servo_base::generic_channel::{
     self, CallbackSetter, GenericCallback, GenericOneshotSender, GenericSend, GenericSender,
     SendResult,
@@ -34,6 +38,8 @@ use servo_base::generic_channel::{
 use servo_base::id::{CookieStoreId, HistoryStateId, PipelineId};
 use servo_url::{ImmutableOrigin, ServoUrl};
 use uuid::Uuid;
+
+use crate::response::RedirectTaint;
 
 /// Identifies a pending asynchronous cookie operation initiated by the embedder.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
@@ -47,6 +53,7 @@ use crate::request::{Request, RequestBuilder};
 use crate::response::{Response, ResponseInit};
 
 pub mod blob_url_store;
+pub mod fetch;
 pub mod filemanager_thread;
 pub mod http_status;
 pub mod image_cache;
@@ -65,11 +72,6 @@ pub use resource_fetch_timing::{
 /// <https://fetch.spec.whatwg.org/#document-accept-header-value>
 pub const DOCUMENT_ACCEPT_HEADER_VALUE: HeaderValue =
     HeaderValue::from_static("text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8");
-
-/// An implementation of the [Fetch specification](https://fetch.spec.whatwg.org/)
-pub mod fetch {
-    pub mod headers;
-}
 
 /// A loading context, for context-specific sniffing, as defined in
 /// <https://mimesniff.spec.whatwg.org/#context-specific-sniffing>
@@ -115,9 +117,9 @@ impl CustomResponse {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, MallocSizeOf, Serialize)]
 pub struct CustomResponseMediator {
-    pub response_chan: IpcSender<Option<CustomResponse>>,
+    pub response_chan: GenericCallback<Option<CustomResponse>>,
     pub load_url: ServoUrl,
 }
 
@@ -311,16 +313,46 @@ pub trait FetchTaskTarget {
     fn process_response_length_hint(&mut self, request_id: &Request, length: usize);
 }
 
+/// <https://fetch.spec.whatwg.org/#concept-filtered-response>
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct ExposedMetadata {
+    pub final_url: ServoUrl,
+    pub headers: Serde<HeaderMap>,
+    pub status: HttpStatus,
+    pub redirected: bool,
+}
+
+impl From<Metadata> for ExposedMetadata {
+    fn from(value: Metadata) -> Self {
+        ExposedMetadata {
+            final_url: value.final_url,
+            headers: value.headers.unwrap_or_else(|| Serde(HeaderMap::new())),
+            status: value.status,
+            redirected: value.redirected,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub enum FilteredMetadata {
-    Basic(Metadata),
-    Cors(Metadata),
+    Basic(ExposedMetadata),
+    Cors(ExposedMetadata),
     Opaque,
     OpaqueRedirect(ServoUrl),
 }
 
-// FIXME: https://github.com/servo/servo/issues/34591
-#[expect(clippy::large_enum_variant)]
+impl From<FetchMetadata> for Metadata {
+    fn from(value: FetchMetadata) -> Self {
+        match value {
+            FetchMetadata::Unfiltered(metadata) => metadata,
+            FetchMetadata::Filtered {
+                filtered: _,
+                unsafe_,
+            } => unsafe_,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub enum FetchMetadata {
     Unfiltered(Metadata),
@@ -339,14 +371,16 @@ impl FetchMetadata {
     }
 
     /// <https://html.spec.whatwg.org/multipage/#cors-cross-origin>
-    pub fn is_cors_cross_origin(&self) -> bool {
+    pub fn cors_status(&self) -> CorsStatus {
         if let Self::Filtered { filtered, .. } = self {
             match filtered {
-                FilteredMetadata::Basic(_) | FilteredMetadata::Cors(_) => false,
-                FilteredMetadata::Opaque | FilteredMetadata::OpaqueRedirect(_) => true,
+                FilteredMetadata::Basic(_) | FilteredMetadata::Cors(_) => CorsStatus::Safe,
+                FilteredMetadata::Opaque | FilteredMetadata::OpaqueRedirect(_) => {
+                    CorsStatus::Unsafe
+                },
             }
         } else {
-            false
+            CorsStatus::Safe
         }
     }
 }
@@ -415,6 +449,66 @@ impl Display for TlsSecurityState {
     }
 }
 
+#[serde_as]
+#[derive(Clone, Serialize, Deserialize, PartialEq)]
+pub struct ServoProtocolVersion(#[serde_as(as = "FromInto<u16>")] pub ProtocolVersion);
+
+impl malloc_size_of::MallocSizeOf for ServoProtocolVersion {
+    fn size_of(&self, _: &mut malloc_size_of::MallocSizeOfOps) -> usize {
+        0
+    }
+}
+
+impl std::fmt::Debug for ServoProtocolVersion {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.0 {
+            ProtocolVersion::SSLv2 => write!(f, "SSL 2.0"),
+            ProtocolVersion::SSLv3 => write!(f, "SSL 3.0"),
+            ProtocolVersion::TLSv1_0 => write!(f, "TLS 1.0"),
+            ProtocolVersion::TLSv1_1 => write!(f, "TLS 1.1"),
+            ProtocolVersion::TLSv1_2 => write!(f, "TLS 1.2"),
+            ProtocolVersion::TLSv1_3 => write!(f, "TLS 1.3"),
+            ProtocolVersion::DTLSv1_0 => write!(f, "DTLS 1.0"),
+            ProtocolVersion::DTLSv1_2 => write!(f, "DTLS 1.2"),
+            ProtocolVersion::DTLSv1_3 => write!(f, "DTLS 1.3"),
+            ProtocolVersion::Unknown(value) => write!(f, "Unknown ({value})"),
+            _ => write!(f, "Not yet implemented"),
+        }
+    }
+}
+
+#[serde_as]
+#[derive(Clone, Serialize, Deserialize, PartialEq)]
+pub struct ServoCipherSuite(#[serde_as(as = "FromInto<u16>")] pub CipherSuite);
+
+impl malloc_size_of::MallocSizeOf for ServoCipherSuite {
+    fn size_of(&self, _: &mut malloc_size_of::MallocSizeOfOps) -> usize {
+        0
+    }
+}
+
+impl std::fmt::Debug for ServoCipherSuite {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{:?}", self.0)
+    }
+}
+
+#[serde_as]
+#[derive(Clone, Serialize, Deserialize, PartialEq)]
+pub struct ServoNamedGroup(#[serde_as(as = "FromInto<u16>")] pub NamedGroup);
+
+impl malloc_size_of::MallocSizeOf for ServoNamedGroup {
+    fn size_of(&self, _: &mut malloc_size_of::MallocSizeOfOps) -> usize {
+        0
+    }
+}
+
+impl std::fmt::Debug for ServoNamedGroup {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{:?}", self.0)
+    }
+}
+
 #[derive(Clone, Debug, Default, Deserialize, MallocSizeOf, PartialEq, Serialize)]
 pub struct TlsSecurityInfo {
     // "insecure", "weak", "broken", "secure".
@@ -423,11 +517,11 @@ pub struct TlsSecurityInfo {
     // Reasons explaining why the negotiated parameters are considered weak.
     pub weakness_reasons: Vec<String>,
     // Negotiated TLS protocol version (e.g. "TLS 1.3").
-    pub protocol_version: Option<String>,
+    pub protocol_version: Option<ServoProtocolVersion>,
     // Negotiated cipher suite identifier.
-    pub cipher_suite: Option<String>,
+    pub cipher_suite: Option<ServoCipherSuite>,
     // Negotiated key exchange group.
-    pub kea_group_name: Option<String>,
+    pub kea_group_name: Option<ServoNamedGroup>,
     // Signature scheme used for certificate verification.
     pub signature_scheme_name: Option<String>,
     // Negotiated ALPN protocol (e.g. "h2" for HTTP/2, "http/1.1" for HTTP/1.1).
@@ -450,7 +544,7 @@ pub struct TlsSecurityInfo {
     pub used_private_dns: bool,
 }
 
-impl FetchTaskTarget for IpcSender<WebSocketNetworkEvent> {
+impl FetchTaskTarget for ProfileGenericCallback<WebSocketNetworkEvent> {
     fn process_request_body(&mut self, _: &Request) {}
     fn process_response(&mut self, _: &Request, response: &Response) {
         if response.is_network_error() {
@@ -633,6 +727,12 @@ impl ResourceThreads {
             .core_thread
             .send(CoreResourceMsg::EmbedderClearSessionCookies(id));
     }
+
+    pub fn store_cache_to_disk(&self, sender: GenericSender<()>) {
+        let _ = self
+            .core_thread
+            .send(CoreResourceMsg::StoreCacheToDisk(sender));
+    }
 }
 
 impl GenericSend<CoreResourceMsg> for ResourceThreads {
@@ -662,6 +762,8 @@ pub enum MessageData {
 
 #[derive(Debug, Deserialize, Serialize, MallocSizeOf)]
 pub enum WebSocketDomAction {
+    /// Abort connection establishment, even if the network has already connected.
+    Abort,
     SendMessage(MessageData),
     Close(Option<u16>, Option<String>),
 }
@@ -680,7 +782,7 @@ pub enum WebSocketNetworkEvent {
 pub enum FetchChannels {
     ResponseMsg(GenericCallback<FetchResponseMsg>),
     WebSocket {
-        event_sender: IpcSender<WebSocketNetworkEvent>,
+        event_sender: ProfileGenericCallback<WebSocketNetworkEvent>,
         action_receiver: CallbackSetter<WebSocketDomAction>,
     },
     /// If the fetch is just being done to populate the cache,
@@ -747,7 +849,6 @@ pub enum CoreResourceMsg {
     /// Delete all session cookies (cookies without an expiry or max-age).
     DeleteSessionCookies(GenericSender<()>),
     DeleteCookie(ServoUrl, String),
-    DeleteCookieAsync(CookieStoreId, ServoUrl, String),
     NewCookieListener(
         CookieStoreId,
         GenericCallback<CookieAsyncResponse>,
@@ -766,7 +867,7 @@ pub enum CoreResourceMsg {
     /// Clear the network cache.
     ClearCache(Option<GenericSender<()>>),
     /// Send the service worker network mediator for an origin to CoreResourceThread
-    NetworkMediator(IpcSender<CustomResponseMediator>, ImmutableOrigin),
+    NetworkMediator(GenericSender<CustomResponseMediator>, ImmutableOrigin),
     /// Message forwarded to file manager's handler
     ToFileManager(FileManagerThreadMsg),
     TotalSizeOfInFlightKeepAliveRecords(PipelineId, GenericSender<u64>),
@@ -776,6 +877,7 @@ pub enum CoreResourceMsg {
     CollectMemoryReport(ReportsChan),
     RevokeTokenForFile(BlobTokenRevocationRequest),
     RefreshTokenForFile(BlobTokenRefreshRequest),
+    StoreCacheToDisk(GenericSender<()>),
 }
 
 #[derive(Debug, Deserialize, MallocSizeOf, Serialize)]
@@ -812,10 +914,12 @@ impl CacheEntryDescriptor {
     }
 }
 
-// FIXME: https://github.com/servo/servo/issues/34591
-#[expect(clippy::large_enum_variant)]
 enum ToFetchThreadMessage {
-    Cancel(Vec<RequestId>, CoreResourceThread),
+    Cancel {
+        request_ids: Vec<RequestId>,
+        forget: bool,
+        core_resource_thread: CoreResourceThread,
+    },
     StartFetch(
         /* request_builder */ RequestBuilder,
         /* response_init */ Option<ResponseInit>,
@@ -914,18 +1018,31 @@ impl FetchThread {
                     let request_id = fetch_response_msg.request_id();
                     let fetch_finished =
                         matches!(fetch_response_msg, FetchResponseMsg::ProcessResponseEOF(..));
+                    let mut active_fetch = match self.active_fetches.entry(request_id) {
+                        Entry::Occupied(occupied_entry) => occupied_entry,
+                        Entry::Vacant(..) => {
+                            // The callback might no longer be in the map if it was cancelled and forgotten
+                            // (for instance, during a Document teardown).
+                            continue;
+                        },
+                    };
 
-                    self.active_fetches
-                        .get_mut(&request_id)
-                        .expect("Got fetch response for unknown fetch")(
-                        fetch_response_msg
-                    );
-
+                    active_fetch.get_mut()(fetch_response_msg);
                     if fetch_finished {
-                        self.active_fetches.remove(&request_id);
+                        let _ = active_fetch.remove();
                     }
                 },
-                Ok(ToFetchThreadMessage::Cancel(request_ids, core_resource_thread)) => {
+                Ok(ToFetchThreadMessage::Cancel {
+                    request_ids,
+                    forget,
+                    core_resource_thread,
+                }) => {
+                    if forget {
+                        for request_id in &request_ids {
+                            self.active_fetches.remove(request_id);
+                        }
+                    }
+
                     // Errors are ignored here, because Servo sends many cancellation requests when shutting down.
                     // At this point the networking task might be shut down completely, so just ignore errors
                     // during this time.
@@ -952,12 +1069,17 @@ impl FetchThread {
         );
     }
 
-    fn cancel_async_fetch(request_ids: Vec<RequestId>, core_resource_thread: &CoreResourceThread) {
+    fn cancel_async_fetch(
+        request_ids: Vec<RequestId>,
+        core_resource_thread: &CoreResourceThread,
+        forget: bool,
+    ) {
         if let Some(fetch_thread) = FETCH_THREAD.get() {
-            let _ = fetch_thread.sender.send(ToFetchThreadMessage::Cancel(
+            let _ = fetch_thread.sender.send(ToFetchThreadMessage::Cancel {
                 request_ids,
-                core_resource_thread.clone(),
-            ));
+                forget,
+                core_resource_thread: core_resource_thread.clone(),
+            });
         }
     }
 
@@ -995,7 +1117,17 @@ pub fn fetch_async(
 /// Instruct the resource thread to cancel an existing request. Does nothing if the
 /// request has already completed or has not been fetched yet.
 pub fn cancel_async_fetch(request_ids: Vec<RequestId>, core_resource_thread: &CoreResourceThread) {
-    FetchThread::cancel_async_fetch(request_ids, core_resource_thread);
+    FetchThread::cancel_async_fetch(request_ids, core_resource_thread, false /* forget */);
+}
+
+/// Instruct the resource thread to cancel an existing request. Does nothing if the
+/// request has already completed or has not been fetched yet. This also "forgets"
+/// the request, which means that no further callbacks will be called when canceled.
+pub fn cancel_and_forget_async_fetch(
+    request_ids: Vec<RequestId>,
+    core_resource_thread: &CoreResourceThread,
+) {
+    FetchThread::cancel_async_fetch(request_ids, core_resource_thread, true /* forget */);
 }
 
 #[derive(Clone, Debug, Deserialize, MallocSizeOf, Serialize)]
@@ -1015,14 +1147,12 @@ pub struct Metadata {
     /// Location URL from the response headers.
     pub location_url: Option<Result<ServoUrl, String>>,
 
-    #[ignore_malloc_size_of = "Defined in hyper"]
     /// MIME type / subtype.
     pub content_type: Option<Serde<ContentType>>,
 
     /// Character set.
     pub charset: Option<String>,
 
-    #[ignore_malloc_size_of = "Defined in hyper"]
     /// Headers
     pub headers: Option<Serde<HeaderMap>>,
 
@@ -1040,6 +1170,8 @@ pub struct Metadata {
     pub redirected: bool,
     /// Detailed TLS metadata associated with the response, if any.
     pub tls_security_info: Option<TlsSecurityInfo>,
+    /// Redirect taint of response
+    pub redirect_taint: RedirectTaint,
 }
 
 impl Metadata {
@@ -1057,6 +1189,7 @@ impl Metadata {
             timing: None,
             redirected: false,
             tls_security_info: None,
+            redirect_taint: Default::default(),
         }
     }
 
@@ -1129,17 +1262,22 @@ pub enum CookieSource {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct CookieChange {
-    changed: Vec<Serde<Cookie<'static>>>,
-    deleted: Vec<Serde<Cookie<'static>>>,
+    pub cookie: Serde<Cookie<'static>>,
+    pub type_: CookieChangeType,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub enum CookieChangeType {
+    Changed,
+    Deleted,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub enum CookieData {
-    Change(CookieChange),
+    Change(Vec<CookieChange>),
     Get(Option<Serde<Cookie<'static>>>),
     GetAll(Vec<Serde<Cookie<'static>>>),
     Set(Result<(), ()>),
-    Delete(Result<(), ()>),
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -1286,6 +1424,12 @@ pub fn trim_http_whitespace(mut slice: &[u8]) -> &[u8] {
     }
 
     slice
+}
+
+/// Returns true if a given string has a given suffix with case-insensitive match.
+pub fn ends_with_ignore_ascii_case(string: &str, suffix: &str) -> bool {
+    string.len() >= suffix.len() &&
+        string.as_bytes()[string.len() - suffix.len()..].eq_ignore_ascii_case(suffix.as_bytes())
 }
 
 /// Returns the cached current system locale, or en-US by default.

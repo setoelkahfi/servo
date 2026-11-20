@@ -1,17 +1,33 @@
 /**
- * Creates a Payment Method Identifier (PMI) URL pointing to payment-method-identifier.py.
+ * Creates a Payment Method Identifier (PMI) URL pointing to
+ * payment-method-identifier.py.
  *
  * @param {string} testId - The unique test run token.
  * @param {Object} [options] - URL configuration options.
+ * @param {string} [options.origin] - Custom origin (default: location.origin).
  * @param {string|string[]} [options.link] - Custom Link header(s).
+ * @param {number} [options.num_redirects] - Number of redirects in chain.
+ * @param {string} [options.redirect_location] - Target URL for redirect.
+ * @param {number} [options.status] - HTTP response status code.
  * @returns {string} Fully qualified PMI URL.
  */
 function createPaymentMethodIdentifierUrl(testId, options = {}) {
-  const url = new URL(`https://${location.host}/payment-method-manifest/resources/payment-method-identifier.py`);
+  const origin = options.origin || location.origin;
+  const url = new URL(`${
+      origin}/payment-method-manifest/resources/payment-method-identifier.py`);
   url.searchParams.set('id', testId);
   if (options.link !== undefined) {
     const links = Array.isArray(options.link) ? options.link : [options.link];
     links.forEach(l => url.searchParams.append('link', l));
+  }
+  if (options.num_redirects !== undefined) {
+    url.searchParams.set('num_redirects', options.num_redirects);
+  }
+  if (options.redirect_location !== undefined) {
+    url.searchParams.set('redirect_location', options.redirect_location);
+  }
+  if (options.status !== undefined) {
+    url.searchParams.set('status', options.status);
   }
   return url.href;
 }
@@ -20,11 +36,68 @@ function createPaymentMethodIdentifierUrl(testId, options = {}) {
  * Creates a Payment Method Manifest URL pointing to payment-method-manifest.py.
  *
  * @param {string} testId - The unique test run token.
+ * @param {Object} [options] - URL configuration options.
+ * @param {string} [options.origin] - Custom origin (default: location.origin).
+ * @param {string} [options.redirect_location] - Target URL for redirect.
+ * @param {number} [options.status] - HTTP response status code.
+ * @param {string} [options.body] - Custom response body.
+ * @param {string} [options.content_type] - Custom Content-Type header.
  * @returns {string} Fully qualified manifest URL.
  */
-function createPaymentMethodManifestUrl(testId) {
-  const url = new URL(`https://${location.host}/payment-method-manifest/resources/payment-method-manifest.py`);
+function createPaymentMethodManifestUrl(testId, options = {}) {
+  const origin = options.origin || location.origin;
+  const url = new URL(
+      `${origin}/payment-method-manifest/resources/payment-method-manifest.py`);
   url.searchParams.set('id', testId);
+  if (options.redirect_location !== undefined) {
+    url.searchParams.set('redirect_location', options.redirect_location);
+  }
+  if (options.status !== undefined) {
+    url.searchParams.set('status', options.status);
+  }
+  if (options.body !== undefined) {
+    url.searchParams.set('body', options.body);
+  }
+  if (options.content_type !== undefined) {
+    url.searchParams.set('content_type', options.content_type);
+  }
+  return url.href;
+}
+
+/**
+ * Creates a Web App Manifest URL pointing to web-app-manifest.py.
+ *
+ * @param {string} testId - The unique test run token.
+ * @param {Object} [options] - URL configuration options.
+ * @param {string} [options.origin] - Custom origin (default: location.origin).
+ * @param {string} [options.app] - Optional app identifier for
+ *     logging/differentiation.
+ * @param {string} [options.redirect_location] - Target URL for redirect.
+ * @param {number} [options.status] - Response HTTP status code.
+ * @param {string} [options.body] - Custom response body.
+ * @param {string} [options.content_type] - Custom Content-Type header.
+ * @returns {string} Fully qualified web app manifest URL.
+ */
+function createWebAppManifestUrl(testId, options = {}) {
+  const origin = options.origin || location.origin;
+  const url = new URL(
+      `${origin}/payment-method-manifest/resources/web-app-manifest.py`);
+  url.searchParams.set('id', testId);
+  if (options.app !== undefined) {
+    url.searchParams.set('app', options.app);
+  }
+  if (options.redirect_location !== undefined) {
+    url.searchParams.set('redirect_location', options.redirect_location);
+  }
+  if (options.status !== undefined) {
+    url.searchParams.set('status', options.status);
+  }
+  if (options.body !== undefined) {
+    url.searchParams.set('body', options.body);
+  }
+  if (options.content_type !== undefined) {
+    url.searchParams.set('content_type', options.content_type);
+  }
   return url.href;
 }
 

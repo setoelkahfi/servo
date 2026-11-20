@@ -90,7 +90,7 @@ impl HTMLTableElement {
         n
     }
 
-    // https://html.spec.whatwg.org/multipage/#dom-table-thead
+    /// <https://html.spec.whatwg.org/multipage/#dom-table-thead>
     /// <https://html.spec.whatwg.org/multipage/#dom-table-tfoot>
     fn get_first_section_of_type(
         &self,
@@ -102,7 +102,7 @@ impl HTMLTableElement {
             .and_then(|n| n.downcast().map(DomRoot::from_ref))
     }
 
-    // https://html.spec.whatwg.org/multipage/#dom-table-thead
+    /// <https://html.spec.whatwg.org/multipage/#dom-table-thead>
     /// <https://html.spec.whatwg.org/multipage/#dom-table-tfoot>
     fn set_first_section_of_type<P>(
         &self,
@@ -503,7 +503,7 @@ impl LayoutDom<'_, HTMLTableElement> {
         (self.unsafe_get()).cellspacing.get()
     }
 
-    pub(crate) fn get_width(self) -> LengthOrPercentageOrAuto {
+    pub(crate) fn width(self) -> LengthOrPercentageOrAuto {
         self.upcast::<Element>()
             .get_attr_for_layout(&ns!(), &local_name!("width"))
             .map(AttrValue::as_dimension)
@@ -511,7 +511,7 @@ impl LayoutDom<'_, HTMLTableElement> {
             .unwrap_or(LengthOrPercentageOrAuto::Auto)
     }
 
-    pub(crate) fn get_height(self) -> LengthOrPercentageOrAuto {
+    pub(crate) fn height(self) -> LengthOrPercentageOrAuto {
         self.upcast::<Element>()
             .get_attr_for_layout(&ns!(), &local_name!("height"))
             .map(AttrValue::as_dimension)
@@ -563,7 +563,11 @@ impl VirtualMethods for HTMLTableElement {
 
     fn attribute_affects_presentational_hints(&self, attr: AttrRef<'_>) -> bool {
         match attr.local_name() {
-            &local_name!("width") | &local_name!("height") => true,
+            &local_name!("bgcolor") |
+            &local_name!("border") |
+            &local_name!("cellspacing") |
+            &local_name!("height") |
+            &local_name!("width") => true,
             _ => self
                 .super_type()
                 .unwrap()

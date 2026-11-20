@@ -2,7 +2,6 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
-use std::cell::LazyCell;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -18,7 +17,6 @@ use servo_geometry::f32_rect_to_au_rect;
 use style::Zero;
 use style::computed_values::border_collapse::T as BorderCollapse;
 use style::computed_values::overflow_x::T as ComputedOverflow;
-use style::computed_values::position::T as ComputedPosition;
 use style::logical_geometry::WritingMode;
 use style::properties::ComputedValues;
 
@@ -26,10 +24,10 @@ use super::{BaseFragment, BaseFragmentInfo, CollapsedBlockMargins, Fragment, Fra
 use crate::SharedStyle;
 use crate::display_list::{ClipId, ToWebRender};
 use crate::formatting_contexts::Baselines;
-use crate::fragment_tree::ContainingBlockCalculation;
+use crate::fragment_tree::{CumulativeContentRectCalculation, FragmentChildren};
 use crate::geom::{
-    AuOrAuto, LengthPercentageOrAuto, PhysicalPoint, PhysicalRect, PhysicalSides,
-    SyncPhysicalRectAu, ToLogical,
+    AuOrAuto, LogicalSides, LogicalVec2, PhysicalPoint, PhysicalRect, PhysicalSides,
+    SyncPhysicalRectAu,
 };
 use crate::style_ext::ComputedValuesExt;
 use crate::table::SpecificTableGridInfo;
@@ -121,9 +119,10 @@ pub(crate) struct BoxFragment {
 
     pub children: Vec<Fragment>,
 
-    /// This [`BoxFragment`]'s containing block rectangle in coordinates relative to
-    /// the initial containing block, but not taking into account any transforms.
-    pub cumulative_containing_block_rect: SyncPhysicalRectAu,
+    /// The cumulative content rect of this [`BoxFragment`]'s parent in coordinates
+    /// relative to the initial containing block, but not taking into account any
+    /// transforms.
+    pub cumulative_parent_content_rect: SyncPhysicalRectAu,
 
     pub padding: PhysicalSides<Au>,
     pub border: PhysicalSides<Au>,
@@ -161,19 +160,50 @@ impl BoxFragment {
     pub(crate) fn new(
         base_fragment_info: BaseFragmentInfo,
         style: ServoArc<ComputedValues>,
-        children: Vec<Fragment>,
+        children: FragmentChildren,
         content_rect: PhysicalRect<Au>,
         padding: PhysicalSides<Au>,
         border: PhysicalSides<Au>,
         margin: PhysicalSides<Au>,
         specific_layout_info: Option<SpecificLayoutInfo>,
     ) -> Self {
+        let writing_mode = style.writing_mode;
+        Self::new_with_writing_mode_override(
+            base_fragment_info,
+            style,
+            children,
+            content_rect,
+            padding,
+            border,
+            margin,
+            specific_layout_info,
+            writing_mode,
+        )
+    }
+
+    #[expect(clippy::too_many_arguments)]
+    pub(crate) fn new_with_writing_mode_override(
+        base_fragment_info: BaseFragmentInfo,
+        style: ServoArc<ComputedValues>,
+        children: FragmentChildren,
+        content_rect: PhysicalRect<Au>,
+        padding: PhysicalSides<Au>,
+        border: PhysicalSides<Au>,
+        margin: PhysicalSides<Au>,
+        specific_layout_info: Option<SpecificLayoutInfo>,
+        writing_mode: WritingMode,
+    ) -> Self {
         let rare_data = BoxFragmentRareData::new(specific_layout_info);
+        let children = children.into_physical_fragments(
+            writing_mode,
+            LogicalVec2::from_physical_size(&content_rect.size, writing_mode),
+        );
+
         Self {
             base: BaseFragment::new(base_fragment_info, content_rect),
             style: style.into(),
             children,
-            cumulative_containing_block_rect: Default::default(),
+            cumulative_parent_content_rect: Default::default(),
             padding,
             border,
             margin,
@@ -183,7 +213,7 @@ impl BoxFragment {
             background_mode: BackgroundMode::Normal,
             rare_data,
             block_level_layout_info: None,
-            spatial_tree_node: AtomicOptionScrollTreeNodeId::new(None),
+            spatial_tree_node: Default::default(),
         }
     }
 
@@ -225,10 +255,11 @@ impl BoxFragment {
         // This applies even if there is no baseline set, so we unconditionally set the value here
         // and ignore anything that is set via [`Self::with_baselines`].
         if style.establishes_scroll_container(self.base.flags) {
-            let content_rect_size = self.content_rect().size.to_logical(writing_mode);
-            let padding = self.padding.to_logical(writing_mode);
-            let border = self.border.to_logical(writing_mode);
-            let margin = self.margin.to_logical(writing_mode);
+            let content_rect_size =
+                LogicalVec2::from_physical_size(&self.content_rect().size, writing_mode);
+            let padding = LogicalSides::from_physical(&self.padding, writing_mode);
+            let border = LogicalSides::from_physical(&self.border, writing_mode);
+            let margin = LogicalSides::from_physical(&self.margin, writing_mode);
             baselines.last = Some(
                 content_rect_size.block + padding.block_end + border.block_end + margin.block_end,
             )
@@ -322,38 +353,47 @@ impl BoxFragment {
     }
 
     #[inline]
-    pub(crate) fn set_containing_block(&self, containing_block: &PhysicalRect<Au>) {
-        self.cumulative_containing_block_rect.set(*containing_block);
+    pub(crate) fn set_cumulative_content_rect(&self, content_rect: &PhysicalRect<Au>) {
+        self.cumulative_parent_content_rect.set(*content_rect);
     }
 
-    pub(crate) fn offset_by_containing_block(
+    pub(crate) fn offset_by_cumulative_content_offset(
         &self,
         rect: &PhysicalRect<Au>,
-        containing_block_computation: ContainingBlockCalculation<'_>,
+        cumulative_content_rect_calculation: CumulativeContentRectCalculation<'_>,
     ) -> PhysicalRect<Au> {
-        containing_block_computation.ensure();
-        rect.translate(self.cumulative_containing_block_rect.origin().to_vector())
+        cumulative_content_rect_calculation.ensure();
+        rect.translate(self.cumulative_parent_content_rect.origin().to_vector())
     }
 
     pub(crate) fn cumulative_content_box_rect(
         &self,
-        containing_block_computation: ContainingBlockCalculation<'_>,
+        cumulative_content_rect_calculation: CumulativeContentRectCalculation<'_>,
     ) -> PhysicalRect<Au> {
-        self.offset_by_containing_block(&self.base.rect(), containing_block_computation)
+        self.offset_by_cumulative_content_offset(
+            &self.base.rect(),
+            cumulative_content_rect_calculation,
+        )
     }
 
     pub(crate) fn cumulative_padding_box_rect(
         &self,
-        containing_block_computation: ContainingBlockCalculation<'_>,
+        cumulative_content_rect_calculation: CumulativeContentRectCalculation<'_>,
     ) -> PhysicalRect<Au> {
-        self.offset_by_containing_block(&self.padding_rect(), containing_block_computation)
+        self.offset_by_cumulative_content_offset(
+            &self.padding_rect(),
+            cumulative_content_rect_calculation,
+        )
     }
 
     pub(crate) fn cumulative_border_box_rect(
         &self,
-        containing_block_computation: ContainingBlockCalculation<'_>,
+        cumulative_content_rect_calculation: CumulativeContentRectCalculation<'_>,
     ) -> PhysicalRect<Au> {
-        self.offset_by_containing_block(&self.border_rect(), containing_block_computation)
+        self.offset_by_cumulative_content_offset(
+            &self.border_rect(),
+            cumulative_content_rect_calculation,
+        )
     }
 
     pub(crate) fn content_rect(&self) -> PhysicalRect<Au> {
@@ -414,99 +454,6 @@ impl BoxFragment {
         tree.end_level();
     }
 
-    pub(crate) fn calculate_resolved_insets_if_positioned(
-        &self,
-        containing_block_computation: ContainingBlockCalculation<'_>,
-    ) -> PhysicalSides<AuOrAuto> {
-        let style = self.style();
-        let position = style.get_box().position;
-        debug_assert_ne!(
-            position,
-            ComputedPosition::Static,
-            "Should not call this method on statically positioned box."
-        );
-
-        if let Some(resolved_sticky_insets) = self.resolved_sticky_insets() {
-            return **resolved_sticky_insets;
-        }
-
-        let convert_to_au_or_auto = |sides: PhysicalSides<Au>| {
-            PhysicalSides::new(
-                AuOrAuto::LengthPercentage(sides.top),
-                AuOrAuto::LengthPercentage(sides.right),
-                AuOrAuto::LengthPercentage(sides.bottom),
-                AuOrAuto::LengthPercentage(sides.left),
-            )
-        };
-
-        let containing_block_size = LazyCell::new(|| {
-            containing_block_computation.ensure();
-            self.cumulative_containing_block_rect.size()
-        });
-
-        // "A resolved value special case property like top defined in another
-        // specification If the property applies to a positioned element and the
-        // resolved value of the display property is not none or contents, and
-        // the property is not over-constrained, then the resolved value is the
-        // used value. Otherwise the resolved value is the computed value."
-        // https://drafts.csswg.org/cssom/#resolved-values
-        let insets = style.physical_box_offsets();
-        if position == ComputedPosition::Relative {
-            let get_resolved_axis = |start: &LengthPercentageOrAuto,
-                                     end: &LengthPercentageOrAuto,
-                                     container_length: Au| {
-                let start = start.map(|value| value.to_used_value(container_length));
-                let end = end.map(|value| value.to_used_value(container_length));
-                match (start.non_auto(), end.non_auto()) {
-                    (None, None) => (Au::zero(), Au::zero()),
-                    (None, Some(end)) => (-end, end),
-                    (Some(start), None) => (start, -start),
-                    // This is the overconstrained case, for which the resolved insets will
-                    // simply be the computed insets.
-                    (Some(start), Some(end)) => (start, end),
-                }
-            };
-
-            let (left, right) =
-                get_resolved_axis(&insets.left, &insets.right, containing_block_size.width);
-            let (top, bottom) =
-                get_resolved_axis(&insets.top, &insets.bottom, containing_block_size.height);
-            return convert_to_au_or_auto(PhysicalSides::new(top, right, bottom, left));
-        }
-
-        debug_assert!(position.is_absolutely_positioned());
-
-        let margin_rect = self.margin_rect();
-        let (top, bottom) = match (&insets.top, &insets.bottom) {
-            (
-                LengthPercentageOrAuto::LengthPercentage(top),
-                LengthPercentageOrAuto::LengthPercentage(bottom),
-            ) => (
-                top.to_used_value(containing_block_size.height),
-                bottom.to_used_value(containing_block_size.height),
-            ),
-            _ => (
-                margin_rect.origin.y,
-                containing_block_size.height - margin_rect.max_y(),
-            ),
-        };
-        let (left, right) = match (&insets.left, &insets.right) {
-            (
-                LengthPercentageOrAuto::LengthPercentage(left),
-                LengthPercentageOrAuto::LengthPercentage(right),
-            ) => (
-                left.to_used_value(containing_block_size.width),
-                right.to_used_value(containing_block_size.width),
-            ),
-            _ => (
-                margin_rect.origin.x,
-                containing_block_size.width - margin_rect.max_x(),
-            ),
-        };
-
-        convert_to_au_or_auto(PhysicalSides::new(top, right, bottom, left))
-    }
-
     /// Whether or this is a flex or grid item.
     pub(crate) fn is_flex_or_grid_item(&self) -> bool {
         self.base
@@ -538,6 +485,42 @@ impl BoxFragment {
 
     pub(crate) fn spatial_tree_node(&self) -> Option<ScrollTreeNodeId> {
         self.spatial_tree_node.get()
+    }
+
+    /// Compute a physical containing block rectangle relative to the content box of this
+    /// fragment for absolutely positioned boxes for which this fragment establishes a
+    /// containing block.
+    ///
+    /// - For grid containers: the grid area rectangle.
+    /// - For everything else: the padding box of the box that establishes the containing block.
+    pub(crate) fn containing_block_rect_for_absolute(
+        &self,
+        item_style: &ComputedValues,
+    ) -> PhysicalRect<Au> {
+        self.grid_info()
+            .map(|grid_info| {
+                // Resolve the hoisted node's grid area from its own grid position styles
+                // into a rectangle in `Au` units relative to the container's content box.
+                grid_info.resolve_grid_area(self, item_style)
+            })
+            .unwrap_or_else(|| {
+                // Get the padding box of this fragment relative to the content box.
+                let mut padding_rect = self.padding_rect();
+                padding_rect.origin -= self.content_rect().origin.to_vector();
+                padding_rect
+            })
+    }
+
+    pub(crate) fn grid_info(&self) -> Option<AtomicRef<'_, SpecificTaffyGridInfo>> {
+        let rare_data = self.rare_data.get().map(|ref_cell| ref_cell.borrow());
+        rare_data.and_then(|rare_data| {
+            AtomicRef::filter_map(rare_data, |rare_data| {
+                match rare_data.specific_layout_info.as_ref() {
+                    Some(SpecificLayoutInfo::Grid(grid_info)) => Some(&**grid_info),
+                    _ => None,
+                }
+            })
+        })
     }
 }
 

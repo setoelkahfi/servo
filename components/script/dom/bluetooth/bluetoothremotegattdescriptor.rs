@@ -2,12 +2,11 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
-use std::rc::Rc;
-
 use dom_struct::dom_struct;
 use js::context::JSContext;
 use js::realm::CurrentRealm;
 use script_bindings::cell::DomRefCell;
+use script_bindings::domstring::TracedDOMString;
 use script_bindings::reflector::{Reflector, reflect_dom_object};
 use servo_base::generic_channel::GenericSender;
 use servo_bluetooth_traits::blocklist::{Blocklist, uuid_is_blocklisted};
@@ -28,14 +27,14 @@ use crate::dom::bluetoothremotegattcharacteristic::{
     BluetoothRemoteGATTCharacteristic, MAXIMUM_ATTRIBUTE_LENGTH,
 };
 use crate::dom::globalscope::GlobalScope;
-use crate::dom::promise::Promise;
+use crate::dom::promise::{Promise, RootedPromise};
 
 // http://webbluetoothcg.github.io/web-bluetooth/#bluetoothremotegattdescriptor
 #[dom_struct]
 pub(crate) struct BluetoothRemoteGATTDescriptor {
     reflector_: Reflector,
     characteristic: Dom<BluetoothRemoteGATTCharacteristic>,
-    uuid: DOMString,
+    uuid: TracedDOMString,
     value: DomRefCell<Option<ByteString>>,
     instance_id: String,
 }
@@ -49,7 +48,7 @@ impl BluetoothRemoteGATTDescriptor {
         BluetoothRemoteGATTDescriptor {
             reflector_: Reflector::new(),
             characteristic: Dom::from_ref(characteristic),
-            uuid,
+            uuid: uuid.traced(),
             value: DomRefCell::new(None),
             instance_id,
         }
@@ -90,7 +89,7 @@ impl BluetoothRemoteGATTDescriptorMethods<crate::DomTypeHolder> for BluetoothRem
 
     /// <https://webbluetoothcg.github.io/web-bluetooth/#dom-bluetoothremotegattdescriptor-uuid>
     fn Uuid(&self) -> DOMString {
-        self.uuid.clone()
+        self.uuid.clone().root()
     }
 
     /// <https://webbluetoothcg.github.io/web-bluetooth/#dom-bluetoothremotegattdescriptor-value>
@@ -99,7 +98,7 @@ impl BluetoothRemoteGATTDescriptorMethods<crate::DomTypeHolder> for BluetoothRem
     }
 
     /// <https://webbluetoothcg.github.io/web-bluetooth/#dom-bluetoothremotegattdescriptor-readvalue>
-    fn ReadValue(&self, cx: &mut CurrentRealm) -> Rc<Promise> {
+    fn ReadValue(&self, cx: &mut CurrentRealm) -> RootedPromise {
         let p = Promise::new_in_realm(cx);
 
         // Step 1.
@@ -135,7 +134,7 @@ impl BluetoothRemoteGATTDescriptorMethods<crate::DomTypeHolder> for BluetoothRem
         &self,
         cx: &mut CurrentRealm,
         value: ArrayBufferViewOrArrayBuffer,
-    ) -> Rc<Promise> {
+    ) -> RootedPromise {
         let p = Promise::new_in_realm(cx);
 
         // Step 1.
@@ -183,7 +182,7 @@ impl AsyncBluetoothListener for BluetoothRemoteGATTDescriptor {
         &self,
         cx: &mut JSContext,
         response: BluetoothResponse,
-        promise: &Rc<Promise>,
+        promise: &RootedPromise,
     ) {
         match response {
             // https://webbluetoothcg.github.io/web-bluetooth/#dom-bluetoothremotegattdescriptor-readvalue

@@ -2,8 +2,6 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
-use std::rc::Rc;
-
 use dom_struct::dom_struct;
 use embedder_traits::{self, AllowOrDeny, EmbedderMsg, PermissionFeature, WakeLockType};
 use js::context::JSContext;
@@ -12,11 +10,13 @@ use js::jsapi::JSObject;
 use js::jsval::{ObjectValue, UndefinedValue};
 use js::realm::CurrentRealm;
 use script_bindings::inheritance::Castable;
-use script_bindings::reflector::{Reflector, reflect_dom_object_with_cx};
+use script_bindings::reflector::{Reflector, reflect_dom_object};
 use servo_base::generic_channel;
+use servo_base::generic_channel::GenericCallback;
 use servo_config::pref;
 
 use crate::conversions::Convert;
+use crate::dom::RootedPromise;
 use crate::dom::bindings::codegen::Bindings::PermissionStatusBinding::{
     PermissionDescriptor, PermissionName, PermissionState, PermissionStatusMethods,
 };
@@ -44,13 +44,13 @@ pub(crate) trait PermissionAlgorithm {
     ) -> Result<Self::Descriptor, Error>;
     fn permission_query(
         cx: &mut JSContext,
-        promise: &Rc<Promise>,
+        promise: &RootedPromise,
         descriptor: &Self::Descriptor,
         status: &Self::Status,
     );
     fn permission_request(
         cx: &mut JSContext,
-        promise: &Rc<Promise>,
+        promise: &RootedPromise,
         descriptor: &Self::Descriptor,
         status: &Self::Status,
     );
@@ -77,19 +77,19 @@ impl Permissions {
     }
 
     pub(crate) fn new(cx: &mut JSContext, global: &GlobalScope) -> DomRoot<Permissions> {
-        reflect_dom_object_with_cx(Box::new(Permissions::new_inherited()), global, cx)
+        reflect_dom_object(cx, Box::new(Permissions::new_inherited()), global)
     }
 
-    // https://w3c.github.io/permissions/#dom-permissions-query
-    // https://w3c.github.io/permissions/#dom-permissions-request
-    // https://w3c.github.io/permissions/#dom-permissions-revoke
+    /// <https://w3c.github.io/permissions/#dom-permissions-query>
+    /// <https://w3c.github.io/permissions/#dom-permissions-request>
+    /// <https://w3c.github.io/permissions/#dom-permissions-revoke>
     fn manipulate(
         &self,
         cx: &mut CurrentRealm,
         op: Operation,
         permission_desc: *mut JSObject,
-        promise: Option<Rc<Promise>>,
-    ) -> Rc<Promise> {
+        promise: Option<RootedPromise>,
+    ) -> RootedPromise {
         rooted!(&in(cx) let mut permission_desc_value = UndefinedValue());
         permission_desc_value
             .handle_mut()
@@ -199,17 +199,17 @@ impl Permissions {
 // Currently these methods use Raw *mut JSObject which is potentially dangerous. We root this object immediately in `self.manipulate`.
 impl PermissionsMethods<crate::DomTypeHolder> for Permissions {
     /// <https://w3c.github.io/permissions/#dom-permissions-query>
-    fn Query(&self, cx: &mut CurrentRealm, permission_desc: *mut JSObject) -> Rc<Promise> {
+    fn Query(&self, cx: &mut CurrentRealm, permission_desc: *mut JSObject) -> RootedPromise {
         self.manipulate(cx, Operation::Query, permission_desc, None)
     }
 
     /// <https://w3c.github.io/permissions/#dom-permissions-request>
-    fn Request(&self, cx: &mut CurrentRealm, permission_desc: *mut JSObject) -> Rc<Promise> {
+    fn Request(&self, cx: &mut CurrentRealm, permission_desc: *mut JSObject) -> RootedPromise {
         self.manipulate(cx, Operation::Request, permission_desc, None)
     }
 
     /// <https://w3c.github.io/permissions/#dom-permissions-revoke>
-    fn Revoke(&self, cx: &mut CurrentRealm, permission_desc: *mut JSObject) -> Rc<Promise> {
+    fn Revoke(&self, cx: &mut CurrentRealm, permission_desc: *mut JSObject) -> RootedPromise {
         self.manipulate(cx, Operation::Revoke, permission_desc, None)
     }
 }
@@ -242,7 +242,7 @@ impl PermissionAlgorithm for Permissions {
     /// > permission_desc and a PermissionStatus status, runs the following steps:
     fn permission_query(
         _cx: &mut JSContext,
-        _promise: &Rc<Promise>,
+        _promise: &RootedPromise,
         _descriptor: &PermissionDescriptor,
         status: &PermissionStatus,
     ) {
@@ -253,7 +253,7 @@ impl PermissionAlgorithm for Permissions {
     /// <https://w3c.github.io/permissions/#boolean-permission-request-algorithm>
     fn permission_request(
         cx: &mut JSContext,
-        promise: &Rc<Promise>,
+        promise: &RootedPromise,
         descriptor: &PermissionDescriptor,
         status: &PermissionStatus,
     ) {
@@ -377,6 +377,60 @@ fn prompt_user_from_embedder(name: PermissionName, global_scope: &GlobalScope) -
             PermissionState::Denied
         },
     }
+}
+
+/// The outcome of request_permission_to_use_async()
+pub(crate) enum AsyncPermissionRequest {
+    /// The state was already known, so the user was not prompted. The caller should continue
+    /// immediately with this state.
+    Settled(PermissionState),
+    /// The user is being prompted. The callback will be invoked with their decision.
+    Prompting,
+}
+
+/// Non-blocking variant of request_permission_to_use(), for specifications that obtain
+/// permission "in parallel" rather than on the script thread.
+///
+/// `callback` is only invoked when the return value is AsyncPermissionRequest::Prompting
+pub(crate) fn request_permission_to_use_async(
+    name: PermissionName,
+    global_scope: &GlobalScope,
+    callback: GenericCallback<AllowOrDeny>,
+) -> AsyncPermissionRequest {
+    let state = descriptor_permission_state(name, Some(global_scope));
+    if state != PermissionState::Prompt {
+        return AsyncPermissionRequest::Settled(state);
+    }
+
+    let Some(webview_id) = global_scope.webview_id() else {
+        warn!("Requesting permissions from non-webview-associated global scope");
+        return AsyncPermissionRequest::Settled(PermissionState::Denied);
+    };
+
+    global_scope.send_to_embedder(EmbedderMsg::RequestPermission(
+        webview_id,
+        name.convert(),
+        callback,
+    ));
+    AsyncPermissionRequest::Prompting
+}
+
+/// Store the user's answer to a prompt started by request_permission_to_use_async(), and return
+/// the resulting permission state.
+pub(crate) fn record_permission_request_result(
+    name: PermissionName,
+    global_scope: &GlobalScope,
+    response: AllowOrDeny,
+) -> PermissionState {
+    let state = match response {
+        AllowOrDeny::Allow => PermissionState::Granted,
+        AllowOrDeny::Deny => PermissionState::Denied,
+    };
+    global_scope
+        .permission_state_invocation_results()
+        .borrow_mut()
+        .insert(name, state);
+    descriptor_permission_state(name, Some(global_scope))
 }
 
 impl Convert<PermissionFeature> for PermissionName {

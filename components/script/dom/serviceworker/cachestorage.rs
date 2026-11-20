@@ -4,18 +4,16 @@
 
 use std::cell::RefCell;
 use std::collections::VecDeque;
-use std::rc::Rc;
 
 use dom_struct::dom_struct;
 use js::context::JSContext;
-use script_bindings::reflector::{Reflector, reflect_dom_object_with_cx};
+use script_bindings::reflector::{Reflector, reflect_dom_object};
 use script_bindings::root::DomRoot;
 use servo_base::generic_channel::{GenericCallback, GenericSend};
 use servo_url::ImmutableOrigin;
 use storage_traits::cache_storage::{CacheStorageThreadMessage, CacheStorageThreadResponse};
 use storage_traits::client_storage::{StorageIdentifier, StorageProxyMap, StorageType};
 
-use crate::dom::Promise;
 use crate::dom::bindings::codegen::Bindings::CacheStorageBinding::CacheStorageMethods;
 use crate::dom::bindings::error::Error;
 use crate::dom::bindings::refcounted::Trusted;
@@ -23,6 +21,7 @@ use crate::dom::bindings::reflector::DomGlobal;
 use crate::dom::bindings::str::DOMString;
 use crate::dom::globalscope::GlobalScope;
 use crate::dom::serviceworker::cache::Cache;
+use crate::dom::{Promise, RootedPromise, TracedPromise};
 
 /// <https://w3c.github.io/ServiceWorker/#cachestorage>
 #[dom_struct]
@@ -30,12 +29,10 @@ pub(crate) struct CacheStorage {
     reflector_: Reflector,
 
     #[no_trace]
-    #[ignore_malloc_size_of = "GenericCallback"]
     callback: RefCell<Option<GenericCallback<CacheStorageThreadResponse>>>,
 
     // Dequeue of pending promises for backend operations.
-    #[conditional_malloc_size_of]
-    pending_promises: RefCell<VecDeque<Rc<Promise>>>,
+    pending_promises: RefCell<VecDeque<TracedPromise>>,
 }
 
 impl CacheStorage {
@@ -48,7 +45,7 @@ impl CacheStorage {
     }
 
     pub(crate) fn new(cx: &mut JSContext, global: &GlobalScope) -> DomRoot<CacheStorage> {
-        reflect_dom_object_with_cx(Box::new(CacheStorage::new_inherited()), global, cx)
+        reflect_dom_object(cx, Box::new(CacheStorage::new_inherited()), global)
     }
 
     /// Setup the callback to the backend service, if this hasn't been done already.
@@ -89,7 +86,12 @@ impl CacheStorage {
         let response = match response {
             Some(response) => response,
             None => {
-                let Some(promise) = self.pending_promises.borrow_mut().pop_front() else {
+                let Some(promise) = self
+                    .pending_promises
+                    .borrow_mut()
+                    .pop_front()
+                    .map(|promise| promise.root(cx))
+                else {
                     error!("No pending promise for CacheStorage response.");
                     return;
                 };
@@ -105,7 +107,12 @@ impl CacheStorage {
             // the steps resolving the promise with the result.
             // Note: spec forgets to queue a task see <https://github.com/w3c/ServiceWorker/issues/1831>
             CacheStorageThreadResponse::HasCacheResult(result) => {
-                let Some(promise) = self.pending_promises.borrow_mut().pop_front() else {
+                let Some(promise) = self
+                    .pending_promises
+                    .borrow_mut()
+                    .pop_front()
+                    .map(|promise| promise.root(cx))
+                else {
                     debug_assert!(false, "No pending promise for HasCacheResult response.");
                     return;
                 };
@@ -129,7 +136,12 @@ impl CacheStorage {
             // <https://w3c.github.io/ServiceWorker/#cache-storage-open>
             // the steps resolving the promise with the result.
             CacheStorageThreadResponse::OpenCacheResult { result, cache_name } => {
-                let Some(promise) = self.pending_promises.borrow_mut().pop_front() else {
+                let Some(promise) = self
+                    .pending_promises
+                    .borrow_mut()
+                    .pop_front()
+                    .map(|promise| promise.root(cx))
+                else {
                     debug_assert!(false, "No pending promise for OpenCacheResult response.");
                     return;
                 };
@@ -150,7 +162,12 @@ impl CacheStorage {
             },
             // <https://w3c.github.io/ServiceWorker/#dom-cachestorage-delete>
             CacheStorageThreadResponse::DeleteCacheResult(result) => {
-                let Some(promise) = self.pending_promises.borrow_mut().pop_front() else {
+                let Some(promise) = self
+                    .pending_promises
+                    .borrow_mut()
+                    .pop_front()
+                    .map(|promise| promise.root(cx))
+                else {
                     debug_assert!(false, "No pending promise for DeleteCacheResult response.");
                     return;
                 };
@@ -208,7 +225,7 @@ fn relevant_name_to_cache_map(
 
 impl CacheStorageMethods<crate::DomTypeHolder> for CacheStorage {
     /// <https://w3c.github.io/ServiceWorker/#cache-storage-has>
-    fn Has(&self, cx: &mut JSContext, cache_name: DOMString) -> Rc<Promise> {
+    fn Has(&self, cx: &mut JSContext, cache_name: DOMString) -> RootedPromise {
         let global = self.global();
 
         // Step 1: Let promise be a new promise.
@@ -243,13 +260,13 @@ impl CacheStorageMethods<crate::DomTypeHolder> for CacheStorage {
 
         self.pending_promises
             .borrow_mut()
-            .push_back(promise.clone());
+            .push_back(promise.to_traced());
 
         promise
     }
 
     /// <https://w3c.github.io/ServiceWorker/#dom-cachestorage-open>
-    fn Open(&self, cx: &mut JSContext, cache_name: DOMString) -> Rc<Promise> {
+    fn Open(&self, cx: &mut JSContext, cache_name: DOMString) -> RootedPromise {
         // Step 1: Let promise be a new promise.
         let global = self.global();
         let promise = Promise::new(cx, &global);
@@ -283,14 +300,14 @@ impl CacheStorageMethods<crate::DomTypeHolder> for CacheStorage {
 
         self.pending_promises
             .borrow_mut()
-            .push_back(promise.clone());
+            .push_back(promise.to_traced());
 
         // Step 3: Return promise.
         promise
     }
 
     /// <https://w3c.github.io/ServiceWorker/#dom-cachestorage-delete>
-    fn Delete(&self, cx: &mut JSContext, cache_name: DOMString) -> Rc<Promise> {
+    fn Delete(&self, cx: &mut JSContext, cache_name: DOMString) -> RootedPromise {
         // Step 1: Let promise be the result of running the algorithm specified in has(cacheName) method with cacheName.
         // Step 2: Return the result of reacting to promise with a fulfillment handler that,
         // when called with argument cacheExists, performs the following substeps:
@@ -331,7 +348,7 @@ impl CacheStorageMethods<crate::DomTypeHolder> for CacheStorage {
 
         self.pending_promises
             .borrow_mut()
-            .push_back(promise.clone());
+            .push_back(promise.to_traced());
 
         // Step 4: Return cacheJobPromise.
         promise

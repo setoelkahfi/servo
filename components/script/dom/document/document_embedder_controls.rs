@@ -2,15 +2,18 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
+#![cfg_attr(crown, allow(crown::jscontext_first_arg))]
+
 use std::cell::Cell;
 
+use app_units::Au;
 use embedder_traits::{
-    ContextMenuAction, ContextMenuElementInformation, ContextMenuElementInformationFlags,
-    ContextMenuItem, ContextMenuRequest, EditingActionEvent, EmbedderControlId,
-    EmbedderControlRequest, EmbedderControlResponse, EmbedderMsg,
+    ClipboardAction, ContextMenuAction, ContextMenuElementInformation,
+    ContextMenuElementInformationFlags, ContextMenuItem, ContextMenuRequest, EmbedderControlId,
+    EmbedderControlRequest, EmbedderControlResponse, EmbedderMsg, PipelineRect,
 };
 use euclid::{Point2D, Rect, Size2D};
-use js::context::{JSContext, NoGC};
+use js::context::JSContext;
 use net_traits::CoreResourceMsg;
 use net_traits::filemanager_thread::FileManagerThreadMsg;
 use rustc_hash::FxHashMap;
@@ -23,23 +26,20 @@ use script_bindings::inheritance::Castable;
 use script_bindings::root::{Dom, DomRoot};
 use servo_base::Epoch;
 use servo_base::generic_channel::GenericSend;
-use servo_constellation_traits::{LoadData, NavigationHistoryBehavior};
 use servo_url::ServoUrl;
-use webrender_api::units::{DeviceIntRect, DevicePoint};
+use style_traits::CSSPixel;
 
 use crate::dom::activation::Activatable;
-use crate::dom::bindings::refcounted::Trusted;
 use crate::dom::bindings::trace::NoTrace;
-use crate::dom::html::form_controls::text_control::TextControlElement;
 use crate::dom::inputevent::HitTestResult;
 use crate::dom::iterators::ShadowIncluding;
+use crate::dom::links::htmlhyperlinkelementutils::HyperlinkElementTraits;
 use crate::dom::node::{Node, NodeTraits};
 use crate::dom::types::{
     Element, HTMLAnchorElement, HTMLElement, HTMLImageElement, HTMLInputElement, HTMLSelectElement,
-    HTMLTextAreaElement, Window,
+    Window,
 };
 use crate::messaging::MainThreadScriptMsg;
-use crate::navigation::navigate;
 
 #[derive(JSTraceable, MallocSizeOf)]
 #[cfg_attr(crown, crown::unrooted_must_root_lint::must_root)]
@@ -102,34 +102,30 @@ impl DocumentEmbedderControls {
     #[cfg_attr(crown, expect(crown::unrooted_must_root))]
     pub(crate) fn show_embedder_control(
         &self,
+        cx: &mut JSContext,
         element: ControlElement,
         request: EmbedderControlRequest,
-        point: Option<DevicePoint>,
+        point: Option<Point2D<Au, CSSPixel>>,
     ) -> EmbedderControlId {
         let id = self.next_control_id();
         let rect = point
-            .map(|point| DeviceIntRect::from_origin_and_size(point.to_i32(), Size2D::zero()))
+            .map(|point| Rect::new(point, Size2D::zero()))
             .unwrap_or_else(|| {
-                let rect = element
+                element
                     .node()
                     .upcast::<Node>()
-                    .border_box()
-                    .unwrap_or_default();
-
-                let rect = Rect::new(
-                    Point2D::new(rect.origin.x.to_px(), rect.origin.y.to_px()),
-                    Size2D::new(rect.size.width.to_px(), rect.size.height.to_px()),
-                );
-
-                // FIXME: This is a CSS pixel rect relative to this frame, we need a DevicePixel rectangle
-                // relative to the entire WebView!
-                DeviceIntRect::from_untyped(&rect.to_box2d())
+                    .border_box(cx)
+                    .unwrap_or_default()
             });
 
         self.visible_elements
             .borrow_mut()
             .insert(id.index.into(), element);
 
+        let rect = PipelineRect {
+            rect,
+            pipeline_id: self.window.pipeline_id(),
+        };
         self.send_embedder_control_request(request, id, rect);
         id
     }
@@ -138,7 +134,7 @@ impl DocumentEmbedderControls {
         &self,
         request: EmbedderControlRequest,
         id: EmbedderControlId,
-        rect: DeviceIntRect,
+        rect: PipelineRect,
     ) {
         match request {
             EmbedderControlRequest::SelectElement(..) |
@@ -149,9 +145,8 @@ impl DocumentEmbedderControls {
                 .send_to_embedder(EmbedderMsg::ShowEmbedderControl(id, rect, request)),
             EmbedderControlRequest::FilePicker(file_picker_request) => {
                 let main_thread_sender = self.window.main_thread_script_chan().clone();
-                let callback = profile_traits::generic_callback::GenericCallback::new(
-                    self.window.as_global_scope().time_profiler_chan().clone(),
-                    move |result| {
+                let callback =
+                    profile_traits::generic_callback::GenericCallback::new(move |result| {
                         let Ok(embedder_control_response) = result else {
                             return;
                         };
@@ -163,9 +158,8 @@ impl DocumentEmbedderControls {
                         ) {
                             warn!("Could not send FileManager response to main thread: {error}")
                         }
-                    },
-                )
-                .expect("Could not create callback");
+                    })
+                    .expect("Could not create callback");
                 self.window
                     .as_global_scope()
                     .resource_threads()
@@ -178,11 +172,24 @@ impl DocumentEmbedderControls {
         }
     }
 
-    pub(crate) fn hide_embedder_control(&self, element: &Element) {
+    pub(crate) fn hide_all_embedder_controls(&self) {
+        self.hide_embedder_controls_given(|_| false)
+    }
+
+    pub(crate) fn hide_embedder_control_for_element(&self, element: &Element) {
+        self.hide_embedder_controls_given(|control_element| {
+            control_element.node() != element.upcast()
+        })
+    }
+
+    fn hide_embedder_controls_given<Callback>(&self, callback: Callback)
+    where
+        Callback: Fn(&ControlElement) -> bool,
+    {
         self.visible_elements
             .borrow_mut()
             .retain(|index, control_element| {
-                if control_element.node() != element.upcast() {
+                if callback(control_element) {
                     return true;
                 }
                 let id = EmbedderControlId {
@@ -247,7 +254,7 @@ impl DocumentEmbedderControls {
         }
     }
 
-    pub(crate) fn show_context_menu(&self, no_gc: &NoGC, hit_test_result: &HitTestResult) {
+    pub(crate) fn show_context_menu(&self, cx: &mut JSContext, hit_test_result: &HitTestResult) {
         {
             let mut visible_elements = self.visible_elements.borrow_mut();
             visible_elements.retain(|index, control_element| {
@@ -268,7 +275,6 @@ impl DocumentEmbedderControls {
 
         let mut anchor_element = None;
         let mut image_element = None;
-        let mut text_input_element = None;
         for node in hit_test_result
             .node
             .inclusive_ancestors(ShadowIncluding::Yes)
@@ -285,12 +291,6 @@ impl DocumentEmbedderControls {
             {
                 image_element = Some(DomRoot::from_ref(candidate_image_element))
             }
-
-            if text_input_element.is_none() &&
-                let Some(candidate_text_input_element) = node.as_text_input()
-            {
-                text_input_element = Some(candidate_text_input_element);
-            }
         }
 
         let mut info = ContextMenuElementInformation::default();
@@ -298,7 +298,7 @@ impl DocumentEmbedderControls {
         if let Some(anchor_element) = anchor_element.as_ref() {
             info.flags.insert(ContextMenuElementInformationFlags::Link);
             info.link_url = anchor_element
-                .full_href_url_for_user_interface(no_gc)
+                .full_href_url_for_user_interface()
                 .map(ServoUrl::into_url);
 
             items.extend(vec![
@@ -337,40 +337,45 @@ impl DocumentEmbedderControls {
             ]);
         }
 
-        if let Some(text_input_element) = &text_input_element {
-            let has_selection = text_input_element.has_uncollapsed_selection();
+        let document = self.window.Document();
+        let editing_context = document.editing_context(cx.no_gc(), &hit_test_result.node);
 
+        let has_selection = editing_context.has_uncollapsed_selection();
+        if has_selection {
+            info.flags
+                .insert(ContextMenuElementInformationFlags::Selection);
+        }
+
+        let can_cut = has_selection && editing_context.cutting_enabled();
+        let can_copy = has_selection && editing_context.copying_enabled();
+        let can_paste = editing_context.pasting_enabled();
+        if can_paste {
             info.flags
                 .insert(ContextMenuElementInformationFlags::EditableText);
-            if has_selection {
-                info.flags
-                    .insert(ContextMenuElementInformationFlags::Selection);
-            }
-
-            items.extend(vec![
-                ContextMenuItem::Item {
-                    label: "Cut".into(),
-                    action: ContextMenuAction::Cut,
-                    enabled: has_selection,
-                },
-                ContextMenuItem::Item {
-                    label: "Copy".into(),
-                    action: ContextMenuAction::Copy,
-                    enabled: has_selection,
-                },
-                ContextMenuItem::Item {
-                    label: "Paste".into(),
-                    action: ContextMenuAction::Paste,
-                    enabled: true,
-                },
-                ContextMenuItem::Item {
-                    label: "Select All".into(),
-                    action: ContextMenuAction::SelectAll,
-                    enabled: text_input_element.has_selectable_text(),
-                },
-                ContextMenuItem::Separator,
-            ]);
         }
+        items.extend(vec![
+            ContextMenuItem::Item {
+                label: "Cut".into(),
+                action: ContextMenuAction::Cut,
+                enabled: can_cut,
+            },
+            ContextMenuItem::Item {
+                label: "Copy".into(),
+                action: ContextMenuAction::Copy,
+                enabled: can_copy,
+            },
+            ContextMenuItem::Item {
+                label: "Paste".into(),
+                action: ContextMenuAction::Paste,
+                enabled: can_paste,
+            },
+            ContextMenuItem::Item {
+                label: "Select All".into(),
+                action: ContextMenuAction::SelectAll,
+                enabled: editing_context.has_selectable_text(),
+            },
+            ContextMenuItem::Separator,
+        ]);
 
         items.extend(vec![
             ContextMenuItem::Item {
@@ -391,17 +396,17 @@ impl DocumentEmbedderControls {
         ]);
 
         self.show_embedder_control(
+            cx,
             ControlElement::ContextMenu(ContextMenuNodes {
                 node: hit_test_result.node.as_traced(),
                 anchor_element: anchor_element.map(|element| element.as_traced()),
                 image_element: image_element.map(|element| element.as_traced()),
-                text_input_element: text_input_element.map(|element| element.as_traced()),
             }),
             EmbedderControlRequest::ContextMenu(ContextMenuRequest {
                 element_info: info,
                 items,
             }),
-            Some(hit_test_result.point_in_frame.cast_unit()),
+            Some(hit_test_result.point_in_frame.map(Au::from_f32_px)),
         );
     }
 }
@@ -415,8 +420,6 @@ pub(crate) struct ContextMenuNodes {
     anchor_element: Option<Dom<HTMLAnchorElement>>,
     /// The first inclusive ancestor of this node that is an `<img>` if one exists.
     image_element: Option<Dom<HTMLImageElement>>,
-    /// The first inclusive ancestor of this node which is a text entry field.
-    text_input_element: Option<Dom<Element>>,
 }
 
 impl ContextMenuNodes {
@@ -434,33 +437,6 @@ impl ContextMenuNodes {
             window.send_to_embedder(EmbedderMsg::SetClipboardText(window.webview_id(), string));
         };
 
-        let open_url_in_new_webview = |cx: &mut JSContext, url: ServoUrl| {
-            let Some(browsing_context) = document.browsing_context() else {
-                return;
-            };
-            let (browsing_context, new) =
-                browsing_context.choose_a_navigable(cx, "_blank".into(), true /* noopener */);
-            let Some(browsing_context) = browsing_context else {
-                return;
-            };
-            assert!(new);
-            let Some(target_document) = browsing_context.document() else {
-                return;
-            };
-
-            let target_window = target_document.window();
-            let target = Trusted::new(target_window);
-            let load_data = LoadData::new_for_new_unrelated_webview(url);
-            let task = task!(open_link_in_new_webview: move |cx| {
-                navigate(cx, &target.root(), NavigationHistoryBehavior::Replace, false, load_data);
-            });
-            target_document
-                .owner_global()
-                .task_manager()
-                .dom_manipulation_task_source()
-                .queue(task);
-        };
-
         match action {
             ContextMenuAction::GoBack => {
                 let _ = window.History(cx).Back();
@@ -469,7 +445,7 @@ impl ContextMenuNodes {
                 let _ = window.History(cx).Forward();
             },
             ContextMenuAction::Reload => {
-                window.Location(cx).reload_without_origin_check(cx);
+                window.Location(cx).reload_without_origin_check(cx, &window);
             },
             ContextMenuAction::CopyLink => {
                 let Some(anchor_element) = &self.anchor_element else {
@@ -477,7 +453,7 @@ impl ContextMenuNodes {
                 };
 
                 let url_string = anchor_element
-                    .full_href_url_for_user_interface(cx.no_gc())
+                    .full_href_url_for_user_interface()
                     .as_ref()
                     .map(ServoUrl::to_string)
                     .unwrap_or_else(|| String::from(anchor_element.Href(cx.no_gc())));
@@ -487,8 +463,8 @@ impl ContextMenuNodes {
                 let Some(anchor_element) = &self.anchor_element else {
                     return;
                 };
-                if let Some(url) = anchor_element.full_href_url_for_user_interface(cx.no_gc()) {
-                    open_url_in_new_webview(cx, url);
+                if let Some(url) = anchor_element.full_href_url_for_user_interface() {
+                    document.event_handler().open_url_in_new_webview(cx, url);
                 };
             },
             ContextMenuAction::CopyImageLink => {
@@ -507,78 +483,25 @@ impl ContextMenuNodes {
                     return;
                 };
                 if let Some(url) = image_element.full_image_url_for_user_interface() {
-                    open_url_in_new_webview(cx, url);
+                    document.event_handler().open_url_in_new_webview(cx, url);
                 }
             },
             ContextMenuAction::Cut => {
-                window.Document().event_handler().handle_editing_action(
-                    cx,
-                    self.text_input_element.as_deref().map(DomRoot::from_ref),
-                    EditingActionEvent::Cut,
-                );
+                let editing_context = document.editing_context(cx.no_gc(), &self.node);
+                document.handle_clipboard_action(cx, &editing_context, ClipboardAction::Cut);
             },
             ContextMenuAction::Copy => {
-                window.Document().event_handler().handle_editing_action(
-                    cx,
-                    self.text_input_element.as_deref().map(DomRoot::from_ref),
-                    EditingActionEvent::Copy,
-                );
+                let editing_context = document.editing_context(cx.no_gc(), &self.node);
+                document.handle_clipboard_action(cx, &editing_context, ClipboardAction::Copy);
             },
             ContextMenuAction::Paste => {
-                window.Document().event_handler().handle_editing_action(
-                    cx,
-                    self.text_input_element.as_deref().map(DomRoot::from_ref),
-                    EditingActionEvent::Paste,
-                );
+                let editing_context = document.editing_context(cx.no_gc(), &self.node);
+                document.handle_clipboard_action(cx, &editing_context, ClipboardAction::Paste);
             },
             ContextMenuAction::SelectAll => {
-                if let Some(text_input_element) = &self.text_input_element {
-                    text_input_element.select_all();
-                }
+                let editing_context = document.editing_context(cx.no_gc(), &self.node);
+                editing_context.select_all(cx);
             },
         }
-    }
-}
-
-impl Node {
-    fn as_text_input(&self) -> Option<DomRoot<Element>> {
-        if let Some(input_element) = self
-            .downcast::<HTMLInputElement>()
-            .filter(|input_element| input_element.is_textual_or_password())
-        {
-            return Some(DomRoot::from_ref(input_element.upcast::<Element>()));
-        }
-        self.downcast::<HTMLTextAreaElement>()
-            .map(Castable::upcast)
-            .map(DomRoot::from_ref)
-    }
-}
-
-impl Element {
-    fn has_uncollapsed_selection(&self) -> bool {
-        self.downcast::<HTMLTextAreaElement>()
-            .map(TextControlElement::has_uncollapsed_selection)
-            .or(self
-                .downcast::<HTMLInputElement>()
-                .map(TextControlElement::has_uncollapsed_selection))
-            .unwrap_or_default()
-    }
-
-    fn has_selectable_text(&self) -> bool {
-        self.downcast::<HTMLTextAreaElement>()
-            .map(TextControlElement::has_selectable_text)
-            .or(self
-                .downcast::<HTMLInputElement>()
-                .map(TextControlElement::has_selectable_text))
-            .unwrap_or_default()
-    }
-
-    fn select_all(&self) {
-        self.downcast::<HTMLTextAreaElement>()
-            .map(TextControlElement::select_all)
-            .or(self
-                .downcast::<HTMLInputElement>()
-                .map(TextControlElement::select_all))
-            .unwrap_or_default()
     }
 }

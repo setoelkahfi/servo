@@ -8,12 +8,14 @@ use dom_struct::dom_struct;
 use embedder_traits::{GamepadSupportedHapticEffects, GamepadUpdateType};
 use js::context::JSContext;
 use js::rust::MutableHandleValue;
-use script_bindings::reflector::{Reflector, reflect_dom_object_with_cx};
+use script_bindings::reflector::{Reflector, reflect_dom_object};
 
 use super::gamepadbutton::GamepadButton;
 use super::gamepadhapticactuator::GamepadHapticActuator;
 use super::gamepadpose::GamepadPose;
-use crate::dom::bindings::codegen::Bindings::GamepadBinding::{GamepadHand, GamepadMethods};
+use crate::dom::bindings::codegen::Bindings::GamepadBinding::{
+    GamepadHand, GamepadMappingType, GamepadMethods,
+};
 use crate::dom::bindings::frozenarray::CachedFrozenArray;
 use crate::dom::bindings::inheritance::Castable;
 use crate::dom::bindings::num::Finite;
@@ -40,11 +42,9 @@ pub(crate) struct Gamepad {
     index: Cell<i32>,
     connected: Cell<bool>,
     timestamp: Cell<f64>,
-    mapping_type: String,
-    #[ignore_malloc_size_of = "mozjs"]
+    mapping_type: GamepadMappingType,
     frozen_buttons: CachedFrozenArray,
     buttons: Vec<Dom<GamepadButton>>,
-    #[ignore_malloc_size_of = "mozjs"]
     frozen_axes: CachedFrozenArray,
     axes: RefCell<Vec<f64>>,
     pose: Option<Dom<GamepadPose>>,
@@ -64,7 +64,7 @@ impl Gamepad {
         index: i32,
         connected: bool,
         timestamp: f64,
-        mapping_type: String,
+        mapping_type: GamepadMappingType,
         buttons: &[&GamepadButton],
         pose: Option<&GamepadPose>,
         hand: GamepadHand,
@@ -111,7 +111,7 @@ impl Gamepad {
         window: &Window,
         gamepad_id: u32,
         id: String,
-        mapping_type: String,
+        mapping_type: GamepadMappingType,
         axis_bounds: (f64, f64),
         button_bounds: (f64, f64),
         supported_haptic_effects: GamepadSupportedHapticEffects,
@@ -122,7 +122,8 @@ impl Gamepad {
         let vibration_actuator =
             GamepadHapticActuator::new(cx, window, gamepad_id, supported_haptic_effects);
         let index = if xr { -1 } else { 0 };
-        let gamepad = reflect_dom_object_with_cx(
+        let gamepad = reflect_dom_object(
+            cx,
             Box::new(Gamepad::new_inherited(
                 gamepad_id,
                 id,
@@ -130,7 +131,7 @@ impl Gamepad {
                 true,
                 0.,
                 mapping_type,
-                buttons.r(),
+                buttons.as_ref_slice(),
                 None,
                 GamepadHand::_empty,
                 axis_bounds,
@@ -138,7 +139,6 @@ impl Gamepad {
                 &vibration_actuator,
             )),
             window,
-            cx,
         );
         gamepad.init_axes();
         gamepad
@@ -167,8 +167,8 @@ impl GamepadMethods<crate::DomTypeHolder> for Gamepad {
     }
 
     /// <https://w3c.github.io/gamepad/#dom-gamepad-mapping>
-    fn Mapping(&self) -> DOMString {
-        DOMString::from(self.mapping_type.clone())
+    fn Mapping(&self) -> GamepadMappingType {
+        self.mapping_type
     }
 
     /// <https://w3c.github.io/gamepad/#dom-gamepad-axes>

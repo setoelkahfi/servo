@@ -1,13 +1,11 @@
-import java.util.regex.Pattern
-
 plugins {
     alias(libs.plugins.android.application)
     alias(libs.plugins.compose)
+    alias(libs.plugins.kotlin.serialization)
 }
 
 android {
-    compileSdk = 37
-    buildToolsVersion = "36.0.0"
+    compileSdk { version = release(37) { minorApiLevel = 2 } }
 
     namespace = "org.servo.servoshell"
 
@@ -32,30 +30,26 @@ android {
     }
 
     compileOptions {
-        sourceCompatibility = JavaVersion.VERSION_1_8
-        targetCompatibility = JavaVersion.VERSION_1_8
+        sourceCompatibility = JavaVersion.VERSION_11
+        targetCompatibility = JavaVersion.VERSION_11
     }
 
-    val signingKeyInfo = getSigningKeyInfo()
-
-    if (signingKeyInfo != null) {
+    System.getenv("APK_SIGNING_KEY_STORE_PATH")?.let { storeFilePath ->
         signingConfigs {
             register("release") {
-                storeFile = signingKeyInfo["storeFile"] as File
-                storePassword = signingKeyInfo["storePassword"] as String
-                keyAlias = signingKeyInfo["keyAlias"] as String
-                keyPassword = signingKeyInfo["keyPassword"] as String
+                storeFile = file(storeFilePath)
+                storePassword = System.getenv("APK_SIGNING_KEY_STORE_PASS")!!
+                keyAlias = System.getenv("APK_SIGNING_KEY_ALIAS")!!
+                keyPassword = System.getenv("APK_SIGNING_KEY_PASS")!!
             }
         }
     }
 
     buildTypes {
-        debug {
-        }
+        debug {}
 
         release {
-            signingConfig =
-                signingConfigs.getByName(if (signingKeyInfo != null) "release" else "debug")
+            signingConfig = signingConfigs.findByName("release") ?: signingConfigs["debug"]
             isMinifyEnabled = false
             proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"))
         }
@@ -65,54 +59,37 @@ android {
         val debug = getByName("debug")
         val release = getByName("release")
 
-
         register("armv7Debug") {
             initWith(debug)
-            ndk {
-                abiFilters.add(getNDKAbi("armv7"))
-            }
+            ndk { abiFilters.add(getNDKAbi("armv7")) }
         }
         register("armv7Release") {
             initWith(release)
-            ndk {
-                abiFilters.add(getNDKAbi("armv7"))
-            }
+            ndk { abiFilters.add(getNDKAbi("armv7")) }
         }
         register("arm64Debug") {
             initWith(debug)
-            ndk {
-                abiFilters.add(getNDKAbi("arm64"))
-            }
+            ndk { abiFilters.add(getNDKAbi("arm64")) }
         }
         register("arm64Release") {
             initWith(release)
-            ndk {
-                abiFilters.add(getNDKAbi("arm64"))
-            }
+            ndk { abiFilters.add(getNDKAbi("arm64")) }
         }
         register("x86Debug") {
             initWith(debug)
-            ndk {
-                abiFilters.add(getNDKAbi("x86"))
-            }
+            ndk { abiFilters.add(getNDKAbi("x86")) }
         }
         register("x86Release") {
             initWith(release)
-            ndk {
-                abiFilters.add(getNDKAbi("x86"))
-            }
+            ndk { abiFilters.add(getNDKAbi("x86")) }
         }
         register("x64Debug") {
             initWith(debug)
-            ndk {
-                abiFilters.add(getNDKAbi("x64"))
-            }
+            ndk { abiFilters.add(getNDKAbi("x64")) }
         }
         register("x64Release") {
             initWith(release)
-            ndk {
-                abiFilters.add(getNDKAbi("x64"))
-            }
+            ndk { abiFilters.add(getNDKAbi("x64")) }
         }
     }
 }
@@ -126,38 +103,11 @@ androidComponents {
     }
 }
 
-project.afterEvaluate {
-    android.applicationVariants.forEach { variant ->
-        val pattern = Pattern.compile("^([\\w\\d]+)(Debug|Release)")
-        val matcher = pattern.matcher(variant.name)
-        if (!matcher.find()) {
-            throw GradleException("Invalid variant name for output: " + variant.name)
-        }
-        val arch = matcher.group(1)
-        val debug = variant.name.contains("Debug")
-        val finalFolder = getTargetDir(debug, arch)
-        val finalFile = File(finalFolder, "servoapp.apk")
-        variant.outputs.forEach { output ->
-            val copyAndRenameAPKTask =
-                project.task<Copy>("copyAndRename${variant.name.capitalize()}APK") {
-                    from(output.outputFile.parent)
-                    into(finalFolder)
-                    include(output.outputFile.name)
-                    rename(output.outputFile.name, finalFile.name)
-                }
-            variant.assembleProvider.get().finalizedBy(copyAndRenameAPKTask)
-        }
-    }
-}
-
 dependencies {
-    if (findProject(":servoview-local") != null) {
-        implementation(project(":servoview-local"))
-    } else {
-        implementation(project(":servoview"))
-    }
+    implementation(project(":servoview"))
     implementation(libs.androidx.activity.compose)
     implementation(libs.androidx.material3.compose)
     implementation(libs.androidx.material3.compose.adaptive)
     implementation(libs.androidx.preference)
+    implementation(libs.kotlinx.serialization.json)
 }

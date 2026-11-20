@@ -2,10 +2,12 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
+#![cfg_attr(crown, allow(crown::jscontext_first_arg))]
+
 use dom_struct::dom_struct;
 use js::context::JSContext;
 use script_bindings::cell::DomRefCell;
-use script_bindings::reflector::{Reflector, reflect_dom_object_with_cx};
+use script_bindings::reflector::{Reflector, reflect_dom_object};
 use servo_canvas_traits::canvas::{
     CanvasGradientStop, FillOrStrokeStyle, LinearGradientStyle, RadialGradientStyle,
 };
@@ -18,7 +20,7 @@ use crate::dom::bindings::root::DomRoot;
 use crate::dom::bindings::str::DOMString;
 use crate::dom::globalscope::GlobalScope;
 
-// https://html.spec.whatwg.org/multipage/#canvasgradient
+/// <https://html.spec.whatwg.org/multipage/#canvasgradient>
 #[dom_struct]
 pub(crate) struct CanvasGradient {
     reflector_: Reflector,
@@ -47,18 +49,23 @@ impl CanvasGradient {
         cx: &mut JSContext,
         style: CanvasGradientStyle,
     ) -> DomRoot<CanvasGradient> {
-        reflect_dom_object_with_cx(Box::new(CanvasGradient::new_inherited(style)), global, cx)
+        reflect_dom_object(cx, Box::new(CanvasGradient::new_inherited(style)), global)
     }
 }
 
 impl CanvasGradientMethods<crate::DomTypeHolder> for CanvasGradient {
     /// <https://html.spec.whatwg.org/multipage/#dom-canvasgradient-addcolorstop>
-    fn AddColorStop(&self, offset: Finite<f64>, color: DOMString) -> ErrorResult {
+    fn AddColorStop(
+        &self,
+        cx: &mut JSContext,
+        offset: Finite<f64>,
+        color: DOMString,
+    ) -> ErrorResult {
         if *offset < 0f64 || *offset > 1f64 {
             return Err(Error::IndexSize(None));
         }
 
-        let color = match parse_color(None, &color) {
+        let color = match parse_color(cx, None, &color) {
             Ok(color) => color,
             Err(_) => return Err(Error::Syntax(None)),
         };

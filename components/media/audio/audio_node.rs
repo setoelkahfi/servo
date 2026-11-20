@@ -15,6 +15,8 @@ use crate::block::{Block, Chunk, Tick};
 use crate::buffer_source_node::{AudioBufferSourceNodeMessage, AudioBufferSourceNodeOptions};
 use crate::channel_node::ChannelNodeOptions;
 use crate::constant_source_node::ConstantSourceNodeOptions;
+use crate::convolver_node::{ConvolverNodeMessage, ConvolverNodeOptions};
+use crate::delay_node::DelayNodeOptions;
 use crate::gain_node::GainNodeOptions;
 use crate::iir_filter_node::IIRFilterNodeOptions;
 use crate::media_element_source_node::MediaElementSourceNodeMessage;
@@ -34,13 +36,13 @@ pub enum AudioNodeInit {
     ChannelMergerNode(ChannelNodeOptions),
     ChannelSplitterNode,
     ConstantSourceNode(ConstantSourceNodeOptions),
-    ConvolverNode,
-    DelayNode,
+    ConvolverNode(ConvolverNodeOptions),
+    DelayNode(DelayNodeOptions),
     DynamicsCompressionNode,
     GainNode(GainNodeOptions),
     IIRFilterNode(IIRFilterNodeOptions),
     MediaElementSourceNode,
-    MediaStreamDestinationNode(#[ignore_malloc_size_of = "Fn"] Box<dyn MediaSocket>),
+    MediaStreamDestinationNode(Box<dyn MediaSocket>),
     MediaStreamSourceNode(MediaStreamId),
     OscillatorNode(OscillatorNodeOptions),
     PannerNode(PannerNodeOptions),
@@ -64,6 +66,8 @@ pub enum AudioNodeType {
     ConstantSourceNode,
     ConvolverNode,
     DelayNode,
+    DelayReader, // Only constructed internally by the DelayNode
+    DelayWriter, // Only constructed internally by the DelayNode
     DestinationNode,
     DynamicsCompressionNode,
     GainNode,
@@ -107,7 +111,7 @@ impl BlockInfo {
     }
 }
 
-#[derive(MallocSizeOf)]
+#[derive(Clone, Copy, MallocSizeOf)]
 pub struct ChannelInfo {
     pub count: u8,
     pub mode: ChannelCountMode,
@@ -181,6 +185,7 @@ pub(crate) trait AudioNodeEngine: Send + AudioNodeCommon {
             AudioNodeMessage::SetParam(id, event) => self
                 .get_param(id)
                 .insert_event(event.convert_to_event(sample_rate)),
+            AudioNodeMessage::SetParamRange(id, range) => self.get_param(id).update_range(range),
             AudioNodeMessage::SetParamRate(id, rate) => self.get_param(id).set_rate(rate),
             _ => self.message_specific(msg, sample_rate),
         }
@@ -238,6 +243,7 @@ pub enum AudioNodeMessage {
     AudioBufferSourceNode(AudioBufferSourceNodeMessage),
     AudioScheduledSourceNode(AudioScheduledSourceNodeMessage),
     BiquadFilterNode(BiquadFilterNodeMessage),
+    ConvolverNode(ConvolverNodeMessage),
     GetParamValue(ParamType, Sender<f32>),
     MediaElementSourceNode(MediaElementSourceNodeMessage),
     OscillatorNode(OscillatorNodeMessage),
@@ -246,6 +252,7 @@ pub enum AudioNodeMessage {
     SetChannelMode(ChannelCountMode),
     SetChannelInterpretation(ChannelInterpretation),
     SetParam(ParamType, UserAutomationEvent),
+    SetParamRange(ParamType, (f32, f32)),
     SetParamRate(ParamType, ParamRate),
     WaveShaperNode(WaveShaperNodeMessage),
 }

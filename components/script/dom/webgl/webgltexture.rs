@@ -107,13 +107,13 @@ impl Drop for DroppableWebGLTexture {
     }
 }
 
-#[dom_struct(associated_memory)]
+#[dom_struct]
 pub(crate) struct WebGLTexture {
     webgl_object: WebGLObject,
     /// The target to which this texture was bound the first time
     target: Cell<Option<u32>>,
     /// Stores information about mipmap levels and cubemap faces.
-    #[ignore_malloc_size_of = "Arrays are cumbersome"]
+    #[ignore_malloc_size_of = "I do not know how"]
     image_info_array: DomRefCell<[Option<ImageInfo>; MAX_LEVEL_COUNT * MAX_FACE_COUNT]>,
     /// Face count can only be 1 or 6
     face_count: Cell<u8>,
@@ -281,7 +281,11 @@ impl WebGLTexture {
             return Err(WebGLError::InvalidOperation);
         }
 
-        if !base_image_info.is_power_of_two() {
+        let Some(context) = self.upcast().context() else {
+            return Err(WebGLError::ContextLost);
+        };
+        // Only WebGL 1 restricts mipmaps to power-of-two sizes.
+        if context.webgl_version() == WebGLVersion::WebGL1 && !base_image_info.is_power_of_two() {
             return Err(WebGLError::InvalidOperation);
         }
 
@@ -623,7 +627,9 @@ impl WebGLTexture {
 
             width = cmp::max(1, width / 2);
             height = cmp::max(1, height / 2);
-            depth = cmp::max(1, depth / 2);
+            if target == TexImageTarget::Texture3D {
+                depth = cmp::max(1, depth / 2);
+            }
         }
 
         self.immutable_levels.set(Some(levels));

@@ -10,7 +10,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::thread;
 
-use log::{debug, error, warn};
+use log::{debug, error, trace, warn};
 use malloc_size_of::MallocSizeOf;
 use malloc_size_of_derive::MallocSizeOf;
 use profile_traits::generic_callback::GenericCallback;
@@ -1065,6 +1065,7 @@ impl IndexedDBManager {
                     continue;
                 },
             };
+            trace!("got message: {:?}", message);
             match message {
                 IndexedDBThreadMsg::Sync(SyncOperation::Exit(sender)) => {
                     let _ = sender.send(());
@@ -1432,7 +1433,7 @@ impl IndexedDBManager {
     }
 
     /// Aborting the current upgrade for an origin.
-    // https://w3c.github.io/IndexedDB/#abort-an-upgrade-transaction
+    /// <https://w3c.github.io/IndexedDB/#abort-an-upgrade-transaction>
     fn abort_pending_upgrade(
         &mut self,
         name: String,

@@ -2,6 +2,8 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
 
+#![cfg_attr(crown, allow(crown::jscontext_first_arg))]
+
 use std::cell::Cell;
 use std::rc::Rc;
 
@@ -19,10 +21,11 @@ use crate::dom::bindings::refcounted::Trusted;
 use crate::dom::bindings::reflector::DomGlobal;
 use crate::dom::bindings::root::{Dom, DomRoot};
 use crate::dom::globalscope::GlobalScope;
-use crate::dom::promise::Promise;
+use crate::dom::promise::{RootedPromise, TracedPromise};
 use crate::dom::stream::byteteeunderlyingsource::ByteTeeUnderlyingSource;
 use crate::dom::stream::readablestream::ReadableStream;
-use crate::runtime::microtask::MicrotaskRunnable;
+use crate::realms::enter_auto_realm;
+use crate::runtime::job_queue::MicrotaskRunnable;
 
 #[derive(JSTraceable, MallocSizeOf)]
 pub(crate) struct ByteTeeReadIntoRequestMicrotask {
@@ -33,8 +36,10 @@ pub(crate) struct ByteTeeReadIntoRequestMicrotask {
 
 impl MicrotaskRunnable for ByteTeeReadIntoRequestMicrotask {
     fn handler(&self, cx: &mut JSContext) {
-        self.tee_read_request
-            .root()
+        let tee_read_request = self.tee_read_request.root();
+        let mut realm = enter_auto_realm(cx, &*tee_read_request);
+        let cx = &mut realm;
+        tee_read_request
             .chunk_steps(&self.chunk, cx)
             .expect("Failed to enqueue chunk");
     }
@@ -57,8 +62,7 @@ pub(crate) struct ByteTeeReadIntoRequest {
     canceled_1: Rc<Cell<bool>>,
     #[conditional_malloc_size_of]
     canceled_2: Rc<Cell<bool>>,
-    #[conditional_malloc_size_of]
-    cancel_promise: Rc<Promise>,
+    cancel_promise: TracedPromise,
     tee_underlying_source: Dom<ByteTeeUnderlyingSource>,
 }
 impl ByteTeeReadIntoRequest {
@@ -74,7 +78,7 @@ impl ByteTeeReadIntoRequest {
         reading: Rc<Cell<bool>>,
         canceled_1: Rc<Cell<bool>>,
         canceled_2: Rc<Cell<bool>>,
-        cancel_promise: Rc<Promise>,
+        cancel_promise: &RootedPromise,
         tee_underlying_source: &ByteTeeUnderlyingSource,
         global: &GlobalScope,
     ) -> DomRoot<Self> {
@@ -91,7 +95,7 @@ impl ByteTeeReadIntoRequest {
                 reading,
                 canceled_1,
                 canceled_2,
-                cancel_promise,
+                cancel_promise: cancel_promise.to_traced(),
                 tee_underlying_source: Dom::from_ref(tee_underlying_source),
             }),
             global,

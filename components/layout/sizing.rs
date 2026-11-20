@@ -11,15 +11,16 @@ use std::sync::atomic::Ordering;
 use app_units::{Au, MAX_AU};
 use malloc_size_of_derive::MallocSizeOf;
 use style::Zero;
-use style::logical_geometry::Direction;
+use style::logical_geometry::LogicalAxis;
 use style::values::computed::{
     LengthPercentage, MaxSize as StyleMaxSize, Percentage, Size as StyleSize,
 };
 
+use crate::containing_block::{ConstraintSpace, IndefiniteContainingBlock};
 use crate::context::LayoutContext;
+use crate::geom::LogicalVec2;
 use crate::layout_box_base::LayoutBoxBase;
 use crate::style_ext::{AspectRatio, Clamp, ComputedValuesExt, ContentBoxSizesAndPBM, LayoutStyle};
-use crate::{ConstraintSpace, IndefiniteContainingBlock, LogicalVec2};
 
 #[derive(PartialEq)]
 pub(crate) enum IntrinsicSizingMode {
@@ -134,6 +135,7 @@ pub(crate) fn outer_inline(
     auto_block_size_stretches_to_containing_block: bool,
     is_replaced: bool,
     establishes_containing_block: bool,
+    skippable_for_block_percentage_quirk: bool,
     get_preferred_aspect_ratio: impl FnOnce(&LogicalVec2<Au>) -> Option<AspectRatio>,
     get_inline_content_size: impl FnOnce(&ConstraintSpace) -> InlineContentSizesResult,
     get_tentative_block_content_size: impl FnOnce(Option<AspectRatio>) -> Option<ContentSizes>,
@@ -157,10 +159,7 @@ pub(crate) fn outer_inline(
     let content_size = LazyCell::new(|| {
         depends_on_contents.set(true);
         let constraint_space = if establishes_containing_block {
-            let available_block_size = containing_block
-                .size
-                .block
-                .map(|v| Au::zero().max(v - pbm_sums.block));
+            let block_stretch_size = containing_block.block_stretch_size(pbm_sums.block);
             let automatic_size = if preferred_size_computes_to_auto.block &&
                 auto_block_size_stretches_to_containing_block
             {
@@ -170,13 +169,13 @@ pub(crate) fn outer_inline(
                 Size::FitContent
             };
             let aspect_ratio = get_preferred_aspect_ratio(&pbm.padding_border_sums);
-            let block_size =
+            let mut block_size =
                 if let Some(block_content_size) = get_tentative_block_content_size(aspect_ratio) {
                     SizeConstraint::Definite(content_box_sizes.block.resolve(
-                        Direction::Block,
+                        LogicalAxis::Block,
                         automatic_size,
                         || auto_minimum.block,
-                        available_block_size,
+                        block_stretch_size,
                         || block_content_size,
                         is_table,
                     ))
@@ -184,23 +183,34 @@ pub(crate) fn outer_inline(
                     content_box_sizes.block.resolve_extrinsic(
                         automatic_size,
                         auto_minimum.block,
-                        available_block_size,
+                        block_stretch_size,
                     )
                 };
-            ConstraintSpace::new(block_size, style, aspect_ratio)
+            let mut has_quirky_block_size = false;
+            if skippable_for_block_percentage_quirk {
+                has_quirky_block_size = !block_size.is_definite();
+                block_size
+                    .replace_if_indefinite_with(containing_block.maybe_quirky_block_size().into())
+            }
+            if has_quirky_block_size {
+                ConstraintSpace::new_quirky(block_size, style, aspect_ratio)
+            } else {
+                ConstraintSpace::new(block_size, style, aspect_ratio)
+            }
         } else {
             // Even if the size doesn't directly depend on block constraints, since this box
             // doesn't establish a containing block, its contents can depend on its block
             // constraints. And thus have a dependency via the intrinsic size.
             depends_on_block_constraints = true;
+            let block_size = containing_block.maybe_quirky_block_size().into();
             // This assumes that there is no preferred aspect ratio, or that there is no
             // block size constraint to be transferred so the ratio is irrelevant.
             // We only get into here for anonymous blocks, for which the assumption holds.
-            ConstraintSpace::new(
-                containing_block.size.block.into(),
-                containing_block.style,
-                None,
-            )
+            if containing_block.has_quirky_block_size() {
+                ConstraintSpace::new_quirky(block_size, containing_block.style, None)
+            } else {
+                ConstraintSpace::new(block_size, containing_block.style, None)
+            }
         };
         get_inline_content_size(&constraint_space)
     });
@@ -228,6 +238,7 @@ pub(crate) fn outer_inline(
                 (size, size, content_size.depends_on_block_constraints)
             },
             Size::Stretch => return stretch_values,
+            Size::QuirkyStretch => unreachable!("Quirky stretch can't be an inline size"),
         })
     };
     let (mut preferred_min_content, preferred_max_content, preferred_depends_on_block_constraints) =
@@ -348,6 +359,12 @@ pub(crate) enum Size<T> {
     FitContentFunction(T),
     /// <https://drafts.csswg.org/css-sizing-4/#valdef-width-stretch>
     Stretch,
+    /// Represents the special stretching behavior of `<html>` and `<body>`
+    /// in quirks mode. Roughly, it behaves as the maximum of `fit-content`
+    /// and `stretch`. It can only be used as a preferred block size.
+    /// <https://quirks.spec.whatwg.org/#the-html-element-fills-the-viewport-quirk>
+    /// <https://quirks.spec.whatwg.org/#the-body-element-fills-the-html-element-quirk>
+    QuirkyStretch,
     /// Represents a numeric `<length-percentage>`, but resolved as a `T`.
     /// <https://drafts.csswg.org/css-sizing/#valdef-width-length-percentage-0>
     Numeric(T),
@@ -387,20 +404,21 @@ impl<T: Clone> Size<T> {
             Size::FitContent => Size::FitContent,
             Size::FitContentFunction(size) => Size::FitContentFunction(f(size.clone())),
             Size::Stretch => Size::Stretch,
+            Size::QuirkyStretch => Size::QuirkyStretch,
             Size::Numeric(numeric) => Size::Numeric(f(numeric.clone())),
         }
     }
 }
 
-impl From<StyleSize> for Size<LengthPercentage> {
-    fn from(size: StyleSize) -> Self {
+impl From<&StyleSize> for Size<LengthPercentage> {
+    fn from(size: &StyleSize) -> Self {
         match size {
-            StyleSize::LengthPercentage(lp) => Size::Numeric(lp.0),
+            StyleSize::LengthPercentage(lp) => Size::Numeric(lp.0.clone()),
             StyleSize::Auto => Size::Initial,
             StyleSize::MinContent => Size::MinContent,
             StyleSize::MaxContent => Size::MaxContent,
             StyleSize::FitContent => Size::FitContent,
-            StyleSize::FitContentFunction(lp) => Size::FitContentFunction(lp.0),
+            StyleSize::FitContentFunction(lp) => Size::FitContentFunction(lp.0.clone()),
             StyleSize::Stretch | StyleSize::WebkitFillAvailable => Size::Stretch,
             StyleSize::AnchorSizeFunction(_) | StyleSize::AnchorContainingCalcFunction(_) => {
                 unreachable!("anchor-size() should be disabled")
@@ -409,15 +427,15 @@ impl From<StyleSize> for Size<LengthPercentage> {
     }
 }
 
-impl From<StyleMaxSize> for Size<LengthPercentage> {
-    fn from(max_size: StyleMaxSize) -> Self {
+impl From<&StyleMaxSize> for Size<LengthPercentage> {
+    fn from(max_size: &StyleMaxSize) -> Self {
         match max_size {
-            StyleMaxSize::LengthPercentage(lp) => Size::Numeric(lp.0),
+            StyleMaxSize::LengthPercentage(lp) => Size::Numeric(lp.0.clone()),
             StyleMaxSize::None => Size::Initial,
             StyleMaxSize::MinContent => Size::MinContent,
             StyleMaxSize::MaxContent => Size::MaxContent,
             StyleMaxSize::FitContent => Size::FitContent,
-            StyleMaxSize::FitContentFunction(lp) => Size::FitContentFunction(lp.0),
+            StyleMaxSize::FitContentFunction(lp) => Size::FitContentFunction(lp.0.clone()),
             StyleMaxSize::Stretch | StyleMaxSize::WebkitFillAvailable => Size::Stretch,
             StyleMaxSize::AnchorSizeFunction(_) | StyleMaxSize::AnchorContainingCalcFunction(_) => {
                 unreachable!("anchor-size() should be disabled")
@@ -508,6 +526,9 @@ impl Size<Au> {
                 content_size.shrink_to_fit(stretch_size.unwrap_or_else(|| content_size.max_content))
             },
             Self::Stretch => stretch_size.unwrap_or_else(|| content_size.max_content),
+            Self::QuirkyStretch => stretch_size
+                .unwrap_or_else(|| content_size.max_content)
+                .max(content_size.min_content),
             Self::Numeric(numeric) => *numeric,
         }
     }
@@ -529,6 +550,7 @@ impl Size<Au> {
             Self::FitContentFunction(size) => content_size.shrink_to_fit(*size),
             Self::FitContent => content_size.shrink_to_fit(stretch_size.unwrap_or_default()),
             Self::Stretch => stretch_size.unwrap_or_default(),
+            Self::QuirkyStretch => unreachable!("Quirky stretch can't be a min size"),
             Self::Numeric(numeric) => *numeric,
         };
         if is_table {
@@ -561,6 +583,7 @@ impl Size<Au> {
             Self::FitContentFunction(size) => content_size.shrink_to_fit(*size),
             Self::FitContent => content_size.shrink_to_fit(stretch_size.unwrap_or(MAX_AU)),
             Self::Stretch => return stretch_size,
+            Self::QuirkyStretch => unreachable!("Quirky stretch can't be a max size"),
             Self::Numeric(numeric) => *numeric,
         })
     }
@@ -570,7 +593,7 @@ impl Size<Au> {
     /// <https://drafts.csswg.org/css-sizing-3/#extrinsic>
     ///
     /// Returns `None` if either:
-    /// - The size is intrinsic.
+    /// - The size is intrinsic. A quirky stretch doesn't count as intrinsic here.
     /// - The size is the initial one.
     ///   TODO: should we allow it to behave as `stretch` instead of assuming it's intrinsic?
     /// - The provided `stretch_size` is `None` but we need its value.
@@ -582,7 +605,7 @@ impl Size<Au> {
             Self::MaxContent |
             Self::FitContent |
             Self::FitContentFunction(_) => None,
-            Self::Stretch => stretch_size,
+            Self::Stretch | Self::QuirkyStretch => stretch_size,
             Self::Numeric(numeric) => Some(*numeric),
         }
     }
@@ -635,6 +658,13 @@ impl SizeConstraint {
             Self::MinMax(min, _) => min,
         }
     }
+
+    #[inline]
+    pub(crate) fn replace_if_indefinite_with(&mut self, replacement: Self) {
+        if !self.is_definite() {
+            *self = replacement
+        }
+    }
 }
 
 impl From<Option<Au>> for SizeConstraint {
@@ -667,14 +697,14 @@ impl Sizes {
     #[inline]
     pub(crate) fn resolve(
         &self,
-        axis: Direction,
+        axis: LogicalAxis,
         automatic_size: Size<Au>,
         get_automatic_minimum_size: impl FnOnce() -> Au,
         stretch_size: Option<Au>,
         get_content_size: impl FnOnce() -> ContentSizes,
         is_table: bool,
     ) -> Au {
-        if is_table && axis == Direction::Block {
+        if is_table && axis == LogicalAxis::Block {
             // The intrinsic block size of a table already takes sizing properties into account,
             // but it can be a smaller amount if there are collapsed rows.
             // Therefore, disregard sizing properties and just defer to the intrinsic size.
@@ -769,7 +799,7 @@ impl Sizes {
 
 struct LazySizeData<'a> {
     sizes: &'a Sizes,
-    axis: Direction,
+    axis: LogicalAxis,
     automatic_size: Size<Au>,
     get_automatic_minimum_size: fn() -> Au,
     stretch_size: Option<Au>,
@@ -787,7 +817,7 @@ pub(crate) struct LazySize<'a> {
 impl<'a> LazySize<'a> {
     pub(crate) fn new(
         sizes: &'a Sizes,
-        axis: Direction,
+        axis: LogicalAxis,
         automatic_size: Size<Au>,
         get_automatic_minimum_size: fn() -> Au,
         stretch_size: Option<Au>,

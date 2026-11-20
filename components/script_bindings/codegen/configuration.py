@@ -11,21 +11,21 @@ import os
 from typing import Any, TypeVar
 
 from WebIDL import (
-    IDLExternalInterface,
-    IDLSequenceType,
-    IDLWrapperType,
-    WebIDLError,
+    IDLAttribute,
+    IDLCallback,
+    IDLDictionary,
     IDLEnum,
+    IDLExternalInterface,
+    IDLInterfaceMember,
+    IDLInterfaceOrNamespace,
+    IDLMethod,
     IDLObject,
     IDLObjectWithIdentifier,
+    IDLSequenceType,
     IDLType,
     IDLTypedef,
-    IDLInterfaceOrNamespace,
-    IDLDictionary,
-    IDLCallback,
-    IDLAttribute,
-    IDLMethod,
-    IDLInterfaceMember,
+    IDLWrapperType,
+    WebIDLError,
 )
 
 TargetType = TypeVar('TargetType')
@@ -218,7 +218,6 @@ class DescriptorProvider:
         """
         return self.config.getDescriptor(interfaceName)
 
-
 def MemberIsLegacyUnforgeable(member: IDLAttribute | IDLMethod, descriptor: Descriptor) -> bool:
     return ((member.isAttr() or member.isMethod())
             and not member.isStatic()
@@ -275,7 +274,7 @@ class Descriptor(DescriptorProvider):
         elif self.interface.isCallback():
             ty = 'crate::codegen::GenericBindings::%sBinding::%s' % (ifaceName, ifaceName)
             pathDefault = ty
-            self.returnType = "Rc<%s<D>>" % ty
+            self.returnType = "RootedCallback<%s<D>>" % ty
             self.argumentType = "???"
             self.nativeType = ty
         else:
@@ -315,7 +314,6 @@ class Descriptor(DescriptorProvider):
         self.weakReferenceable = desc.get('weakReferenceable', False)
         self.useSystemCompartment = desc.get('useSystemCompartment', False)
         self.allowDropImpl = desc.get('allowDropImpl', False)
-        self.useRcPromise = desc.get('useRcPromise', False)
 
         # If we're concrete, we need to crawl our ancestor interfaces and mark
         # them as having a concrete descendant.

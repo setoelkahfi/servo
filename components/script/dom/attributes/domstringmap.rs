@@ -9,18 +9,16 @@ use script_bindings::reflector::{Reflector, reflect_dom_object};
 
 use crate::dom::bindings::codegen::Bindings::DOMStringMapBinding::DOMStringMapMethods;
 use crate::dom::bindings::error::{Error, ErrorResult};
-use crate::dom::bindings::inheritance::Castable;
 use crate::dom::bindings::root::{Dom, DomRoot};
 use crate::dom::bindings::str::DOMString;
 use crate::dom::bindings::xmlname::matches_name_production;
 use crate::dom::element::Element;
-use crate::dom::html::htmlelement::HTMLElement;
 use crate::dom::node::NodeTraits;
 
 #[dom_struct]
 pub(crate) struct DOMStringMap {
     reflector_: Reflector,
-    element: Dom<HTMLElement>,
+    element: Dom<Element>,
 }
 
 static DATA_PREFIX: &str = "data-";
@@ -115,14 +113,14 @@ fn to_snake_case(name: &DOMString, should_throw: bool) -> Option<String> {
 }
 
 impl DOMStringMap {
-    fn new_inherited(element: &HTMLElement) -> DOMStringMap {
+    fn new_inherited(element: &Element) -> DOMStringMap {
         DOMStringMap {
             reflector_: Reflector::new(),
             element: Dom::from_ref(element),
         }
     }
 
-    pub(crate) fn new(cx: &mut JSContext, element: &HTMLElement) -> DomRoot<DOMStringMap> {
+    pub(crate) fn new(cx: &mut JSContext, element: &Element) -> DomRoot<DOMStringMap> {
         reflect_dom_object(
             cx,
             Box::new(DOMStringMap::new_inherited(element)),
@@ -131,7 +129,7 @@ impl DOMStringMap {
     }
 
     fn as_element(&self) -> &Element {
-        self.element.upcast::<Element>()
+        &self.element
     }
 }
 
@@ -156,11 +154,15 @@ impl DOMStringMapMethods<crate::DomTypeHolder> for DOMStringMap {
         let Some(name) = to_snake_case(&name, true) else {
             // Step 1. If name contains a U+002D HYPHEN-MINUS character (-) followed by an ASCII lower alpha,
             // then throw a "SyntaxError" DOMException.
-            return Err(Error::Syntax(None));
+            return Err(Error::Syntax(Some(
+                "Name contains a hyphen followed by a lowercase ASCII letter".into(),
+            )));
         };
         // Step 4. If name is not a valid attribute local name, then throw an "InvalidCharacterError" DOMException.
         if !matches_name_production(&name) {
-            return Err(Error::InvalidCharacter(None));
+            return Err(Error::InvalidCharacter(Some(
+                "Invalid attribute name".into(),
+            )));
         }
         // Step 5. Set an attribute value for the DOMStringMap's associated element using name and value.
         let name = LocalName::from(name);

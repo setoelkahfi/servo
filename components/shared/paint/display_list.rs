@@ -14,7 +14,8 @@ use malloc_size_of_derive::MallocSizeOf;
 use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
 use servo_base::Epoch;
-use servo_base::id::ScrollTreeNodeId;
+use servo_base::cross_process_instant::CrossProcessInstant;
+use servo_base::id::{ContainerTimingID, LCPCandidateID, ScrollTreeNodeId};
 use servo_base::print_tree::PrintTree;
 use servo_geometry::FastLayoutTransform;
 use style::values::specified::Overflow;
@@ -251,6 +252,13 @@ pub struct ScrollableNodeInfo {
 }
 
 impl ScrollableNodeInfo {
+    fn scroll_range(&self) -> (LayoutVector2D, LayoutVector2D) {
+        (
+            (self.content_rect.min - self.clip_rect.min).min(LayoutVector2D::zero()),
+            (self.content_rect.max - self.clip_rect.max).max(LayoutVector2D::zero()),
+        )
+    }
+
     fn scroll_to_offset(
         &mut self,
         new_offset: LayoutVector2D,
@@ -262,15 +270,14 @@ impl ScrollableNodeInfo {
             return None;
         }
 
-        let scrollable_size = self.scrollable_size();
         let original_layer_scroll_offset = self.offset;
-
-        if scrollable_size.width > 0. && self.scroll_sensitivity.x.contains(context) {
-            self.offset.x = new_offset.x.clamp(0.0, scrollable_size.width);
+        let (min_scroll_range, max_scroll_range) = self.scroll_range();
+        if min_scroll_range.x != max_scroll_range.x && self.scroll_sensitivity.x.contains(context) {
+            self.offset.x = new_offset.x.clamp(min_scroll_range.x, max_scroll_range.x);
         }
 
-        if scrollable_size.height > 0. && self.scroll_sensitivity.y.contains(context) {
-            self.offset.y = new_offset.y.clamp(0.0, scrollable_size.height);
+        if min_scroll_range.y != max_scroll_range.y && self.scroll_sensitivity.y.contains(context) {
+            self.offset.y = new_offset.y.clamp(min_scroll_range.y, max_scroll_range.y);
         }
 
         if self.offset != original_layer_scroll_offset {
@@ -292,38 +299,34 @@ impl ScrollableNodeInfo {
             return None;
         }
 
+        let (min_scroll_range, max_scroll_range) = self.scroll_range();
         let delta = match scroll_location {
             ScrollLocation::Delta(delta) => delta,
             ScrollLocation::Start => {
-                if self.offset.y.round() <= 0.0 {
+                let start = min_scroll_range.y;
+                if self.offset.y.round() <= start {
                     // Nothing to do on this layer.
                     return None;
                 }
 
-                self.offset.y = 0.0;
+                self.offset.y = start;
                 self.offset_changed.set(true);
                 return Some(self.offset);
             },
             ScrollLocation::End => {
-                let end_pos = self.scrollable_size().height;
-                if self.offset.y.round() >= end_pos {
+                let end = max_scroll_range.y;
+                if self.offset.y.round() >= end {
                     // Nothing to do on this layer.
                     return None;
                 }
 
-                self.offset.y = end_pos;
+                self.offset.y = end;
                 self.offset_changed.set(true);
                 return Some(self.offset);
             },
         };
 
         self.scroll_to_offset(self.offset + delta, context)
-    }
-}
-
-impl ScrollableNodeInfo {
-    fn scrollable_size(&self) -> LayoutSize {
-        self.content_rect.size() - self.clip_rect.size()
     }
 }
 
@@ -578,14 +581,14 @@ impl ScrollTree {
         external_id: ExternalScrollId,
     ) -> Option<(TouchAction, bool, bool)> {
         let node_id = self.node_with_external_scroll_node_id(external_id)?;
-        let SpatialTreeNodeInfo::Scroll(info) = &self.get_node(node_id).info else {
+        let SpatialTreeNodeInfo::Scroll(scroll_node_info) = &self.get_node(node_id).info else {
             return None;
         };
-        let scrollable_size = info.scrollable_size();
+        let (min_scroll_range, max_scroll_range) = scroll_node_info.scroll_range();
         Some((
-            info.touch_action,
-            scrollable_size.width > 0.,
-            scrollable_size.height > 0.,
+            scroll_node_info.touch_action,
+            min_scroll_range.x != max_scroll_range.x,
+            min_scroll_range.y != max_scroll_range.y,
         ))
     }
 
@@ -763,6 +766,44 @@ impl ScrollTree {
         transforms
     }
 
+    /// This is a replication of WebRender's code for determining the transform to use for
+    /// a reference frame which takes into account perspective frames that scroll relative
+    /// to different scroll frames.
+    fn reference_frame_transform(
+        &self,
+        node: &ScrollTreeNode,
+        info: &ReferenceFrameNodeInfo,
+        cumulative_sticky_offset: LayoutVector2D,
+    ) -> FastLayoutTransform {
+        let ReferenceFrameKind::Perspective {
+            scrolling_relative_to: Some(scrolling_relative_to),
+        } = &info.kind
+        else {
+            return info.transform;
+        };
+
+        let mut scroll_offset = LayoutVector2D::zero();
+        let mut current_node = node;
+        let mut ending_cumulative_sticky_offset = LayoutVector2D::zero();
+
+        while let Some(parent_id) = current_node.parent {
+            let parent_node = self.get_node(parent_id);
+            if let SpatialTreeNodeInfo::Scroll(parent_info) = &parent_node.info {
+                if parent_info.external_id == *scrolling_relative_to {
+                    ending_cumulative_sticky_offset = self.cumulative_sticky_offsets(parent_id);
+                    break;
+                }
+                scroll_offset += parent_info.offset;
+            }
+            current_node = parent_node;
+        }
+
+        scroll_offset -= cumulative_sticky_offset - ending_cumulative_sticky_offset;
+        info.transform
+            .pre_translate(-scroll_offset)
+            .then_translate(scroll_offset)
+    }
+
     /// Traverse a scroll node to its root to calculate the transform.
     #[servo_tracing::instrument(name = "ScrollTree::cumulative_node_transform_inner", skip_all)]
     fn cumulative_node_transform_inner(
@@ -790,9 +831,14 @@ impl ScrollTree {
                 // To apply a transformation we need to make sure the rectangle's
                 // coordinate space is the same as reference frame's coordinate space.
                 let offset = info.frame_origin_for_query.to_vector();
+                let transform = self.reference_frame_transform(
+                    node,
+                    info,
+                    parent_transforms.cumulative_sticky_offsets,
+                );
                 let node_to_parent_transform =
-                    info.transform.pre_translate(-offset).then_translate(offset);
-                let parent_to_node_transform = info.transform.inverse().map(|inverse_transform| {
+                    transform.pre_translate(-offset).then_translate(offset);
+                let parent_to_node_transform = transform.inverse().map(|inverse_transform| {
                     FastLayoutTransform::Offset(-info.origin.to_vector()).then(&inverse_transform)
                 });
                 ScrollTreeNodeTransformationCache {
@@ -919,12 +965,86 @@ impl ScrollTree {
     }
 }
 
+/// A bitflags set that represents the paint timing report for a display list.
+///
+/// <https://www.w3.org/TR/paint-timing/#set-of-previously-reported-paints>
+/// Note: Analogous to the document's "set of previously reported paints". It
+/// is produced by layout's `mark paint timing` as the report for the current
+/// display list. In the specification this is an ordered set of paint-type
+/// strings (`"first-paint"`,`"first-contentful-paint"`).
+#[derive(Clone, Copy, Debug, Default, Deserialize, MallocSizeOf, PartialEq, Serialize)]
+pub struct PaintTimingReport(u8);
+
+bitflags! {
+    impl PaintTimingReport: u8 {
+        /// Report first paint (the spec's `"first-paint"`).
+        const FirstPaint = 1 << 0;
+        /// Report first contentful paint (the spec's `"first-contentful-paint"`).
+        const FirstContentfulPaint = 1 << 1;
+    }
+}
+
+/// <https://www.w3.org/TR/paint-timing/#paint-timing-info>
+#[derive(Clone, Copy, Debug, Deserialize, MallocSizeOf, PartialEq, Serialize)]
+pub struct PaintTimingInfo {
+    /// <https://w3c.github.io/paint-timing/#paint-timing-info-rendering-update-end-time>
+    pub rendering_update_end_time: CrossProcessInstant,
+    /// <https://w3c.github.io/paint-timing/#paint-timing-info-implementation-defined-presentation-time>
+    pub implementation_defined_presentation_time: Option<CrossProcessInstant>,
+}
+
+impl PaintTimingInfo {
+    pub fn now() -> Self {
+        Self {
+            rendering_update_end_time: CrossProcessInstant::now(),
+            implementation_defined_presentation_time: None,
+        }
+    }
+
+    /// Return a copy of this [`PaintTimingInfo`] with its implementation-defined
+    /// presentation time set to `presentation_time`.
+    pub fn with_presentation_time(self, presentation_time: CrossProcessInstant) -> Self {
+        Self {
+            implementation_defined_presentation_time: Some(presentation_time),
+            ..self
+        }
+    }
+
+    /// <https://www.w3.org/TR/paint-timing/#dom-painttimingmixin-painttime>
+    pub fn paint_time(&self) -> CrossProcessInstant {
+        // The `paintTime` attribute's getter step is to return this's paint
+        // timing info's rendering update end time.
+        self.rendering_update_end_time
+    }
+
+    /// <https://www.w3.org/TR/paint-timing/#dom-painttimingmixin-presentationtime>
+    pub fn presentation_time(&self) -> Option<CrossProcessInstant> {
+        // The `presentationTime` attribute's getter step, if it exists, is to
+        // return this's paint timing info's implementation-defined
+        // presentation time.
+        self.implementation_defined_presentation_time
+    }
+
+    /// <https://www.w3.org/TR/paint-timing/#default-paint-timestamp>
+    pub fn default_paint_timestamp(&self) -> CrossProcessInstant {
+        // Return paintTimingInfo's implementation-defined presentation time if
+        // it is non-null, otherwise paintTimingInfo's rendering update end time.
+        self.implementation_defined_presentation_time
+            .unwrap_or(self.rendering_update_end_time)
+    }
+}
+
 /// A data structure which stores `Paint`-side information about
 /// display lists sent to `Paint`.
 #[derive(Clone, Debug, Deserialize, MallocSizeOf, Serialize)]
 pub struct PaintDisplayListInfo {
     /// The WebRender [PipelineId] of this display list.
     pub pipeline_id: PipelineId,
+
+    /// A map of `<iframe>` [`PipelineId`]s to their rectangle and containing [`ScrollTreeNodeId`].
+    /// This can be used to translate from coordinates within an `<iframe>` to root WebView
+    /// coordinates.
+    pub iframes: FxHashMap<PipelineId, (ScrollTreeNodeId, LayoutRect)>,
 
     /// The [`ViewportDetails`] that describe the viewport in the script/layout thread at
     /// the time this display list was created.
@@ -948,18 +1068,25 @@ pub struct PaintDisplayListInfo {
     /// tree.
     pub root_scroll_node_id: ScrollTreeNodeId,
 
-    /// From <https://www.w3.org/TR/paint-timing/#paintable>:
-    /// Whether the display list contains paintable items.
-    pub is_paintable: bool,
-
-    /// From <https://www.w3.org/TR/paint-timing/#contentful>:
-    /// Contentful paint i.e. whether the display list contains items of type
-    /// text, image, non-white canvas or SVG). Used by metrics.
-    pub is_contentful: bool,
-
     /// Whether the first layout or a subsequent (incremental) layout triggered this
     /// display list creation.
     pub first_reflow: bool,
+
+    /// The paint-timing report for this display list.
+    pub paint_timing_report: PaintTimingReport,
+
+    /// The [`PaintTimingInfo`] for this display list.
+    pub paint_timing_info: PaintTimingInfo,
+
+    /// New largest-contentful-paint candidate in this display list, if any.
+    /// The pair is the candidate's id and its reported area.
+    pub lcp_candidate: Option<(LCPCandidateID, usize)>,
+
+    /// The Container Timing updates produced by this display list, if any. Only the IDs
+    /// travel here: the records themselves go straight from layout to script, and paint's
+    /// sole job is to hand these IDs back once the frame has actually been composited.
+    /// <https://wicg.github.io/container-timing/>
+    pub container_timing_candidates: Vec<ContainerTimingID>,
 
     /// If this display list contains a blinking caret, this value will be filled with its animation
     /// key and original color value so that the painter can animate the caret.
@@ -1006,19 +1133,25 @@ impl PaintDisplayListInfo {
 
         PaintDisplayListInfo {
             pipeline_id,
+            iframes: Default::default(),
             viewport_details,
             content_size,
             epoch,
             scroll_tree,
             root_reference_frame_id,
             root_scroll_node_id,
-            is_paintable: false,
-            is_contentful: false,
             first_reflow,
+            lcp_candidate: None,
+            container_timing_candidates: Vec::new(),
+            paint_timing_report: PaintTimingReport::default(),
+            paint_timing_info: PaintTimingInfo::now(),
             caret_property_binding: Default::default(),
         }
     }
 
+    /// Find the [`ExternalScrollId`] of the scroll node identified by the given
+    /// [`ScrollTreeNodeId`]. This will walk up the tree to find the first inclusive
+    /// ancestor scroll node.
     pub fn external_scroll_id_for_scroll_tree_node(
         &self,
         id: ScrollTreeNodeId,

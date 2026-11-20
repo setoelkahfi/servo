@@ -2,30 +2,24 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
-use std::rc::Rc;
-
-use dom_struct::dom_struct;
 use js::context::JSContext;
 use js::jsapi::{GCReason, JS_GC};
-use script_bindings::reflector::Reflector;
 
+use crate::dom::RootedPromise;
 use crate::dom::bindings::codegen::Bindings::TestUtilsBinding::TestUtilsMethods;
+use crate::dom::bindings::refcounted::TrustedPromise;
 use crate::dom::globalscope::GlobalScope;
 use crate::dom::promise::Promise;
-use crate::test::TrustedPromise;
 
-#[dom_struct]
-pub(crate) struct TestUtils {
-    reflector_: Reflector,
-}
+pub(crate) struct TestUtils;
 
 impl TestUtilsMethods<crate::DomTypeHolder> for TestUtils {
     /// <https://testutils.spec.whatwg.org/#dom-testutils-gc>
     #[expect(unsafe_code)]
-    fn Gc(cx: &mut JSContext, global: &GlobalScope) -> Rc<Promise> {
+    fn Gc(cx: &mut JSContext, global: &GlobalScope) -> RootedPromise {
         // 1. Let p be a new promise.
         let promise = Promise::new(cx, global);
-        let trusted = TrustedPromise::new(promise.clone());
+        let trusted = TrustedPromise::from(&promise);
         // 2. Run the following in parallel:
         // 2.1 Run implementation-defined steps to perform a garbage collection covering at least the entry Realm.
         // 2.2 Resolve p.
@@ -35,7 +29,7 @@ impl TestUtilsMethods<crate::DomTypeHolder> for TestUtils {
             unsafe {
                 JS_GC(cx.raw_cx(), GCReason::DOM_TESTUTILS);
             }
-            let promise = trusted.root();
+            let promise = trusted.root(cx);
             promise.resolve_native(cx, &());
         });
 

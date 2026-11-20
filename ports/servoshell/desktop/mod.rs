@@ -21,5 +21,6 @@ mod keyutils;
 mod protocols;
 pub(crate) mod settings;
 mod tracing;
+mod webview_widget;
 #[cfg(feature = "webxr")]
 mod webxr;

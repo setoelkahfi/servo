@@ -8,11 +8,13 @@ use std::rc::{Rc, Weak};
 use std::sync::Arc;
 use std::time::Duration;
 
+use accesskit::ActionRequest;
 use crossbeam_channel::{Receiver, Sender, unbounded};
 pub use embedder_traits::*;
 use env_logger::Builder as EnvLoggerBuilder;
 use fonts::SystemFontService;
 #[cfg(all(
+    feature = "multiprocess",
     not(target_os = "windows"),
     not(target_os = "ios"),
     not(target_os = "android"),
@@ -23,29 +25,39 @@ use fonts::SystemFontService;
     not(target_env = "ohos"),
 ))]
 use gaol::sandbox::{ChildSandbox, ChildSandboxMethods};
+#[cfg(feature = "multiprocess")]
 use ipc_channel::ipc::{self, IpcSender};
 use keyboard_types::Modifiers;
 use layout::LayoutFactoryImpl;
+#[cfg(feature = "multiprocess")]
 use layout_api::ScriptThreadFactory;
 use log::{Log, Metadata, Record, debug, warn};
 use media::{GlApi, NativeDisplay, WindowGLContext};
 use net::embedder::NetToEmbedderMsg;
+#[cfg(feature = "multiprocess")]
 use net::image_cache::ImageCacheFactoryImpl;
 use net::protocols::ProtocolRegistry;
 use net::resource_thread::new_resource_threads;
-use net_traits::{FetchThread, ResourceThreads};
+#[cfg(feature = "multiprocess")]
+use net_traits::FetchThread;
+use net_traits::ResourceThreads;
 use paint::{InitialPaintState, Paint};
 pub use paint_api::rendering_context::RenderingContext;
 use paint_api::{CrossProcessPaintApi, PaintMessage, PaintProxy};
-use profile::{mem as profile_mem, system_reporter, time as profile_time};
-use profile_traits::mem::{MemoryReportResult, ProfilerMsg, Reporter};
+use profile::{mem as profile_mem, time as profile_time};
+use profile_traits::mem::MemoryReportResult;
+#[cfg(feature = "multiprocess")]
+use profile_traits::mem::{ProfilerMsg, Reporter};
 use profile_traits::{mem, time};
 use rustc_hash::FxHashMap;
-use script::{JSEngineSetup, ServiceWorkerManager};
+use script::JSEngineSetup;
+#[cfg(feature = "multiprocess")]
+use script::ServiceWorkerManager;
+#[cfg(feature = "multiprocess")]
 use servo_background_hang_monitor::HangMonitorRegister;
-use servo_base::generic_channel::{GenericCallback, GenericSender, RoutedReceiver};
+use servo_base::generic_channel::{GenericCallback, GenericSender, RoutedReceiver, SendError};
 pub use servo_base::id::WebViewId;
-use servo_base::id::{EMBEDDER_PIPELINE_NAMESPACE_ID, PipelineNamespace};
+use servo_base::id::{EMBEDDER_PIPELINE_NAMESPACE_ID, PipelineId, PipelineNamespace};
 #[cfg(feature = "bluetooth")]
 use servo_bluetooth::BluetoothThreadFactory;
 #[cfg(feature = "bluetooth")]
@@ -53,7 +65,10 @@ use servo_bluetooth_traits::BluetoothRequest;
 use servo_config::opts::{DiagnosticsLoggingOption, Opts};
 use servo_config::prefs::{PrefValue, Preferences};
 use servo_config::{opts, pref, prefs};
+#[cfg(feature = "multiprocess")]
+use servo_constellation::UnprivilegedContent;
 #[cfg(all(
+    feature = "multiprocess",
     not(target_os = "windows"),
     not(target_os = "ios"),
     not(target_os = "android"),
@@ -65,10 +80,13 @@ use servo_config::{opts, pref, prefs};
 ))]
 use servo_constellation::content_process_sandbox_profile;
 use servo_constellation::{
-    Constellation, ConstellationToEmbedderMsg, FromEmbedderLogger, FromScriptLogger,
-    InitialConstellationState, NewScriptEventLoopProcessInfo, UnprivilegedContent,
+    Constellation, ConstellationToEmbedderMsg, FromEmbedderLogger, InitialConstellationState,
 };
-use servo_constellation_traits::{EmbedderToConstellationMessage, ScriptToConstellationSender};
+#[cfg(feature = "multiprocess")]
+use servo_constellation::{FromScriptLogger, NewScriptEventLoopProcessInfo};
+use servo_constellation_traits::EmbedderToConstellationMessage;
+#[cfg(feature = "multiprocess")]
+use servo_constellation_traits::ScriptToConstellationSender;
 use servo_geometry::{
     DeviceIndependentIntRect, convert_rect_to_css_pixel, convert_size_to_css_pixel,
 };
@@ -77,6 +95,7 @@ use servo_media::player::context::GlContext;
 use servo_wakelock::DefaultWakeLockDelegate;
 use storage::new_storage_threads;
 use storage_traits::StorageThreads;
+#[cfg(feature = "multiprocess")]
 use style::global_style_data::StyleThreadPool;
 #[cfg(feature = "webxr")]
 use webxr::WebXrRegistry;
@@ -84,6 +103,7 @@ use webxr::WebXrRegistry;
 use crate::clipboard_delegate::StringRequest;
 #[cfg(feature = "gamepad")]
 use crate::gamepad_delegate::{GamepadHapticEffectRequest, GamepadHapticEffectRequestType};
+use crate::geolocation_delegate::{PositionRequest, PositionWatch};
 use crate::javascript_evaluator::JavaScriptEvaluator;
 use crate::network_manager::NetworkManager;
 use crate::proxies::ConstellationProxy;
@@ -96,7 +116,10 @@ use crate::webview_delegate::{
     FilePicker, NavigationRequest, PermissionRequest, ProtocolHandlerRegistration, WebResourceLoad,
 };
 
-#[cfg(feature = "media-gstreamer")]
+#[cfg(all(
+    feature = "media-gstreamer",
+    not(any(target_os = "android", target_env = "ohos"))
+))]
 mod media_platform {
     use servo_media_gstreamer::GStreamerBackend;
 
@@ -105,6 +128,8 @@ mod media_platform {
     #[cfg(any(windows, target_os = "macos"))]
     pub fn init() {
         ServoMedia::init_with_backend(|| {
+            use servo_media::BackendInit;
+
             let mut plugin_dir = std::env::current_exe().unwrap();
             plugin_dir.pop();
 
@@ -114,12 +139,16 @@ mod media_platform {
 
             let plugin_list = crate::gstreamer_plugins::gstreamer_plugins();
             match GStreamerBackend::init_with_plugins(plugin_dir, &plugin_list) {
-                Ok(b) => b,
-                Err(e) => {
-                    log::error!("Error initializing GStreamer: {:?}", e);
-                    std::process::exit(1);
+                Ok(backend) => return backend,
+                Err(error) => {
+                    log::warn!(
+                        "Error initializing GStreamer: {error:?}. \
+                        Trying fallback initialization."
+                    );
                 },
             }
+
+            GStreamerBackend::init()
         });
     }
 
@@ -129,7 +158,7 @@ mod media_platform {
     }
 }
 
-#[cfg(all(not(feature = "media-gstreamer"), target_env = "ohos"))]
+#[cfg(target_env = "ohos")]
 mod media_platform {
     use servo_media_ohos::OhosBackend;
 
@@ -139,7 +168,10 @@ mod media_platform {
     }
 }
 
-#[cfg(all(not(feature = "media-gstreamer"), not(target_env = "ohos")))]
+#[cfg(all(
+    not(target_env = "ohos"),
+    not(all(feature = "media-gstreamer", not(target_os = "android")))
+))]
 mod media_platform {
     use super::ServoMedia;
     pub fn init() {
@@ -252,6 +284,9 @@ struct ServoInner {
     pending_handled_input_events: RefCell<Vec<PendingHandledInputEvent>>,
     /// An [`EventLoopWaker`] used to wake up the main embedder event loop.
     event_loop_waker: Box<dyn EventLoopWaker>,
+    /// Geolocation watches that have been handed to a GeolocationDelegate grouped by the pipeline
+    /// that asked for them.
+    geolocation_watches: RefCell<FxHashMap<PipelineId, Vec<GeolocationWatchId>>>,
 }
 
 impl ServoInner {
@@ -260,6 +295,34 @@ impl ServoInner {
             .borrow()
             .get(&id)
             .and_then(WebView::from_weak_handle)
+    }
+
+    /// Forget a geolocation watch, returning whether we were still tracking it.
+    fn untrack_geolocation_watch(&self, watch_id: &GeolocationWatchId) -> bool {
+        let mut watches = self.geolocation_watches.borrow_mut();
+        let Some(pipeline_watches) = watches.get_mut(&watch_id.pipeline_id) else {
+            return false;
+        };
+        let Some(index) = pipeline_watches.iter().position(|id| id == watch_id) else {
+            return false;
+        };
+        pipeline_watches.swap_remove(index);
+        if pipeline_watches.is_empty() {
+            watches.remove(&watch_id.pipeline_id);
+        }
+        true
+    }
+
+    /// Tell the GeolocationDelegate to stop a watch, if we still believe it to be running.
+    fn stop_geolocation_watch(&self, watch_id: &GeolocationWatchId) {
+        if !self.untrack_geolocation_watch(watch_id) {
+            return;
+        }
+        if let Some(webview) = self.get_webview_handle(watch_id.webview_id) {
+            webview
+                .geolocation_delegate()
+                .stop_watch(webview.clone(), watch_id);
+        }
     }
 
     #[servo_tracing::instrument(level = "debug", skip_all)]
@@ -581,7 +644,7 @@ impl ServoInner {
                     webview.set_cursor(cursor);
                 }
             },
-            EmbedderMsg::NewFavicon(webview_id, image) => {
+            EmbedderMsg::SetFavicon(webview_id, image) => {
                 if let Some(webview) = self.get_webview_handle(webview_id) {
                     webview.set_favicon(image);
                 }
@@ -621,10 +684,10 @@ impl ServoInner {
                         .request_permission(webview, permission_request);
                 }
             },
-            EmbedderMsg::RequestWakeLockPermission(webview_id, callback, type_) => {
+            EmbedderMsg::RequestPermission(webview_id, requested_feature, callback) => {
                 if let Some(webview) = self.get_webview_handle(webview_id) {
                     let permission_request = PermissionRequest {
-                        requested_feature: PermissionFeature::ScreenWakeLock(type_),
+                        requested_feature,
                         allow_deny_request: AllowOrDenyRequest::new_from_callback(
                             callback,
                             AllowOrDeny::Deny,
@@ -635,6 +698,30 @@ impl ServoInner {
                         .delegate()
                         .request_permission(webview, permission_request);
                 }
+            },
+            EmbedderMsg::RequestGeolocationPosition(webview_id, options, result_sender) => {
+                if let Some(webview) = self.get_webview_handle(webview_id) {
+                    webview.geolocation_delegate().request_position(
+                        webview.clone(),
+                        PositionRequest::new(result_sender, options),
+                    );
+                }
+            },
+            EmbedderMsg::StartGeolocationWatch(watch_id, options, result_sender) => {
+                if let Some(webview) = self.get_webview_handle(watch_id.webview_id) {
+                    self.geolocation_watches
+                        .borrow_mut()
+                        .entry(watch_id.pipeline_id)
+                        .or_default()
+                        .push(watch_id.clone());
+                    webview.geolocation_delegate().start_watch(
+                        webview.clone(),
+                        PositionWatch::new(watch_id, result_sender, options),
+                    );
+                }
+            },
+            EmbedderMsg::StopGeolocationWatch(watch_id) => {
+                self.stop_geolocation_watch(&watch_id);
             },
             EmbedderMsg::OnDevtoolsStarted(port, token) => match port {
                 Ok(port) => self
@@ -708,9 +795,18 @@ impl ServoInner {
                     None => self.delegate.borrow().show_console_message(level, message),
                 }
             },
-            EmbedderMsg::ShowEmbedderControl(control_id, position, embedder_control_request) => {
+            EmbedderMsg::ShowEmbedderControl(control_id, rect, embedder_control_request) => {
                 if let Some(webview) = self.get_webview_handle(control_id.webview_id) {
-                    webview.show_embedder_control(control_id, position, embedder_control_request);
+                    let device_rect = self
+                        .paint
+                        .borrow()
+                        .map_pipeline_rect_to_device_rect(control_id.webview_id, rect)
+                        .unwrap_or_default();
+                    webview.show_embedder_control(
+                        control_id,
+                        device_rect.to_i32(),
+                        embedder_control_request,
+                    );
                 }
             },
             EmbedderMsg::HideEmbedderControl(control_id) => {
@@ -798,23 +894,6 @@ impl ServoInner {
                     webview.delegate().notify_closed(webview);
                 }
             },
-            ConstellationToEmbedderMsg::WebViewFocused(webview_id, focus_result) => {
-                if focus_result {
-                    for id in self.webviews.borrow().keys() {
-                        if let Some(webview) = self.get_webview_handle(*id) {
-                            let focused = webview.id() == webview_id;
-                            webview.set_focused(focused);
-                        }
-                    }
-                }
-            },
-            ConstellationToEmbedderMsg::WebViewBlurred => {
-                for id in self.webviews.borrow().keys() {
-                    if let Some(webview) = self.get_webview_handle(*id) {
-                        webview.set_focused(false);
-                    }
-                }
-            },
             ConstellationToEmbedderMsg::FinishJavaScriptEvaluation(evaluation_id, result) => {
                 self.javascript_evaluator
                     .borrow_mut()
@@ -864,6 +943,17 @@ impl ServoInner {
                         .notify_crashed(webview, reason, backtrace);
                 }
             },
+            ConstellationToEmbedderMsg::PipelineExited(pipeline_id) => {
+                let orphaned = self
+                    .geolocation_watches
+                    .borrow()
+                    .get(&pipeline_id)
+                    .cloned()
+                    .unwrap_or_default();
+                for watch_id in orphaned {
+                    self.stop_geolocation_watch(&watch_id);
+                }
+            },
             ConstellationToEmbedderMsg::MediaSessionEvent(webview_id, media_session_event) => {
                 if let Some(webview) = self.get_webview_handle(webview_id) {
                     webview
@@ -886,6 +976,12 @@ impl Drop for ServoInner {
     }
 }
 
+#[cfg(feature = "devtools")]
+type DevtoolsMessage = devtools_traits::DevtoolsControlMsg;
+
+#[cfg(not(feature = "devtools"))]
+type DevtoolsMessage = ();
+
 /// An in-process handle to a `Servo` instance. Cloning the handle does not create a new instance
 /// of `Servo`.
 ///
@@ -901,8 +997,8 @@ impl Servo {
     #[servo_tracing::instrument(name = "Servo::new", skip(builder))]
     fn new(builder: ServoBuilder) -> Self {
         // Global configuration options, parsed from the command line.
-        let opts = builder.opts.map(|opts| *opts);
-        opts::initialize_options(opts.unwrap_or_default());
+        let opts = builder.opts.map(|opts| *opts).unwrap_or_default();
+        opts::initialize_options(opts);
         let opts = opts::get();
 
         // Set the preferences globally.
@@ -947,14 +1043,14 @@ impl Servo {
         );
         let mem_profiler_chan = profile_mem::Profiler::create();
 
-        let devtools_sender = if pref!(devtools_server_enabled) {
-            Some(devtools::start_server(
+        let mut devtools_sender: Option<Sender<DevtoolsMessage>> = None;
+        #[cfg(feature = "devtools")]
+        if pref!(devtools_server_enabled) {
+            devtools_sender = Some(devtools::start_server(
                 embedder_proxy.clone(),
                 mem_profiler_chan.clone(),
             ))
-        } else {
-            None
-        };
+        }
 
         // Important that this call is done in a single-threaded fashion, we
         // can't defer it after `create_constellation` has started.
@@ -1009,6 +1105,7 @@ impl Servo {
             paint_proxy,
             time_profiler_chan,
             mem_profiler_chan,
+            #[cfg(feature = "devtools")]
             devtools_sender,
             protocols,
             public_resource_threads.clone(),
@@ -1020,6 +1117,7 @@ impl Servo {
 
         net::connector::prewarm_tls();
 
+        #[cfg(feature = "multiprocess")]
         if opts::get().multiprocess {
             prefs::add_observer(Box::new(constellation_proxy.clone()));
         }
@@ -1030,6 +1128,7 @@ impl Servo {
             network_manager: Rc::new(RefCell::new(NetworkManager::new(
                 public_resource_threads.clone(),
                 private_resource_threads.clone(),
+                constellation_proxy.clone(),
             ))),
             site_data_manager: SiteDataManager::new(
                 public_resource_threads,
@@ -1050,6 +1149,7 @@ impl Servo {
             _js_engine_setup: js_engine_setup,
             pending_handled_input_events: Default::default(),
             event_loop_waker,
+            geolocation_watches: Default::default(),
         }))
     }
 
@@ -1132,6 +1232,19 @@ impl Servo {
         &self.0.site_data_manager
     }
 
+    /// When an [`ActionRequest`] is received from AccessKit, forward it to the appropriate document
+    /// to fulfill the action in the request.
+    ///
+    /// For example, if an AccessKit adapter sends a request for an [`accesskit::Action::Click`]
+    /// with a particular [`accesskit::TreeId`] and [`accesskit::NodeId`], determine which document
+    /// contains the tree matching the [`accesskit::TreeId`] and forward the [`ActionRequest`]
+    /// there, so that it can find the appropriate node to take the click action on.
+    pub fn forward_accessibility_action(&self, action_request: ActionRequest) {
+        self.0.constellation_proxy.send(
+            EmbedderToConstellationMessage::ForwardAccessibilityAction(action_request),
+        );
+    }
+
     pub(crate) fn paint<'a>(&'a self) -> Ref<'a, Paint> {
         self.0.paint.borrow()
     }
@@ -1205,7 +1318,7 @@ fn create_paint_channel(
     let sender_clone = sender.clone();
     let event_loop_waker_clone = event_loop_waker.clone();
     // This callback is equivalent to `PaintProxy::send`
-    let result_callback = move |msg: Result<PaintMessage, ipc_channel::IpcError>| {
+    let result_callback = move |msg: Result<PaintMessage, SendError>| {
         if let Err(err) = sender_clone.send(msg) {
             warn!("Failed to send response ({:?}).", err);
         }
@@ -1233,7 +1346,9 @@ fn create_constellation(
     paint_proxy: PaintProxy,
     time_profiler_chan: time::ProfilerChan,
     mem_profiler_chan: mem::ProfilerChan,
-    devtools_sender: Option<Sender<devtools_traits::DevtoolsControlMsg>>,
+    #[cfg(feature = "devtools")] devtools_sender: Option<
+        Sender<devtools_traits::DevtoolsControlMsg>,
+    >,
     protocols: Arc<ProtocolRegistry>,
     public_resource_threads: ResourceThreads,
     private_resource_threads: ResourceThreads,
@@ -1262,6 +1377,7 @@ fn create_constellation(
         paint_proxy,
         embedder_proxy,
         constellation_to_embedder_proxy,
+        #[cfg(feature = "devtools")]
         devtools_sender,
         #[cfg(feature = "bluetooth")]
         bluetooth_thread,
@@ -1322,6 +1438,7 @@ where
     }
 }
 
+#[cfg(feature = "multiprocess")]
 fn set_logger(script_to_constellation_sender: ScriptToConstellationSender) {
     let con_logger = FromScriptLogger::new(script_to_constellation_sender);
     let env = env_logger::Env::default();
@@ -1335,6 +1452,7 @@ fn set_logger(script_to_constellation_sender: ScriptToConstellationSender) {
 }
 
 /// Content process entry point.
+#[cfg(feature = "multiprocess")]
 pub fn run_content_process(token: String) {
     let (unprivileged_content_sender, unprivileged_content_receiver) =
         ipc::channel::<UnprivilegedContent>().unwrap();
@@ -1404,6 +1522,7 @@ pub fn run_content_process(token: String) {
 }
 
 #[cfg(all(
+    feature = "multiprocess",
     not(target_os = "windows"),
     not(target_os = "ios"),
     not(target_os = "android"),
@@ -1488,6 +1607,7 @@ impl ServoBuilder {
     }
 }
 
+#[cfg(feature = "multiprocess")]
 fn register_system_memory_reporter_for_event_loop(
     new_event_loop_info: &NewScriptEventLoopProcessInfo,
 ) {
@@ -1496,7 +1616,7 @@ fn register_system_memory_reporter_for_event_loop(
     // reporter can make measurements.
     let callback = GenericCallback::new(|message| {
         if let Ok(request) = message {
-            system_reporter::collect_reports(request);
+            profile::system_reporter::collect_reports(request);
         }
     })
     .expect("Could not create memory reporter callback");

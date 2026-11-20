@@ -7,14 +7,14 @@ use std::ops::Add;
 use dom_struct::dom_struct;
 use js::context::JSContext;
 use script_bindings::codegen::GenericBindings::UserActivationBinding::UserActivationMethods;
-use script_bindings::reflector::{Reflector, reflect_dom_object_with_cx};
+use script_bindings::reflector::{Reflector, reflect_dom_object};
 use servo_base::cross_process_instant::CrossProcessInstant;
 use time::Duration;
 
 use crate::dom::bindings::reflector::DomGlobal;
 use crate::dom::bindings::root::{Dom, DomRoot};
 use crate::dom::document::{
-    Document, SameOriginDescendantNavigablesIterator, SameoriginAncestorNavigablesIterator,
+    Document, LocalAncestorNavigablesIterator, LocalDescendantNavigablesIterator,
 };
 use crate::dom::globalscope::GlobalScope;
 
@@ -32,7 +32,7 @@ impl UserActivation {
     }
 
     pub(crate) fn new(cx: &mut JSContext, global: &GlobalScope) -> DomRoot<UserActivation> {
-        reflect_dom_object_with_cx(Box::new(UserActivation::new_inherited()), global, cx)
+        reflect_dom_object(cx, Box::new(UserActivation::new_inherited()), global)
     }
 
     /// <https://html.spec.whatwg.org/multipage/#activation-notification>
@@ -52,15 +52,17 @@ impl UserActivation {
         // Step 3.
         // > Extend windows with the active window of each of document's ancestor navigables.
         // TODO: this would not work for disimilar origin ancestor, since we don't store the document in this script thread.
-        for document in SameoriginAncestorNavigablesIterator::new(DomRoot::from_ref(document)) {
+        for document in LocalAncestorNavigablesIterator::new(DomRoot::from_ref(document)) {
             windows.push(Dom::from_ref(document.window()));
         }
 
         // Step 4.
         // > Extend windows with the active window of each of document's descendant navigables, filtered to include only
         // > those navigables whose active document's origin is same origin with document's origin.
-        for document in SameOriginDescendantNavigablesIterator::new(document) {
-            windows.push(Dom::from_ref(document.window()));
+        for descendant in LocalDescendantNavigablesIterator::new(document) {
+            if descendant.origin().same_origin(&document.origin()) {
+                windows.push(Dom::from_ref(descendant.window()));
+            }
         }
 
         // Step 5.
@@ -75,7 +77,7 @@ impl UserActivation {
 
             // Step 5.2.
             // > Notify the close watcher manager about user activation given window.
-            // TODO: impl close watcher
+            window.notify_the_close_watcher_manager_about_user_activation();
         }
     }
 }
